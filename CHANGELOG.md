@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Token savings for agents: MCP tool profiles (default ~1.4k tokens instead of ~7.2k) with `help` and `tb`; one-call `briefing` (delta cursor), `next`, `finish` and `batch`; actionable, coalesced and mutable notifications; `fields`/table/`brief` reads and spec outline/section; role guides; a per-agent token usage meter.
 - Six more ways of working: waterfall stage-gates (phases with gates), lean startup, OKRs (objectives, key results, progress roll-up), a priority matrix (Eisenhower), a support desk with SLAs and escalation, and a personal GTD list.
 - Board menu starts on "All boards"; also by board type and single boards. Cross-board scope (`tm`, `bs`) on tasks, dashboard, attention, risks and agent stats, plus `/portfolio` and a `portfolio` MCP tool.
 - Ways of working per board: scrum, kanban, scrumban, shape up, simple. WIP limits (warn/block), flow metrics and cumulative flow, velocity, retrospectives with actions, auto-rollover, replenish signal, work item types and epics.

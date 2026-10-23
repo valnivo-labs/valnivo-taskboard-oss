@@ -423,8 +423,8 @@ async function rawPost(path, text) {
 }
 async function renderAdmin() {
   const el = $("v-admin");
-  let tk, se, bk, tp;
-  try { [tk, se, bk, tp] = await Promise.all([api("GET", "/tokens"), api("GET", "/settings"), api("GET", "/admin/backups"), api("GET", "/templates")]); }
+  let tk, se, bk, tp, us;
+  try { [tk, se, bk, tp, us] = await Promise.all([api("GET", "/tokens"), api("GET", "/settings"), api("GET", "/admin/backups"), api("GET", "/templates"), api("GET", "/admin/usage")]); }
   catch (_) { el.innerHTML = '<div class="pad"><div class="empty"><b>Admin only</b><br>Your token does not have the admin role.</div></div>'; return; }
   if (view !== "admin") return;
   const last = bk.last;
@@ -445,6 +445,8 @@ async function renderAdmin() {
       <div class="rowbtn"><label class="mini filebtn">Import JSON<input type="file" id="impjson" accept=".json,application/json" hidden></label><label class="mini filebtn">Import CSV into this board<input type="file" id="impcsv" accept=".csv,text/csv" hidden></label></div>
       <p class="muted hint">CSV header: <code class="k">title,description,status,priority,assignee,kind,channel,labels,points</code></p></div></div>
     <div class="panel"><h2>Board rules — definition of done${B && !B.multi ? " · " + esc(B.name) : ""}</h2><p class="muted hint">One item per line. A task on this board cannot move to Done until every item is ticked and no review is open.</p><form id="dodf" class="stack"><textarea name="dod" rows="4" placeholder="Tests pass&#10;PR linked&#10;Deployed to test">${esc(B && !B.multi ? B.dod || "" : "")}</textarea><div class="rowbtn"><button class="primary mini" type="submit" ${B && !B.multi ? "" : "disabled"}>Save rules</button></div></form></div>
+    <div class="panel"><h2>Token usage <span class="muted">since ${esc((us.since || "").slice(0, 16))} UTC</span></h2><p class="muted hint">Approximate tokens (bytes ÷ 4) that each agent has sent and received through the API. Use it to see which calls cost the most; <code class="k">briefing</code>, <code class="k">next</code> and <code class="k">finish</code> replace several calls each.</p>
+      ${us.agents.length ? `<table class="tb"><tr><th>Agent</th><th>Calls</th><th>Tokens</th><th>Costliest routes</th></tr>${us.agents.map(a => `<tr><td>${esc(a.n)}</td><td class="num">${a.calls}</td><td class="num">${a.t}</td><td class="muted">${a.routes.slice(0, 3).map(r => esc(r.r) + " " + r.t).join(" · ")}</td></tr>`).join("")}</table>` : '<span class="muted">No calls yet.</span>'}</div>
     <div class="panel"><h2>Templates &amp; recurring tasks</h2><p class="muted hint">Rules: ${esc(tp.help)}. A recurring template creates a task on schedule, unless the previous one is still open.</p>
       ${tp.i.length ? `<table class="tb"><tr><th>Template</th><th>Rule</th><th>Next run</th><th>Assignee</th><th></th></tr>${tp.i.map(t => `<tr><td>${esc(t.n)}${t.on ? "" : ' <span class="muted">(paused)</span>'}</td><td>${esc(t.rc || "manual")}</td><td>${esc(t.nx || "—")}</td><td>${esc(t.as || "—")}</td><td class="num"><button type="button" class="mini" data-usetpl="${t.id}">Use</button> <button type="button" class="mini" data-edittpl="${t.id}">Edit</button> <button type="button" class="mini" data-deltpl="${t.id}">Delete</button></td></tr>`).join("")}</table>` : '<p class="muted">No templates yet.</p>'}
       <div class="rowbtn"><button type="button" class="mini primary" id="newtpl">+ New template</button><button type="button" class="mini" id="runtpl">Run due recurring now</button></div></div></div></div>`;

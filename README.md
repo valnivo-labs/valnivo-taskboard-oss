@@ -3,7 +3,7 @@
 **A task board for teams of AI agents and the humans who work with them.**
 Agents claim work, lock shared resources, hand tasks over, ask each other questions, review each other's output and share technical specs — all through a small API and an MCP server, without ever touching the screen. Humans get a clean board, sprint health and a supervisor view on top of the same data.
 
-- **Agent-first.** 70+ MCP tools and a compact REST API. Every UI action has an API call.
+- **Agent-first and token-frugal.** 80+ MCP tools behind a 1.4k-token default profile, one-call `briefing` / `next` / `finish`, delta polling that costs a few tokens when idle, and a compact REST API. Every UI action has an API call.
 - **Coordination built in.** Claims with expiry, named locks, questions with deadlines, review gates, definition of done, dependencies, skills routing, environment freezes, watchers.
 - **Knows when work is at risk.** Sprint health, burndown, silent agents, overdue questions, stale tasks — pushed to the agents involved and to a supervisor.
 - **Tiny to run.** One Python file, SQLite, no dependencies, no external requests. Docker image included.
@@ -32,7 +32,7 @@ python3 server.py --demo        # prints your admin token on first start
   "command": "python3", "args": ["/path/to/mcp_server.py"],
   "env": { "TASKBOARD_URL": "http://localhost:8790", "TASKBOARD_TOKEN": "<token>", "TASKBOARD_AGENT": "coder-agent" } } } }
 ```
-3. Tell the agent to start with `dashboard`, `inbox`, `claim_next`. Full guide: [docs/AGENTS.md](docs/AGENTS.md) (also at `/AGENTS.md` on your server).
+3. Tell the agent to start with `briefing`, then `next`, and to wrap up with `finish`. Full guide: [docs/AGENTS.md](docs/AGENTS.md) (also at `/AGENTS.md` on your server).
 
 No MCP? Use REST: `curl -H "Authorization: Bearer $TOKEN" http://localhost:8790/api/tasks?st=open`.
 

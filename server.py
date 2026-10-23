@@ -4,7 +4,7 @@
 API is compact by default (short keys, empties omitted, no description in lists).
 Add ?full=1 (or header X-TB-Full:1) for verbose column-named JSON (used by the web UI).
 """
-import calendar, collections, csv, hashlib, hmac, io, ipaddress, json, os, re, secrets, socket, sqlite3, sys, threading, queue, time, urllib.error, urllib.request
+import calendar, collections, csv, http.client, hashlib, hmac, io, ipaddress, json, os, re, secrets, socket, sqlite3, sys, threading, queue, time, urllib.error, urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
@@ -114,6 +114,7 @@ for _t, _c, _d in (("tasks", "blocker", "TEXT DEFAULT ''"), ("tasks", "blocked_b
                    ("boards", "dod", "TEXT DEFAULT ''"), ("agents", "last_seen", "TEXT DEFAULT ''"), ("agents", "status_text", "TEXT DEFAULT ''"), ("agents", "status_task", "INTEGER"), ("agents", "skills", "TEXT DEFAULT ''"),
                    ("boards", "method", "TEXT DEFAULT 'scrum'"), ("boards", "cfg", "TEXT DEFAULT ''"), ("tasks", "type", "TEXT DEFAULT 'task'"), ("tasks", "parent", "INTEGER"),
                    ("sprints", "committed", "INTEGER DEFAULT 0"), ("tasks", "target", "REAL"), ("tasks", "current", "REAL"),
+                   ("notifications", "cnt", "INTEGER DEFAULT 1"), ("agents", "mute", "TEXT DEFAULT ''"),
                    ("boards", "team", "TEXT DEFAULT ''")):
     if _c not in [r[1] for r in db.execute(f"PRAGMA table_info({_t})")]:
         db.execute(f"ALTER TABLE {_t} ADD COLUMN {_c} {_d}")
@@ -594,6 +595,13 @@ def list_tasks(q, full):
     items = [cdict("tasks", r, full, skip) for r in rs]
     if full:
         return {"total": total, "offset": off, "items": items}
+    fl = [x.strip() for x in (_qv(q, "fields") or "").split(",") if x.strip()]
+    if fl:
+        keep = set(["id"] + fl)
+        items = [{k: v for k, v in it.items() if k in keep} for it in items]
+    if _qv(q, "fmt") in ("t", "table"):     # header once, rows as arrays: ~40% fewer tokens than repeating every key
+        cols = ["id"] + [c for c in (fl or ["t", "st", "pr", "as", "s"]) if c != "id"]
+        return {"n": total, "o": off, "h": cols, "r": [[it.get(c, "") for c in cols] for it in items]}
     return {"n": total, "o": off, "i": items}
 
 
@@ -661,6 +669,8 @@ def crud(actor, method, table, rid, body, q, full):
         if not r:
             raise ApiError("nf", 404)
         r = r[0]
+        if table == "tasks" and "brief" in q:
+            return task_brief(rid)
         if table == "sprints":
             return sprint_row(r, full)
         if table == "boards":
@@ -844,10 +854,22 @@ def comment_out(c):
     return {"id": c["id"], "by": c["actor"], "c": c["body"], "ts": c["ts"]}
 
 
+NOTIF_DO = {"task.assigned": "claim", "task.handoff": "claim", "task.ready": "claim", "task.unblocked": "claim", "claim.expired": "claim", "task.comment": "comment",
+            "ask.new": "answer", "ask.overdue": "answer", "review.requested": "decide_review", "task.nudged": "set_task", "sla.breach": "set_task",
+            "review.changes": "set_task", "review.approved": "finish", "ask.answered": "task", "sprint.risk": "risks", "env.frozen": "envs"}
+COALESCE_TYPES = frozenset({"task.updated", "task.status", "task.comment", "watch.task", "task.attachment"})
+
+
 def ndict(r):
     o = {"id": r["id"], "tk": r["task_id"], "b": r["board_id"], "ty": r["type"], "by": r["actor"], "m": r["summary"], "ts": r["ts"]}
     if r["payload"]:
         o["d"] = json.loads(r["payload"])
+    op = NOTIF_DO.get(r["type"])
+    if op:      # the next call that acts on this item, so the agent does not have to fetch the task just to decide
+        ref = (o.get("d") or {}).get("ask") or (o.get("d") or {}).get("review") or r["task_id"]
+        o["do"] = "%s id=%s" % (op, ref) if ref and op not in ("risks", "envs") else op
+    if (r.get("cnt") or 1) > 1:
+        o["x"] = r["cnt"]
     if r["hook"]:
         o["hk"] = r["hook"]
     return {k: v for k, v in o.items() if v not in (None, "")}
@@ -861,6 +883,15 @@ def notify(agent, typ, actor, task_id, board_id, summary, delta=None):
         return
     if actor.lower() not in SYSTEM_ACTORS and "*" not in NOTIFY_ACTORS and actor.lower() not in NOTIFY_ACTORS:
         return
+    mu = db.execute("SELECT mute FROM agents WHERE name=?", (agent,)).fetchone()
+    if mu and mu["mute"] and typ in mu["mute"].split(","):
+        return
+    if typ in COALESCE_TYPES:       # repeated chatter about the same task becomes one item with a counter
+        prev = db.execute("SELECT id FROM notifications WHERE agent=? AND type=? AND task_id IS ? AND read=0 AND ts>=datetime('now','-60 seconds') ORDER BY id DESC LIMIT 1", (agent, typ, task_id)).fetchone()
+        if prev:
+            db.execute("UPDATE notifications SET cnt=COALESCE(cnt,1)+1, summary=?, actor=?, payload=? WHERE id=?",
+                       (summary[:300], actor, json.dumps(delta, separators=(",", ":")) if delta else "", prev["id"]))
+            return
     cur = db.execute("INSERT INTO notifications(agent,task_id,board_id,type,actor,summary,payload) VALUES(?,?,?,?,?,?,?)",
                      (agent, task_id, board_id, typ, actor, summary[:300], json.dumps(delta, separators=(",", ":")) if delta else ""))
     with inbox_cv:
@@ -1029,6 +1060,9 @@ def agent_set(body):
             db.execute("INSERT INTO agents(name,webhook,secret) VALUES(?,?,?)", (name, hook, secret))
         if "capacity" in body:
             db.execute("UPDATE agents SET capacity=? WHERE name=?", (max(0, int(body["capacity"] or 0)), name))
+        if "mute" in body:
+            mu_ = ",".join(sorted({x.strip() for x in (body["mute"] if isinstance(body["mute"], list) else str(body["mute"] or "").split(",")) if x.strip() and "." in x}))[:300]
+            db.execute("UPDATE agents SET mute=? WHERE name=?", (mu_, name))
         if "skills" in body:
             sk = ",".join(sorted({re.sub(r"[^a-z0-9._-]", "", x.strip().lower()) for x in (body["skills"] if isinstance(body["skills"], list) else str(body["skills"] or "").split(",")) if x.strip()}))[:200]
             db.execute("UPDATE agents SET skills=? WHERE name=?", (sk, name))
@@ -2514,6 +2548,215 @@ def replenish_tick(actor="system"):
             set_setting(key, "")
 
 
+# ---------------------------------------------------------------- token-saving calls: briefing, next, finish, batch, guides, usage meter
+def _first(s_, n):
+    s_ = " ".join(str(s_ or "").split())
+    return s_ if len(s_) <= n else s_[:n - 1] + "…"
+
+
+def task_brief(tid, deep=False):
+    """Everything needed to start on a task in ~60 tokens (deep: ~250): title, status, owner, open deps, one-line description, latest comment."""
+    r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+    if not r:
+        raise ApiError("nf", 404)
+    t = r[0]
+    o = {"id": tid, "t": t["title"], "st": t["status"], "pr": t["priority"], "as": t["assignee"], "pt": t["points"] or None, "ty": t["type"] if t["type"] != "task" else None,
+         "sum": _first(t["description"], 1500 if deep else 140) or None}
+    od = open_dep_ids(t["depends"])
+    if od:
+        o["dpo"] = od
+    cm = rows("SELECT actor, body FROM comments WHERE task_id=? ORDER BY id DESC LIMIT ?", (tid, 3 if deep else 1))
+    if cm:
+        o["cc"] = [{"by": c["actor"], "c": _first(c["body"], 220 if deep else 100)} for c in reversed(cm)]
+    if deep:
+        dc = [d["title"] for d in rows("SELECT title FROM docs WHERE (scope='task' AND ref_id=?) OR (scope='board' AND ref_id=?) ORDER BY id LIMIT 8", (tid, t["board_id"]))]
+        if dc:
+            o["rules"] = dc
+        n_at = db.execute("SELECT COUNT(*) FROM attachments WHERE task_id=?", (tid,)).fetchone()[0]
+        if n_at:
+            o["att"] = n_at
+    return {k: v for k, v in o.items() if v not in (None, "", [])}
+
+
+def _avail(me, since, scope):
+    base = "status='todo' AND (claimed_by='' OR claim_until<?) AND (assignee='' OR assignee=? COLLATE NOCASE) AND " + READY_SQL
+    args = [now_s(), me]
+    fr, fa = _in("board_id", scope)
+    if since is not None:
+        ids = set()
+        for e in rows("SELECT payload FROM events WHERE id>? AND type LIKE 'task.%'", (since,)):
+            try:
+                ids.add(json.loads(e["payload"]).get("id"))
+            except ValueError:
+                pass
+        ids = [i for i in ids if isinstance(i, int)]
+        if not ids:
+            return 0
+        base += " AND id IN (%s)" % ",".join("?" * len(ids))
+        args += ids
+    return db.execute("SELECT COUNT(*) FROM tasks WHERE " + base + fr, args + fa).fetchone()[0]
+
+
+def briefing(actor, q):
+    """One call instead of inbox + dashboard + risks. With `since=<c from the last call>` it returns only what changed, or just {"c":N} when nothing did."""
+    me = _qv(q, "as", "agent") or (actor if actor and actor.lower() not in GENERIC_ACTORS else "")
+    if not me:
+        raise ApiError("missing", 400, "as")
+    since = qint(q, "since", None)
+    scope = scope_of(q)
+    cur = last_event()
+    out = {"c": cur}
+    with lock:
+        items = rows("SELECT * FROM notifications WHERE agent=? AND read=0 ORDER BY id LIMIT 30", (me,))
+        if items:
+            out["in"] = [ndict(i) for i in items]
+            if q.get("ack", ["1"])[0] not in ("0", ""):
+                db.execute("UPDATE notifications SET read=1 WHERE id IN (%s)" % ",".join("?" * len(items)), [i["id"] for i in items])
+    nw = _avail(me, since, scope)
+    if nw:
+        out["nw"] = nw
+    if since is None or q.get("full", ["0"])[0] not in ("0", ""):
+        fr, fa = _in("board_id", scope)
+        work = rows("SELECT * FROM tasks WHERE assignee=? COLLATE NOCASE AND status NOT IN ('done','declined')" + fr + " ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'review' THEN 1 WHEN 'todo' THEN 2 WHEN 'blocked' THEN 3 ELSE 4 END, priority, id LIMIT 15", [me] + fa)
+        if work:
+            out["work"] = [{k: v for k, v in cdict("tasks", t, False, ("description",)).items() if k in ("id", "t", "st", "pr", "b", "cu", "dpo")} for t in work]
+        att = attention(scope)[:5]
+        if att:
+            out["att"] = [{"k": a["k"], "sev": a["sev"], "m": a["m"]} for a in att]
+        rk = [{"n": r["n"], "h": r["health"]} for r in active_risks(scope) if r["health"] != "green"]
+        if rk:
+            out["rk"] = rk
+    return out
+
+
+def next_task(actor, body):
+    """claim_next + the context to start working, in one call."""
+    res = claim_next(actor, body)
+    if res.get("none"):
+        return res
+    return {**res, "task": task_brief(res["id"], deep=True)}
+
+
+def task_finish(actor, role, tid, body):
+    """Attach outputs, comment, record PR/sha, then close, send to review, or hand off - one call."""
+    t = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+    if not t:
+        raise ApiError("nf", 404)
+    t = t[0]
+    summary = str(body.get("summary") or "").strip()[:2000]
+    if not summary:
+        raise ApiError("missing", 400, "summary")
+    review, to = str(body.get("review") or "").strip(), str(body.get("to") or "").strip()
+    st = body.get("st") or "done"
+    if st not in STATUSES:
+        raise ApiError("bad", 400, "st")
+    patch = {}
+    for k_, src in (("pu", "pr"), ("pu", "pu"), ("sha", "sha"), ("dn", "dn")):
+        if body.get(src) not in (None, "", []):
+            patch[k_] = body[src]
+    closing = not review and not to
+    if closing and st == "done" and t["status"] != "done":
+        check_done_gate(tid, t["board_id"], ",".join(str(i) for i in patch["dn"]) if isinstance(patch.get("dn"), list) else patch.get("dn", t["dod_done"]))   # fail before any side effect
+    did = []
+    for a in (body.get("attach") or []):
+        att_add(actor, tid, a)
+        did.append("attach")
+    comment_add(actor, tid, {"c": summary}, notify_assignee=False)
+    did.append("comment")
+    if closing:
+        patch["st"] = st
+    if patch:
+        crud(actor, "PATCH", "tasks", tid, patch, {}, False)
+        did.append("update")
+    if review:
+        review_request(actor, tid, {"reviewer": review, "note": summary[:300], "as": body.get("as")})
+        did.append("review")
+    elif to:
+        task_handoff(actor, tid, {"to": to, "summary": summary, "next": body.get("next", ""), "st": body.get("st")})
+        did.append("handoff")
+    return {"id": tid, "did": did, "st": rows("SELECT status FROM tasks WHERE id=?", (tid,))[0]["status"]}
+
+
+GUIDES = {
+    "agent": "Work loop: briefing (no args after the first call: it returns only changes, or just {c}) -> next (claims the best task and returns it with context) -> work -> finish {id,summary,pr,sha,to|review}. "
+             "Reply to inbox items with their `do` hint. heartbeat with one line while busy. lock shared things (env:test). Prefer tasks fields=… fmt=t for lists, task brief=1 for one task, help(op) before an unfamiliar tool.",
+    "coder": "1 briefing. 2 next (read task.sum, rules, dpo). 3 lock repo/env if shared. 4 commit with '#<id>' in the message. 5 finish {id,summary,pr,sha,review:<reviewer>} (or no review for done). "
+             "Blocked? set_task st=blocked bl=why bb=[ids]; ask {to,q,due} when you need an answer; handoff when someone else continues. Tick dn items before done if the board has a definition of done.",
+    "reviewer": "briefing shows review.requested items with do='decide_review id=N'. Read the task with task brief=1 and its attachments, then decide_review {id,decision:approve|changes,note}. changes needs a note and sends the task back. Do not set done yourself while a review is open.",
+    "supervisor": "briefing returns att (needs attention) and rk (sprints at risk). Use portfolio tm=<type> for several boards, attention for the list, risks, agent_stats for load. Escalations arrive as esc.* items. Unblock by reassigning (set_task as=…), answering asks, or freeze_env/unfreeze_env. Force closes only when the gate is wrong.",
+    "planner": "Shape work as tasks with ty (story/epic/bug), pa (epic), pt (points), dp (dependencies), lb. Use specs for decisions (search first, append instead of rewrite). board_flow / board_velocity / okr / board_sla show how the method is going; set_board changes method and limits. Use as='auto' with a skill label to route.",
+}
+
+
+def guide_get(q):
+    role = (_qv(q, "role") or "agent").lower()
+    if role not in GUIDES:
+        raise ApiError("bad", 400, "role")
+    return {"role": role, "roles": sorted(GUIDES), "g": GUIDES[role]}
+
+
+# ---- usage meter: approximate tokens (bytes/4) spent per agent and per route since the server started
+USAGE = {}
+USAGE_SINCE = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+_us_lock = threading.Lock()
+
+
+def route_label(path):
+    return re.sub(r"/\d+", "/{id}", path.replace("/api", "", 1)) or "/"
+
+
+def usage_hit(actor, route, out_b, in_b):
+    with _us_lock:
+        e = USAGE.setdefault((str(actor), route), [0, 0, 0])
+        e[0] += 1
+        e[1] += out_b
+        e[2] += in_b
+
+
+def usage_report(top=8):
+    ag, rt = {}, {}
+    with _us_lock:
+        for (a, r), (n, ob, ib) in USAGE.items():
+            x = ag.setdefault(a, {"n": a, "calls": 0, "out": 0, "in": 0, "routes": []})
+            x["calls"] += n
+            x["out"] += ob // 4
+            x["in"] += ib // 4
+            x["routes"].append({"r": r, "calls": n, "t": (ob + ib) // 4})
+            y = rt.setdefault(r, {"r": r, "calls": 0, "t": 0})
+            y["calls"] += n
+            y["t"] += (ob + ib) // 4
+    for x in ag.values():
+        x["routes"] = sorted(x["routes"], key=lambda z: -z["t"])[:5]
+        x["t"] = x["out"] + x["in"]
+    return {"since": USAGE_SINCE, "unit": "tokens (bytes/4, responses 'out' and requests 'in')",
+            "agents": sorted(ag.values(), key=lambda z: -z["t"])[:top], "routes": sorted(rt.values(), key=lambda z: -z["t"])[:top]}
+
+
+# ---- spec views: outline and one section instead of the whole body
+def spec_view(o, q):
+    if "outline" not in q and not _qv(q, "section"):
+        return o
+    body = o.get("d", "")
+    heads, pos = [], 0
+    lines = body.split("\n")
+    marks = []
+    for i, ln in enumerate(lines):
+        m = re.match(r"^(#{1,4})\s+(.*)", ln)
+        if m:
+            marks.append((i, len(m.group(1)), m.group(2).strip()))
+    sections = []
+    for k, (i, lvl, h) in enumerate(marks):
+        end = marks[k + 1][0] if k + 1 < len(marks) else len(lines)
+        sections.append({"i": k, "h": h, "lvl": lvl, "text": "\n".join(lines[i:end]).strip()})
+    if "outline" in q:
+        return {"id": o["id"], "t": o["t"], "rv": o.get("rv"), "len": len(body), "outline": [{"i": x["i"], "h": x["h"], "lvl": x["lvl"], "len": len(x["text"])} for x in sections]}
+    want = _qv(q, "section")
+    for x in sections:
+        if str(x["i"]) == want or x["h"].lower() == want.lower():
+            return {"id": o["id"], "t": o["t"], "rv": o.get("rv"), "h": x["h"], "d": x["text"]}
+    raise ApiError("nf", 404, "section")
+
+
 # ---------------------------------------------------------------- sprint lifecycle
 def sprint_close(actor, sid, move_to=None, force=False):
     """Close a sprint; unfinished tasks go to `move_to` (sprint id | 'backlog'); default = next planned sprint, else backlog."""
@@ -3109,6 +3352,9 @@ class H(BaseHTTPRequestHandler):
 
     def send_json(self, code, obj, etag=None):
         b = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode()
+        if getattr(self, "_rt", None):
+            usage_hit(getattr(self, "_act", "?"), self._rt, len(b), getattr(self, "_inb", 0))
+            self._rt = None
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(b)))
@@ -3165,6 +3411,34 @@ class H(BaseHTTPRequestHandler):
                 return xf.split(",")[0].strip()
         return self.client_address[0]
 
+    def run_batch(self, body):
+        ops = body.get("ops")
+        if not isinstance(ops, list) or not ops or len(ops) > 20:
+            raise ApiError("bad", 400, "ops")
+        host = "127.0.0.1" if HOST in ("0.0.0.0", "", "::") else HOST
+        port, auth = self.server.server_address[1], self.headers.get("Authorization", "")
+        out = []
+        for op in ops:
+            m, pth = str(op.get("m") or "GET").upper(), str(op.get("p") or "")
+            if m not in ("GET", "POST", "PATCH", "PUT", "DELETE") or not pth.startswith("/") or ".." in pth or pth.startswith(("/batch", "/api/batch")):
+                raise ApiError("bad", 400, "op")
+            data = json.dumps(op["b"]).encode() if isinstance(op.get("b"), (dict, list)) else None
+            conn = http.client.HTTPConnection(host, port, timeout=30)
+            try:
+                conn.request(m, pth if pth.startswith("/api/") else "/api" + pth, data, {"Authorization": auth, "Content-Type": "application/json"})
+                resp = conn.getresponse()
+                raw = resp.read()
+            finally:
+                conn.close()
+            try:
+                r = json.loads(raw)
+            except ValueError:
+                r = raw.decode("utf-8", "replace")[:300]
+            out.append({"s": resp.status, "r": r})
+            if resp.status >= 400 and not body.get("cont"):
+                break
+        return {"n": len(out), "i": out}
+
     def read_body(self, limit=None):
         n = int(self.headers.get("Content-Length") or 0)
         if n > (limit or MAX_BODY):
@@ -3197,6 +3471,11 @@ class H(BaseHTTPRequestHandler):
             return self.err("auth", 401)
         if rate_hit("tok:" + str(actor), RATE_PER_MIN):
             return self.err("rate", 429)
+        self._act, self._rt = actor, route_label(path)
+        try:
+            self._inb = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._inb = 0
         try:
             cl = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -3273,7 +3552,7 @@ class H(BaseHTTPRequestHandler):
                     return self.send_json(200, spec_get(sid, int(msp.group(3))) if msp.group(3) else spec_revs(sid))
                 if not msp.group(2):
                     if method == "GET":
-                        return self.send_json(200, spec_get(sid))
+                        return self.send_json(200, spec_view(spec_get(sid), q))
                     if method in ("PATCH", "PUT"):
                         return self.send_json(200, spec_update(actor, sid, self.read_body()))
                     if method == "DELETE":
@@ -3378,6 +3657,20 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, retro_get(int(mrt.group(1))))
             if mrt and method == "POST":
                 return self.send_json(200, retro_save(actor, int(mrt.group(1)), self.read_body()))
+            if path == "/api/briefing" and method == "GET":
+                return self.send_json(200, briefing(actor, q))
+            if path == "/api/next" and method == "POST":
+                return self.send_json(200, next_task(actor, self.read_body()))
+            mfn = re.fullmatch(r"/api/tasks/(\d+)/finish", path)
+            if mfn and method == "POST":
+                return self.send_json(200, task_finish(actor, self.role, int(mfn.group(1)), self.read_body()))
+            if path == "/api/batch" and method == "POST":
+                return self.send_json(200, self.run_batch(self.read_body()))
+            if path == "/api/guide" and method == "GET":
+                g = guide_get(q)
+                return self.send_raw(200, g["g"], "text/plain; charset=utf-8") if _qv(q, "fmt") == "text" else self.send_json(200, g)
+            if path == "/api/admin/usage" and method == "GET":
+                return self.send_json(200, usage_report())
             if path == "/api/attention" and method == "GET":
                 return self.send_json(200, {"i": attention(scope_of(q))})
             mha = re.fullmatch(r"/api/tasks/(\d+)/(handoff|activity)", path)

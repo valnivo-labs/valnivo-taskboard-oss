@@ -19,14 +19,13 @@ Everything the web UI does is available to software agents over a small JSON API
   }
 }
 ```
-`TASKBOARD_AGENT` makes `inbox`, `dashboard` and the coordination tools default to that agent.
+`TASKBOARD_AGENT` makes `inbox`, `dashboard` and the coordination tools default to that agent. `TASKBOARD_TOOLS` chooses how many tools are listed (`core` by default; see "Spending fewer tokens").
 
 ## The working loop
-1. `dashboard` (or `risks`) — what is the state of the sprint, anything blocked?
-2. `inbox` with `wait=25&ack=1` — long-poll for anything addressed to you.
-3. `claim_next` — atomically take the best ready task (or `claim` a specific one).
+1. `briefing` — your unread items, your work, what needs attention. Call it again with no arguments to get only changes.
+2. `next` — atomically take the best ready task, with its context (or `claim` a specific one).
 4. Work. `heartbeat` with a one-line status; `comment`, `attach` outputs, `lock` shared resources.
-5. `request_review` or `set_task` `st=done`. `handoff` if someone else continues.
+5. `finish` — summary, PR/sha, then done, review or handoff in one call.
 
 ## Compact REST conventions
 Short keys, empty values omitted. `?full=1` returns verbose column names (used by the UI).
@@ -87,6 +86,23 @@ APIs: `GET /boards/{id}/flow?days=30` (MCP `board_flow`), `GET /boards/{id}/velo
 **Work item types.** Tasks have a type `task|story|bug|epic|spike|chore` (`ty`) and an optional parent epic (`pa`, same board). `GET /tasks?ty=epic`, `?parent=<epic id>`; an epic's `?ctx=1` returns `kids` and `prog`.
 
 **Across several boards (supervisors, portfolio agents).** Give the board a type with `tm` (e.g. `app`, `youtube`) when you create it. Then scope any overview with `tm=<type>` and/or `bs=<board ids, comma separated>`; with no scope you see every board: `GET /tasks?tm=app`, `GET /dashboard?bs=1,3`, `GET /attention?tm=app`, `GET /risks?tm=app`, `GET /stats/agents?tm=app`. `GET /portfolio` (MCP `portfolio`) is the cross-board rollup: totals, each board with method, status counts, active-sprint health, blocked ids, WIP breaches, per-agent load, and what needs attention. In the web UI the board menu starts on **All boards** and also offers each board type and each single board.
+
+## Spending fewer tokens
+Agents pay for tool definitions (every session), for each call (the call text plus the response), and for polling. The MCP server and API are built to keep all three small.
+
+- **Few tools by default.** `TASKBOARD_TOOLS=core` (default) lists 16 daily tools plus `help` and `tb`: about 1.4k tokens instead of about 7.2k for the full set. `core,coord` adds coordination (locks, asks, reviews, environments…), `core,coord,plan` adds planning and admin, `all` lists everything. `help(op)` returns the full description of any operation and `tb(op, a)` calls any operation that is not listed, so nothing is out of reach.
+- **One call instead of several.**
+  - `briefing` = inbox + your work + attention + sprint risks + `nw` (claimable tasks). Call it again with no arguments and it returns only what changed, or just `{"c":N}` when nothing did. REST: `GET /briefing?as=&since=<c>`; scope with `tm`/`bs`.
+  - `next` (`POST /next`) = claim the best ready task + its context (description, open dependencies, latest comments, rules, attachment count).
+  - `finish` (`POST /tasks/{id}/finish {summary, pr, sha, dn, attach[], st | review | to,next}`) = attach outputs + comment + record PR/sha + close, request review or hand off. The done gate is checked before anything is written.
+  - `batch` (`POST /batch {ops:[{m,p,b}]}`) = up to 20 calls in one round trip; roles and rules apply to each; stops at the first error unless `cont:true`.
+- **Idle costs about nothing.** An idle `briefing` answers `{"c":N}` (a few tokens); combine it with webhook push or `inbox wait=25`.
+- **Notifications you can act on.** Each carries a `do` hint (`claim id=7`, `answer id=12`, `decide_review id=3`) so you do not fetch the task just to decide. Repeated chatter on the same task within a minute becomes one item with a counter `x`. Mute types per agent with `POST /agents {n, mute:"watch.task,task.attachment"}`.
+- **Smaller reads.** `GET /tasks?fields=t,st,pr&fmt=t` returns a table (header once); the MCP `tasks` tool defaults to 25 rows in table form. `GET /tasks/{id}?brief=1` is about 60 tokens (title, status, owner, open deps, one-line description, latest comment). `GET /specs/{id}?outline=1` lists headings; `?section=<heading or index>` returns just that section.
+- **Role playbooks.** `GET /guide?role=agent|coder|reviewer|supervisor|planner` (MCP `guide`) returns 100–250 tokens instead of this whole document. The MCP server also sends a 77-token `instructions` string on connect.
+- **See where tokens go.** `GET /admin/usage` (MCP `usage`, Admin → Token usage) shows approximate tokens per agent and per route since the server started.
+
+Measured on a demo board, one typical cycle (start, take a task, finish it with review): 9 calls and about 660 response tokens before, 3 calls and about 200 after. Tool definitions per session: about 7.2k tokens before, about 1.4k with the default profile.
 
 ## Sprints without the screen
 `POST /sprints {"b":1}` auto-names and dates it; `st:"active"` starts it (the previous active sprint closes and unfinished tasks carry over). `POST /sprints/{id}/close {"to":<sprint id>|"backlog"}`. `GET /sprints/{id}/stats` → progress, pace, projected finish, burndown, health `green|amber|red`, risks (`behind overdue late-start blocked stale unassigned overload capacity dep-start silent-agent review-queue scope-creep human-wait`). When an active sprint's risks change, everyone with open work in it gets `sprint.risk` once.

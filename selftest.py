@@ -477,3 +477,72 @@ for mth in ("gtd", "lean", "eisenhower"):
     st, b_ = J("POST", "/boards", {"n": mth, "method": mth}); assert b_["mt"] == mth
     t_ = J("POST", "/tasks", {"b": b_["id"], "t": "x", "pr": 2})[1]; assert J("PATCH", f"/tasks/{t_['id']}", {"pr": 1})[1]["pr"] == 1
 print("v10 selftest OK")
+
+# ================= v11: token-saving calls =================
+# ---- guides
+g = J("GET", "/guide?role=coder")[1]; assert g["role"] == "coder" and "finish" in g["g"] and len(g["g"]) < 1200 and "reviewer" in g["roles"]
+assert J("GET", "/guide?role=wizard")[1]["e"] == "bad"
+assert call("GET", "/guide?role=supervisor&fmt=text")[2].startswith("briefing returns att")
+# ---- briefing with a cursor: idle calls cost almost nothing
+st, bf = J("GET", "/briefing?as=Briefer"); assert isinstance(bf["c"], int) and "in" not in bf, bf
+c0 = bf["c"]
+st, bt = J("POST", "/tasks", {"b": BID, "t": "for briefer", "as": "Briefer", "st": "todo"})
+bf = J("GET", f"/briefing?as=Briefer&since={c0}")[1]
+assert len(bf["in"]) == 1 and bf["in"][0]["do"] == f"claim id={bt['id']}" and bf["c"] > c0, bf
+idle = J("GET", f"/briefing?as=Briefer&since={bf['c']}")[1]; assert list(idle) == ["c"], idle                    # acked + nothing new = {"c": N}
+J("POST", "/tasks", {"b": BID, "t": "claimable new work", "st": "todo", "lb": "nwx"})
+assert J("GET", f"/briefing?as=Briefer&since={idle['c']}")[1].get("nw", 0) >= 1
+first = J("GET", "/briefing?as=Briefer")[1]; assert any(w["id"] == bt["id"] for w in first["work"]) and "nw" in first
+# ---- next: claim + context in one call
+st, nx = J("POST", "/tasks", {"b": BID, "t": "context task", "d": "Do the thing carefully. " * 20, "st": "todo", "lb": "nxlabel", "pr": 1, "pt": 3})
+J("POST", f"/tasks/{nx['id']}/comments", {"c": "heads up: use the v2 API"})
+r = J("POST", "/next", {"as": "Nexter", "lb": "nxlabel"})[1]
+assert r["id"] == nx["id"] and r["cb"] == "Nexter" and r["task"]["sum"].startswith("Do the thing") and r["task"]["cc"][0]["c"].startswith("heads up"), r
+assert J("POST", "/next", {"as": "Nexter", "lb": "nxlabel"})[1] == {"none": 1}
+# ---- finish: attach + comment + pr/sha + status in one call; gate checked first
+st, ft = J("POST", "/tasks", {"b": BID, "t": "finish me", "as": "Finisher", "st": "in_progress"})
+r = J("POST", f"/tasks/{ft['id']}/finish", {"summary": "Implemented and tested", "pr": "https://x.y/pr/1", "sha": "abc1", "attach": [{"name": "report", "url": "https://x.y/r", "kind": "report"}]})[1]
+assert r["st"] == "done" and r["did"] == ["attach", "comment", "update"], r
+g = J("GET", f"/tasks/{ft['id']}?ctx=1")[1]; assert g["pu"] == "https://x.y/pr/1" and g["sha"] == "abc1" and g["att"][0]["n"] == "report" and g["cc"][-1]["c"] == "Implemented and tested"
+st, fd = J("POST", "/boards", {"n": "Finish DoD", "dod": "tests"}); st, ft2 = J("POST", "/tasks", {"b": fd["id"], "t": "gated", "st": "in_progress"})
+r = J("POST", f"/tasks/{ft2['id']}/finish", {"summary": "done?", "attach": [{"name": "x"}]}); assert r[1]["e"] == "dod", r
+assert J("GET", f"/tasks/{ft2['id']}/comments")[1]["n"] == 0 and J("GET", f"/tasks/{ft2['id']}/attachments")[1]["n"] == 0        # nothing was written
+assert J("POST", f"/tasks/{ft2['id']}/finish", {"summary": "ok", "dn": [0]})[1]["st"] == "done"
+st, ft3 = J("POST", "/tasks", {"b": BID, "t": "to review", "as": "Finisher", "st": "in_progress"})
+r = J("POST", f"/tasks/{ft3['id']}/finish", {"summary": "please look", "review": "Rev One", "as": "Finisher"})[1]; assert r["st"] == "review" and r["did"][-1] == "review", r
+assert J("GET", "/inbox?as=Rev%20One")[1]["i"][0]["do"].startswith("decide_review id=")
+st, ft4 = J("POST", "/tasks", {"b": BID, "t": "to hand off", "as": "Finisher", "st": "in_progress"})
+r = J("POST", f"/tasks/{ft4['id']}/finish", {"summary": "api done", "to": "Next Dev", "next": "write docs"})[1]; assert r["did"][-1] == "handoff" and J("GET", f"/tasks/{ft4['id']}")[1]["as"] == "Next Dev"
+assert J("POST", f"/tasks/{ft['id']}/finish", {})[1]["e"] == "missing"
+# ---- batch: several calls, one round trip (runs through the normal auth and rules)
+r = J("POST", "/batch", {"ops": [{"m": "GET", "p": f"/tasks/{ft['id']}?brief=1"}, {"m": "GET", "p": "/guide?role=agent"}, {"m": "POST", "p": f"/tasks/{ft['id']}/comments", "b": {"c": "via batch"}}]})[1]
+assert r["n"] == 3 and [x["s"] for x in r["i"]] == [200, 200, 201] and r["i"][0]["r"]["t"] == "finish me", r
+r = J("POST", "/batch", {"ops": [{"p": "/nosuch"}, {"p": "/boards"}]})[1]; assert r["n"] == 1 and r["i"][0]["s"] == 404                           # stops at the first error
+assert J("POST", "/batch", {"ops": [{"p": "/nosuch"}, {"p": "/boards"}], "cont": True})[1]["n"] == 2
+assert J("POST", "/batch", {"ops": [{"m": "POST", "p": "/batch", "b": {"ops": []}}]})[1]["e"] == "bad"
+assert J("POST", "/batch", {"ops": [{"p": "/boards"}]}, tok="vtok")[0] == 403                                                          # a viewer cannot even start a batch
+r = J("POST", "/batch", {"ops": [{"m": "DELETE", "p": f"/boards/{BID}"}]}, tok="wtok")[1]; assert r["i"][0]["s"] == 403                   # roles apply to every inner call
+assert J("POST", "/batch", {"ops": [{"p": "/boards"}] * 21})[1]["e"] == "bad"
+# ---- notifications: coalesced, actionable, mutable
+st, ct = J("POST", "/tasks", {"b": BID, "t": "chatty", "as": "Coal", "st": "todo"}); J("GET", "/inbox?as=Coal&ack=1")
+for i in range(3):
+    J("POST", f"/tasks/{ct['id']}/comments", {"c": "msg %d" % i}, tok="stok")
+ib = [n for n in J("GET", "/inbox?as=Coal")[1]["i"] if n["ty"] == "task.comment"]
+assert len(ib) == 1 and ib[0]["x"] == 3 and "msg 2" in ib[0]["m"] and ib[0]["do"] == f"comment id={ct['id']}", ib
+J("POST", "/agents", {"n": "Mute Me", "mute": "task.comment,watch.task"}); st, mt_ = J("POST", "/tasks", {"b": BID, "t": "muted", "as": "Mute Me"})
+J("POST", f"/tasks/{mt_['id']}/comments", {"c": "hello"}, tok="stok")
+assert [n["ty"] for n in J("GET", "/inbox?as=Mute%20Me")[1]["i"]] == ["task.assigned"]                      # assignment still arrives, comment muted
+# ---- shaped responses
+r = J("GET", f"/tasks?b={BID}&fields=t,st&fmt=t&limit=3")[1]; assert r["h"] == ["id", "t", "st"] and len(r["r"]) == 3 and len(r["r"][0]) == 3, r
+r = J("GET", f"/tasks?b={BID}&fields=t&limit=2")[1]; assert set(r["i"][0]) == {"id", "t"}
+assert J("GET", f"/tasks?b={BID}&fmt=t&limit=1")[1]["h"] == ["id", "t", "st", "pr", "as", "s"]
+bt_ = J("GET", f"/tasks/{nx['id']}?brief=1")[1]; assert bt_["t"] == "context task" and len(json.dumps(bt_)) < 400 and bt_["sum"].endswith("…"), bt_
+st, spx = J("POST", "/specs", {"t": "Big spec", "d": "# Overview\nintro\n## Interface\nthe api\n## Decisions\nwe chose X\n"})
+o = J("GET", f"/specs/{spx['id']}?outline=1")[1]; assert [x["h"] for x in o["outline"]] == ["Overview", "Interface", "Decisions"] and "d" not in o, o
+sc_ = J("GET", f"/specs/{spx['id']}?section=interface")[1]; assert sc_["h"] == "Interface" and "the api" in sc_["d"] and "we chose" not in sc_["d"]
+assert J("GET", f"/specs/{spx['id']}?section=2")[1]["h"] == "Decisions" and J("GET", f"/specs/{spx['id']}?section=nope")[1]["e"] == "nf"
+# ---- usage meter
+u = J("GET", "/admin/usage")[1]
+assert u["agents"] and u["agents"][0]["t"] > 0 and u["routes"] and all("r" in x and "t" in x for x in u["routes"]) and "since" in u, u
+assert J("GET", "/admin/usage", tok="wtok")[0] == 403
+print("v11 selftest OK")

@@ -4,7 +4,7 @@
 Responses are the compact REST JSON as-is (short keys: id,b,s,t,st,pr,as,k,u,d / n,g / p=[done,total]).
 Repeated GETs send If-None-Match; an unchanged resource returns {"same":1}.
 """
-import json, os, sys, urllib.request, urllib.error
+import json, os, re, sys, urllib.request, urllib.error
 from urllib.parse import urlencode
 
 URL = os.environ.get("TASKBOARD_URL", "http://127.0.0.1:8790").rstrip("/")
@@ -40,6 +40,18 @@ def idn(a):
     return {**a, "as": a.get("as") or ME} if (a.get("as") or ME) else a
 
 
+_BRIEF = {"c": None}
+
+
+def _briefing(a):
+    """Remembers the cursor of the last briefing so repeat calls return only changes."""
+    since = None if a.get("full") else _BRIEF["c"]
+    r = api("GET", "/briefing" + qs({"as": a.get("as") or ME, "since": since, "ack": a.get("ack"), "tm": a.get("tm"), "bs": a.get("bs"), "full": 1 if a.get("full") else None}, ["as", "since", "ack", "tm", "bs", "full"]))
+    if isinstance(r, dict) and isinstance(r.get("c"), int):
+        _BRIEF["c"] = r["c"]
+    return r
+
+
 def qs(a, keys):
     p = {k: a[k] for k in keys if a.get(k) not in (None, "")}
     return "?" + urlencode(p) if p else ""
@@ -64,10 +76,10 @@ TOOLS = {
     "board": ("Board snapshot: sprints (p=[done,total]) + tasks without descriptions. Pass d=1 for descriptions.",
               S(["id"], id=i, d=i), lambda a: api("GET", f"/boards/{a['id']}" + qs(a, ["d"]))),
     "tasks": ("List tasks. Filters: board_id|b, sprint_id|s('none'), status|st (single, comma-list, or 'open'/=exclude done), as|assignee, kind|k, lb, ch, open=1, blocked=1, q. Paging: limit,offset. Result {n,o,i}.",
-              S(board_id=i, b=i, tm=s, bs=s, sprint_id=s, s=s, status=s, st=s, assignee=s, **{"as": s}, kind=s, k=s, q=s, lb=s, ch=s, blocked=i, open=i, ready=i, limit=i, offset=i, d=i),
-              lambda a: api("GET", "/tasks" + qs(a, ["board_id", "b", "tm", "bs", "sprint_id", "s", "status", "st", "assignee", "as", "kind", "k", "q", "lb", "ch", "blocked", "open", "ready", "limit", "offset", "d"]))),
-    "task": ("Get one task incl. description. ctx=1 adds dc: docs/rules of task+sprint+board (with bodies).", S(["id"], id=i, ctx=i),
-             lambda a: api("GET", f"/tasks/{a['id']}" + qs(a, ["ctx"]))),
+              S(fields=s, fmt=s, board_id=i, b=i, tm=s, bs=s, sprint_id=s, s=s, status=s, st=s, assignee=s, **{"as": s}, kind=s, k=s, q=s, lb=s, ch=s, blocked=i, open=i, ready=i, limit=i, offset=i, d=i),
+              lambda a: api("GET", "/tasks" + qs({"limit": 25, "fmt": "t", **a}, ["fields", "fmt", "board_id", "b", "tm", "bs", "sprint_id", "s", "status", "st", "assignee", "as", "kind", "k", "q", "lb", "ch", "blocked", "open", "ready", "limit", "offset", "d"]))),
+    "task": ("Get one task incl. description. ctx=1 adds dc: docs/rules of task+sprint+board (with bodies).", S(["id"], id=i, ctx=i, brief=i),
+             lambda a: api("GET", f"/tasks/{a['id']}" + qs(a, ["ctx", "brief"]))),
     "add_task": ("Create a task. Keys: ty(type: task|story|bug|epic|spike|chore) pa(parent epic id) b(board) t(title) d(description) st pr(1-4) as(assignee; 'auto' routes by label/skills) k(human|agent) s(sprint) bl bb(blockers) lb(labels csv) ch(area, optional) pu(PR url) sha dp(depends on ids) pt(points). New tasks join the active sprint unless s is given. Common labels: gate (review inbox), next (pick-up queue), bug, feature. Blocked waiting: st=blocked bl=why bb=[ids]",
                  S(["b", "t"], b=i, t=s, d=s, st=stenum, pr=i, **{"as": s}, k={"type": "string", "enum": ["human", "agent"]}, s=i, bl=s, bb={"type": ["array", "string"]}, lb=s, ch=s,  pu=s, sha=s, cm=CM, dp={"type": ["array", "string"]}, pt=i, ty=s, pa=i, tg=s, cr=s),
                  lambda a: api("POST", "/tasks", a)),
@@ -119,8 +131,8 @@ TOOLS = {
               S(b=i, tm=s, bs=s), lambda a: api("GET", "/risks" + qs(a, ["b", "tm", "bs"]))),
     "specs": ("Shared technical specs library (all agents read/write). Search q (title/body/tags), tag, st(draft|review|approved|deprecated), b(board; also returns global specs), tk(task id). Returns {id,t,tg,st,au,rv,tk,u,sn(snippet when q)}; d=1 adds bodies. Search here BEFORE designing something others may have specced.",
               S(q=s, tag=s, st=s, b=i, tk=i, d=i, limit=i), lambda a: api("GET", "/specs" + qs(a, ["q", "tag", "st", "b", "tk", "d", "limit"]))),
-    "spec": ("Read one spec with its markdown body (d). rev=N reads an older revision.", S(["id"], id=i, rev=i),
-             lambda a: api("GET", f"/specs/{a['id']}" + (f"/revs/{a['rev']}" if a.get("rev") else ""))),
+    "spec": ("Read one spec with its markdown body (d). rev=N reads an older revision.", S(["id"], id=i, rev=i, outline=i, section=s),
+             lambda a: api("GET", f"/specs/{a['id']}" + (f"/revs/{a['rev']}" if a.get("rev") else "") + qs(a, ["outline", "section"]))),
     "add_spec": ("Publish a technical spec for other agents: t(title) d(markdown body) tg(tags csv, e.g. api,auth) st(draft default) b(board id; omit = global) tk(linked task ids) to=[agent names to notify; assignees of linked tasks are always notified].",
                  S(["t"], t=s, d=s, tg=s, st={"type": "string", "enum": ["draft", "review", "approved", "deprecated"]}, b=i, tk={"type": ["array", "string"]}, to={"type": "array", "items": s}, note=s),
                  lambda a: api("POST", "/specs", a)),
@@ -194,13 +206,91 @@ TOOLS = {
     "retro": ("Read a sprint's retrospective and result summary.", S(["id"], id=i), lambda a: api("GET", f"/sprints/{a['id']}/retro")),
     "save_retro": ("Record a sprint retrospective: well, improve (text), actions (list of improvement actions; each becomes a backlog task labelled 'retro' unless make_tasks=false; saving again never duplicates them).",
                    S(["id"], id=i, well=s, improve=s, actions={"type": ["array", "string"]}, make_tasks={"type": "boolean"}), lambda a: api("POST", f"/sprints/{a.pop('id')}/retro", a)),
+    "briefing": ("Session start and idle check in ONE call: your unread notifications (each with a `do` hint for the next call), your open work, what needs attention, sprints at risk, and `nw` = ready tasks you could claim. Call it again with no arguments: it then returns only what changed, or just {c:N} when nothing did. full=1 resets. tm/bs scope it across boards.",
+                 S(**{"as": s}, full=i, ack=i, tm=s, bs=s), lambda a: _briefing(a)),
+    "next": ("Claim the best ready task for you (priority, todo, no open dependencies, unclaimed) and get its context in the same response: description, open deps, latest comments, rules, attachment count. lb=labels/skills to match, b=board, ttl=minutes. {none:1} when the queue is empty.",
+             S(lb=s, b=i, ttl=i, **{"as": s}), lambda a: api("POST", "/next", idn(a))),
+    "finish": ("Wrap up a task in ONE call: summary (required) is posted as a comment; optional attach=[{name,url,kind}], pr, sha, dn=[ticked checklist items]; then st=done (default), or review=<reviewer> to ask for review, or to=<agent> (+next) to hand it over. The done gate (checklist, open reviews) is checked before anything is written.",
+               S(["id", "summary"], id=i, summary=s, pr=s, sha=s, dn={"type": ["array", "string"]}, attach={"type": "array", "items": {"type": "object", "properties": {"name": s, "url": s, "kind": s}}}, to=s, next=s, review=s, st=stenum, **{"as": s}),
+               lambda a: api("POST", f"/tasks/{a['id']}/finish", {k: v for k, v in idn(a).items() if k != 'id'})),
+    "batch": ("Run up to 20 calls in one round trip: ops=[{m:'GET'|'POST'|'PATCH'|'DELETE', p:'/tasks/7', b:{...}}]. Stops at the first error unless cont=true. Returns [{s:status, r:result}].",
+              S(["ops"], ops={"type": "array", "items": {"type": "object", "properties": {"m": s, "p": s, "b": {"type": "object"}}}}, cont={"type": "boolean"}), lambda a: api("POST", "/batch", a)),
+    "guide": ("A short playbook for your role (~100-250 tokens): agent, coder, reviewer, supervisor or planner.", S(role=s), lambda a: api("GET", "/guide" + qs(a, ["role"]))),
+    "usage": ("Admin: approximate tokens spent per agent and per route since the server started (bytes/4), to see what costs the most.", S(), lambda a: api("GET", "/admin/usage")),
     "agents": ("List agents (registered + seen as assignees) with unread inbox counts and webhook URL if set.", S(), lambda a: api("GET", "/agents")),
     "set_agent": ("Register/update an agent: n(name) hook(push webhook URL, '' clears) secret(optional, HMAC-SHA256 in X-Taskboard-Signature) capacity(points or tasks per sprint; 0 = none, drives the capacity risk) skills(csv, e.g. frontend,qa: used by route and as='auto'). Notifications POST {agent,n} there; the inbox always works too.",
-                  S(["n"], n=s, hook=s, secret=s, capacity=i, skills=s), lambda a: api("POST", "/agents", a)),
+                  S(["n"], n=s, hook=s, secret=s, capacity=i, skills=s, mute=s), lambda a: api("POST", "/agents", a)),
     "del_agent": ("Remove an agent's webhook registration.", S(["n"], n=s), lambda a: api("DELETE", "/agents?n=" + urllib.request.quote(a["n"]))),
     "changes": ("Event deltas since event id: {c:last_id,e:[[id,type,entity,board,delta]]}. Store c, pass back as since.",
                 S(["since"], since=i, board_id=i, limit=i), lambda a: api("GET", "/changes" + qs(a, ["since", "board_id", "limit"]))),
 }
+
+
+CORE = ["briefing", "next", "finish", "inbox", "claim", "set_task", "add_task", "tasks", "task", "comment", "handoff", "heartbeat", "answer", "decide_review", "lock", "unlock"]
+COORD = ["claim_next", "release", "locks", "ask", "asks", "cancel_ask", "request_review", "reviews", "watch", "unwatch", "watches", "attach", "attachments", "del_attachment",
+         "route", "envs", "deploy_env", "freeze_env", "unfreeze_env", "decline_task", "reopen_task", "add_commit", "task_activity", "comments"]
+GROUPS = {"core": CORE, "coord": COORD, "plan": [n for n in TOOLS if n not in CORE + COORD]}
+PROFILE = os.environ.get("TASKBOARD_TOOLS", "core")      # core (default) | core,coord | core,coord,plan | all | tool names
+if PROFILE == "all":
+    VISIBLE = list(TOOLS)
+else:
+    VISIBLE = [n for n in dict.fromkeys(x for part in PROFILE.split(",") for x in (GROUPS.get(part.strip()) or ([part.strip()] if part.strip() in TOOLS else [])))]
+
+# one-line descriptions with a key legend for the daily tools; the rest use the first sentence. help(op) returns the full text.
+SHORT = {
+    "briefing": "Start/idle check in one call: unread items (with `do` hint), your work, attention, sprints at risk, nw=claimable tasks. Repeat calls return only changes.",
+    "next": "Claim the best ready task and get its context (desc, deps, comments, rules). lb,b,ttl. {none:1} if empty.",
+    "finish": "Wrap up: summary(required)+attach[],pr,sha,dn[]; then st=done | review=<who> | to=<who>,next. Gate checked first.",
+    "inbox": "Notifications (unread). wait<=30 long-polls, ack=1 marks read. Prefer briefing.",
+    "claim": "Claim task id (ttl min): you become assignee, todo->in_progress. 409 claimed if held.",
+    "set_task": "Patch task id. Keys: t d st pr(1-4) as k s bl bb lb ch pu sha dp pt ty pa dn cr tg ver. ver=v you read (409 on conflict). dn=ticked checklist idx.",
+    "add_task": "Create task. Keys: b(board) t d st pr as('auto'=route) k(human|agent) s bl bb lb ch pu sha dp pt ty(story|bug|epic..) pa(epic id).",
+    "tasks": "List tasks (default 25, table form). Filters: b tm bs s st(csv|open) as(~contains) k lb ch q ready=1 ty parent; fields=t,st,pr; limit offset d=1.",
+    "task": "One task. brief=1 (~60 tokens) | ctx=1 (docs, comments, attachments, reviews) | default full.",
+    "comment": "Comment on task id (c); notifies the assignee and to=[names].",
+    "handoff": "Reassign id to `to` with summary and next; one notification to them.",
+    "heartbeat": "Say you are alive: status (one line), task id. Silent agents with open work are escalated.",
+    "answer": "Answer question id (a) addressed to you.",
+    "decide_review": "Decide review id: decision approve|changes (changes needs note).",
+    "lock": "Take lock `name` (env:test, repo:x) ttl min. 409 locked if held.",
+    "unlock": "Release lock `name`.",
+}
+
+
+def slim(sc):
+    """Drop bare string/integer type declarations: the argument names are self-explanatory and every property costs tokens in every session."""
+    props = {k: ({} if v in ({"type": "string"}, {"type": "integer"}) else v) for k, v in sc.get("properties", {}).items()}
+    out = {"type": "object", "properties": props}
+    if sc.get("required"):
+        out["required"] = sc["required"]
+    return out
+
+
+def short(n, d):
+    if n in SHORT:
+        return SHORT[n]
+    x = re.split(r"(?<=[a-z\)])\. ", d, maxsplit=1)[0]
+    return x if len(x) <= 130 else x[:127] + "..."
+
+
+META = {
+    "help": ("Full description and arguments of any operation (including ones not listed here): op.", {"type": "object", "properties": {"op": {"type": "string"}}, "required": ["op"]}),
+    "tb": ("Call ANY operation by name even if it is not listed: op, a={args}. Use help(op) first.", {"type": "object", "properties": {"op": {"type": "string"}, "a": {"type": "object"}}, "required": ["op"]}),
+}
+
+
+def meta_call(name, a):
+    op = a.get("op")
+    if op not in TOOLS:
+        return {"e": "bad", "f": "op", "ops": sorted(TOOLS)}
+    if name == "help":
+        d, sc, _ = TOOLS[op]
+        return {"op": op, "d": d, "args": sc.get("properties", {}), "req": sc.get("required", [])}
+    return TOOLS[op][2](dict(a.get("a") or {}))
+
+
+INSTRUCTIONS = ("Valnivo Taskboard. Loop: briefing (call again with no args: returns only changes) -> next -> work -> finish. Reply to inbox items with their `do` hint. "
+                "help(op) explains any operation, tb(op,a) calls any operation not listed, guide(role) gives a short playbook. Lists: use fields= and brief=1 to save tokens.")
 
 
 def send(o):
@@ -218,13 +308,15 @@ for line in sys.stdin:
         continue
     if meth == "initialize":
         send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": m["params"].get("protocolVersion", "2024-11-05"),
-              "capabilities": {"tools": {}}, "serverInfo": {"name": "valnivo-taskboard", "version": "0.3"}}})
+              "capabilities": {"tools": {}}, "serverInfo": {"name": "valnivo-taskboard", "version": "0.4"}, "instructions": INSTRUCTIONS}})
     elif meth == "tools/list":
-        send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [{"name": n, "description": d, "inputSchema": sc} for n, (d, sc, _) in TOOLS.items()]}})
+        tl = [{"name": n, "description": short(n, TOOLS[n][0]), "inputSchema": slim(TOOLS[n][1])} for n in VISIBLE]
+        tl += [{"name": n, "description": d, "inputSchema": sc} for n, (d, sc) in META.items()]
+        send({"jsonrpc": "2.0", "id": mid, "result": {"tools": tl}})
     elif meth == "tools/call":
         p = m["params"]
         try:
-            out = TOOLS[p["name"]][2](dict(p.get("arguments") or {}))
+            out = meta_call(p["name"], dict(p.get("arguments") or {})) if p["name"] in META else TOOLS[p["name"]][2](dict(p.get("arguments") or {}))
             send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(out, separators=(",", ":"), ensure_ascii=False)}],
                   "isError": isinstance(out, dict) and "e" in out}})
         except Exception as e:
