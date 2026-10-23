@@ -316,3 +316,5 @@ button.link.krt{color:var(--fg);font-weight:500;text-align:left;overflow-wrap:an
 .chip.sla.ok{background:var(--ok-bg);color:var(--ok)}.chip.sla.warn{background:var(--warn-bg);color:var(--warn)}.chip.sla.bad{background:var(--bad-bg);color:var(--bad-h);font-weight:600}
 .row4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
 @media(max-width:900px){.kr{grid-template-columns:1fr 1fr}.krbar{grid-column:1/-1}.row4{grid-template-columns:repeat(2,1fr)}.okrrow{grid-template-columns:1fr}}
+
+.card.flash{box-shadow:0 0 0 3px var(--pri),var(--sh2);transition:box-shadow .3s}

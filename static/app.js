@@ -106,6 +106,31 @@ function applyPreset(key, persist) {
   document.querySelectorAll("#presets .preset").forEach(b => b.classList.toggle("on", b.dataset.preset === preset));
   render();
 }
+function hiddenReasons(t) {
+  const r = [], sp = $("sprint").value, q = query(), ch = $("chan").value.toLowerCase(), ag = $("asg").value, p = preset;
+  if (sp !== "" && !(sp === "none" ? !t.sprint_id : t.sprint_id == sp)) { const x = B.sprints.find(y => y.id == t.sprint_id); r.push(t.sprint_id ? "it is in " + (x ? x.name : "another sprint") : "it has no sprint"); }
+  if (ag !== "" && !(ag === "none" ? !t.assignee : t.assignee === ag)) r.push("the assignee filter");
+  if (ch !== "" && !(ch === "none" ? !t.channel : (t.channel || "").toLowerCase() === ch)) r.push("the area filter");
+  if (q && !(t.title + " " + (t.channel || "") + " " + (t.assignee || "") + " " + csv(t.labels).join(" ") + " #" + t.id).toLowerCase().includes(q)) r.push("the search box");
+  if (p) r.push(`the "${p}" filter`);
+  return r;
+}
+function showTask(t) {
+  $("search").value = ""; $("asg").value = ""; $("chan").value = ""; autoSprint = false;
+  $("sprint").value = t.sprint_id ? String(t.sprint_id) : "";
+  applyPreset("");
+  const c = document.querySelector(`.card[data-id="${t.id}"]`);
+  if (c) { c.scrollIntoView({block: "center"}); c.classList.add("flash"); setTimeout(() => c.classList.remove("flash"), 2200); }
+}
+async function ensureVisible(id) {
+  for (let i = 0; i < 14 && !(B && B.tasks.some(t => t.id == id)); i++) await new Promise(r => setTimeout(r, 150));     // wait for the live update to arrive
+  if (!B || view !== "board") return;
+  const t = B.tasks.find(x => x.id == id);
+  if (!t || visible().some(x => x.id == id)) return;
+  const why = hiddenReasons(t);
+  toast(`#${id} is saved but hidden by your view${why.length ? ": " + why.join(", ") : ""}.`, "Show it", () => showTask(t));
+}
+
 function visible() {
   const sp = $("sprint").value, q = query(), ch = $("chan").value.toLowerCase(), p = preset, ag = $("asg").value;
   return B.tasks.filter(t => (ag === "" || (ag === "none" ? !t.assignee : t.assignee === ag)) && (sp === "" || (sp === "none" ? !t.sprint_id : t.sprint_id == sp)) &&
@@ -841,7 +866,7 @@ async function quickAdd(status, title) {
   const body = {board_id: B.id, title, status, kind: "agent", ...(ch ? {channel: ch} : {})};
   if (sp > 0) body.sprint_id = +sp;
   const nt = await api("POST", "/tasks", body);
-  qa = {status, text: ""}; render(); undoTask(nt);
+  qa = {status, text: ""}; render(); undoTask(nt); ensureVisible(nt.id);
 }
 
 function handoffDlg(id) {
@@ -865,6 +890,10 @@ function taskDlg(id, status, title, boardId, pri) {
     {status: status || "todo", priority: pri || 3, kind: "agent", title: title || "", sprint_id: sp > 0 ? +sp : ""};
   const people = [...new Set(B.tasks.map(x => x.assignee).filter(Boolean))];
   const bid = id ? t.board_id : (boardId || B.id), bd = BS[bid] || B;
+  if (!id && !t.sprint_id && $("sprint").value !== "none") {      // viewing "No sprint" keeps it sprintless; otherwise land where the team is working
+    const act = (bd.sprints || []).filter(x => x.state === "active").pop(), mm = MET[bd.method];
+    if (act && (!mm || mm.sprints)) t.sprint_id = act.id;
+  }
   dlg(`<div class="dlghead"><span class="crumb">${id ? `<span class="mono">#${id}</span> · ` : ""}${esc(bd.name)}</span><h3>${id ? esc(t.title) : "New task"}</h3></div>
     ${id ? `<div class="dtabs" role="tablist"><button type="button" class="dtab on" role="tab" data-tab="details">Details</button><button type="button" class="dtab" role="tab" data-tab="activity">Activity</button><button type="button" class="dtab" role="tab" data-tab="comments">Comments</button><button type="button" class="dtab" role="tab" data-tab="files">Files</button><button type="button" class="dtab" role="tab" data-tab="review">Review</button></div>` : ""}
     <div class="tp" data-p="details">
@@ -908,7 +937,7 @@ function taskDlg(id, status, title, boardId, pri) {
       } else { d.decline_reason = ""; }
       if (d.channel) localStorage.tb_ch = d.channel;
       if (id) {
-        try { const r = await api("PATCH", "/tasks/" + id, d); if (r && r.w) toast(r.w[0]); }
+        try { const r = await api("PATCH", "/tasks/" + id, d); if (r && r.w) toast(r.w[0]); else ensureVisible(id); }
         catch (e) {
           if (e && e.e === "conflict") { toast("Someone changed this task while you were editing — board reloaded, open it again"); await loadBoard(); }
           else if (e && e.e === "dod") toast("Tick every definition-of-done item before moving this to Done");
@@ -916,7 +945,7 @@ function taskDlg(id, status, title, boardId, pri) {
           throw e;
         }
       }
-      else { d.board_id = bid; const nt = await api("POST", "/tasks", d); undoTask(nt); }
+      else { d.board_id = bid; const nt = await api("POST", "/tasks", d); undoTask(nt); ensureVisible(nt.id); }
     },
     id ? '<button type="button" id="handoff">Hand off…</button><button type="button" class="danger sp" id="del">Delete task</button>' : "", id ? "Save" : "Create task");
   if (id) {
