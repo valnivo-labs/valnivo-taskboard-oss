@@ -546,3 +546,45 @@ u = J("GET", "/admin/usage")[1]
 assert u["agents"] and u["agents"][0]["t"] > 0 and u["routes"] and all("r" in x and "t" in x for x in u["routes"]) and "since" in u, u
 assert J("GET", "/admin/usage", tok="wtok")[0] == 403
 print("v11 selftest OK")
+
+# ================= v12: move a task to another board =================
+st, bsrc = J("POST", "/boards", {"n": "Move src", "dod": "tests"}); st, bdst = J("POST", "/boards", {"n": "Move dst"}); st, bk_ = J("POST", "/boards", {"n": "Move kanban", "method": "kanban", "cf": {"wip": {"in_progress": 1}, "wip_mode": "block"}})
+SRC, DST, KAN = bsrc["id"], bdst["id"], bk_["id"]
+st, ssrc = J("POST", "/sprints", {"b": SRC, "st": "active"}); st, sdst = J("POST", "/sprints", {"b": DST, "st": "active", "n": "Dst sprint"}); st, sdst2 = J("POST", "/sprints", {"b": DST, "n": "Dst later"})
+st, ep = J("POST", "/tasks", {"b": SRC, "t": "Move epic", "ty": "epic"})
+st, mt1 = J("POST", "/tasks", {"b": SRC, "t": "movable", "as": "Mover", "pa": ep["id"], "dn": [0], "pt": 3})
+assert mt1["s"] == ssrc["id"] and mt1["pa"] == ep["id"]
+J("POST", f"/tasks/{mt1['id']}/comments", {"c": "history stays"}, tok="stok"); J("POST", "/docs", {"sc": "task", "r": mt1["id"], "t": "task note", "d": "x"})
+# the raw field can no longer be changed behind the app's back
+assert J("PATCH", f"/tasks/{mt1['id']}", {"board_id": DST})[1]["e"] == "use_move" and J("POST", "/tasks/bulk", {"ids": [mt1["id"]], "board_id": DST})[1]["e"] == "use_move"
+J("GET", "/inbox?as=Mover&ack=1")
+r = J("POST", f"/tasks/{mt1['id']}/move", {"b": DST})[1]
+assert r["b"] == DST and r["from"] == SRC and r["s"] == sdst["id"], r                                        # joins the destination's ACTIVE sprint
+g = J("GET", f"/tasks/{mt1['id']}?ctx=1")[1]
+assert g["b"] == DST and g["s"] == sdst["id"] and "pa" not in g and "dn" not in g and g["v"] >= 2, g              # epic link and checklist ticks reset
+assert any("Moved from 'Move src' to 'Move dst'" in c["c"] for c in g["cc"]) and any(c["c"] == "history stays" for c in g["cc"]), g["cc"]
+assert [d["t"] for d in J("GET", f"/docs?sc=task&r={mt1['id']}&board_id={DST}")[1]["i"]] == ["task note"]            # attached notes follow the task
+assert any(n["ty"] == "task.moved" for n in J("GET", "/inbox?as=Mover")[1]["i"])
+assert mt1["id"] not in [t["id"] for t in J("GET", f"/tasks?b={SRC}&limit=500")[1]["i"]] and mt1["id"] in [t["id"] for t in J("GET", f"/tasks?b={DST}&limit=500")[1]["i"]]
+ev = J("GET", f"/changes?since=0&limit=1000")[1]["e"]; mv = [e for e in ev if e[1] == "task.moved" and e[2] == mt1["id"]]
+assert [e[3] for e in mv] == [SRC, DST] and mv[0][4] == {"b": DST}, mv                                              # old board sees it leave, new board sees it arrive
+# errors
+assert J("POST", f"/tasks/{mt1['id']}/move", {"b": DST})[1]["e"] == "bad" and J("POST", f"/tasks/{mt1['id']}/move", {"b": 99999})[1]["e"] == "nf" and J("POST", f"/tasks/{mt1['id']}/move", {})[1]["e"] == "missing"
+assert J("POST", f"/tasks/{mt1['id']}/move", {"b": SRC, "s": sdst["id"]})[1]["e"] == "bad"                          # sprint must belong to the target board
+r = J("POST", f"/tasks/{mt1['id']}/move", {"b": SRC, "s": ssrc["id"]})[1]; assert r["s"] == ssrc["id"]            # explicit sprint
+# an epic moves with its children; done work leaves the sprint behind; children keep their epic
+st, ep2 = J("POST", "/tasks", {"b": SRC, "t": "Epic with kids", "ty": "epic"})
+k1 = J("POST", "/tasks", {"b": SRC, "t": "kid open", "pa": ep2["id"]})[1]; k2 = J("POST", "/tasks", {"b": SRC, "t": "kid done", "pa": ep2["id"], "st": "done"})[1]
+r = J("POST", f"/tasks/{ep2['id']}/move", {"b": DST})[1]; assert sorted(r["moved"]) == sorted([k1["id"], k2["id"]]) and r["s"] == sdst["id"], r
+assert all(J("GET", f"/tasks/{i}")[1]["b"] == DST for i in (ep2["id"], k1["id"], k2["id"]))
+assert J("GET", f"/tasks/{k1['id']}")[1]["pa"] == ep2["id"] and J("GET", f"/tasks/{k1['id']}")[1]["s"] == sdst["id"] and "s" not in J("GET", f"/tasks/{k2['id']}")[1]
+assert J("GET", f"/tasks/{ep2['id']}?ctx=1")[1]["prog"] == [1, 2]
+st, ep3 = J("POST", "/tasks", {"b": SRC, "t": "Epic alone", "ty": "epic"}); k3 = J("POST", "/tasks", {"b": SRC, "t": "stays behind", "pa": ep3["id"]})[1]
+J("POST", f"/tasks/{ep3['id']}/move", {"b": DST, "children": False}); k3b = J("GET", f"/tasks/{k3['id']}")[1]; assert k3b["b"] == SRC and "pa" not in k3b       # child stays, link cleared
+# destination without sprints, and its WIP limits
+st, kt = J("POST", "/tasks", {"b": SRC, "t": "to kanban", "st": "in_progress"}); assert J("POST", f"/tasks/{kt['id']}/move", {"b": KAN})[1]["b"] == KAN and "s" not in J("GET", f"/tasks/{kt['id']}")[1]
+st, kt2 = J("POST", "/tasks", {"b": SRC, "t": "blocked by wip", "st": "in_progress"})
+r = J("POST", f"/tasks/{kt2['id']}/move", {"b": KAN}); assert r[0] == 409 and r[1]["e"] == "wip" and J("GET", f"/tasks/{kt2['id']}")[1]["b"] == SRC, r             # nothing changed
+assert J("POST", f"/tasks/{kt2['id']}/move", {"b": KAN, "force": True})[1]["b"] == KAN                                                                         # admin override
+assert J("POST", f"/tasks/{kt2['id']}/move", {"b": DST, "force": True}, tok="vtok")[0] == 403                                                                  # viewers cannot
+print("v12 selftest OK")

@@ -620,6 +620,8 @@ def bulk_set_tasks(actor, body, full):
         raise ApiError("bad", 400, "ids")
     patch = {k: v for k, v in body.items() if k not in ("ids", "id")}
     d = validate("tasks", patch, True)
+    if "board_id" in d:
+        raise ApiError("use_move", 400, "b")
     if not d:
         raise ApiError("empty", 400)
     if "status" in d and d["status"] != "blocked":
@@ -769,6 +771,8 @@ def crud(actor, method, table, rid, body, q, full):
             if table == "tasks" and body.get("ver") not in (None, "") and int(body["ver"]) != (old.get("version") or 1):
                 raise ApiError("conflict", 409, "ver")
             if table == "tasks":
+                if "board_id" in d and d["board_id"] != old["board_id"]:
+                    raise ApiError("use_move", 400, "b")
                 _wip = None
                 if "status" in d and d["status"] != old["status"]:
                     _wip = check_wip(old["board_id"], d["status"], tid=rid, force=body.get("force"))
@@ -2429,6 +2433,78 @@ def retro_save(actor, sid, body):
     return retro_get(sid)
 
 
+# ---- move a task (and an epic's children) to another board, keeping everything consistent
+def move_task(actor, tid, body):
+    r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+    if not r:
+        raise ApiError("nf", 404)
+    t = r[0]
+    try:
+        dest = int(body.get("board") or body.get("b") or body.get("board_id") or 0)
+    except (TypeError, ValueError):
+        raise ApiError("bad", 400, "b")
+    if not dest:
+        raise ApiError("missing", 400, "b")
+    dest_b = rows("SELECT * FROM boards WHERE id=?", (dest,))
+    if not dest_b:
+        raise ApiError("nf", 404, "b")
+    src = t["board_id"]
+    if dest == src:
+        raise ApiError("bad", 400, "b")
+    src_b = rows("SELECT * FROM boards WHERE id=?", (src,))[0]
+    sprint = body.get("sprint", body.get("s"))
+    if sprint not in (None, ""):
+        sprint = int(sprint)
+        if not rows("SELECT id FROM sprints WHERE id=? AND board_id=?", (sprint, dest)):
+            raise ApiError("bad", 400, "s")
+    else:
+        sprint = None
+    kids = body.get("children", True) is not False
+    force = bool(body.get("force")) and _priv(getattr(_ctx, "role", "agent"))
+    warns = []
+    with lock:
+        ids = [tid]
+        if t["type"] == "epic":
+            ch = [x["id"] for x in rows("SELECT id FROM tasks WHERE parent=? AND board_id=?", (tid, src))]
+            if kids:
+                ids += ch
+            elif ch:
+                db.execute("UPDATE tasks SET parent=NULL WHERE parent=?", (tid,))
+        moving = rows("SELECT * FROM tasks WHERE id IN (%s)" % ",".join("?" * len(ids)), ids)
+        meth, cfg = board_cfg(dest)
+        if METHODS.get(meth, {}).get("wip"):         # the destination's work-in-progress limits apply to everything arriving
+            arrive = {}
+            for m_ in moving:
+                arrive[m_["status"]] = arrive.get(m_["status"], 0) + 1
+            for st_, n_ in arrive.items():
+                lim = (cfg.get("wip") or {}).get(st_)
+                if lim:
+                    cur = db.execute("SELECT COUNT(*) FROM tasks WHERE board_id=? AND status=?", (dest, st_)).fetchone()[0]
+                    if cur + n_ > lim:
+                        if cfg.get("wip_mode") == "block" and not force:
+                            raise ApiError("wip", 409, st_)
+                        warns.append("WIP limit for %s will be exceeded on the new board (%d of %d)" % (st_, cur + n_, lim))
+        act = rows("SELECT id FROM sprints WHERE board_id=? AND state='active' ORDER BY id DESC LIMIT 1", (dest,)) if board_has_sprints(dest) else []
+        same_dod = (src_b["dod"] or "") == (dest_b[0]["dod"] or "")
+        main_sprint = None
+        for m_ in moving:
+            ns = None if m_["status"] in ("done", "declined") else (sprint if sprint is not None else (act[0]["id"] if act else None))
+            if m_["id"] == tid:
+                main_sprint = ns
+            parent = m_["parent"] if m_["id"] != tid and t["type"] == "epic" else None
+            db.execute("UPDATE tasks SET board_id=?, sprint_id=?, parent=?, dod_done=?, nudge='', updated=CURRENT_TIMESTAMP, version=COALESCE(version,1)+1 WHERE id=?",
+                       (dest, ns, parent, m_["dod_done"] if same_dod else "", m_["id"]))
+            db.execute("UPDATE docs SET board_id=? WHERE scope='task' AND ref_id=?", (dest, m_["id"]))
+            db.execute("UPDATE asks SET board_id=? WHERE task_id=?", (dest, m_["id"]))
+            db.execute("INSERT INTO comments(task_id,actor,body) VALUES(?,?,?)", (m_["id"], actor, "Moved from '%s' to '%s'" % (src_b["name"], dest_b[0]["name"])))
+            emit(actor, "task.moved", m_["id"], src, {"b": dest})
+            emit(actor, "task.moved", m_["id"], dest, cdict("tasks", rows("SELECT * FROM tasks WHERE id=?", (m_["id"],))[0], False))
+            if m_["assignee"]:
+                notify(m_["assignee"], "task.moved", actor, m_["id"], dest, "#%d '%s' moved from '%s' to '%s' by %s" % (m_["id"], m_["title"][:60], src_b["name"], dest_b[0]["name"], actor), {"b": dest})
+    out = {"id": tid, "b": dest, "from": src, "s": main_sprint, "moved": ids[1:], "w": warns}
+    return {k: v for k, v in out.items() if v not in (None, [], "")}
+
+
 # ---- stage-gate (waterfall), OKR progress, support SLAs
 def ensure_phases(bid):
     """A waterfall board without phases gets its default ones (the first is started)."""
@@ -3661,6 +3737,9 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, briefing(actor, q))
             if path == "/api/next" and method == "POST":
                 return self.send_json(200, next_task(actor, self.read_body()))
+            mmv = re.fullmatch(r"/api/tasks/(\d+)/move", path)
+            if mmv and method == "POST":
+                return self.send_json(200, move_task(actor, int(mmv.group(1)), self.read_body()))
             mfn = re.fullmatch(r"/api/tasks/(\d+)/finish", path)
             if mfn and method == "POST":
                 return self.send_json(200, task_finish(actor, self.role, int(mfn.group(1)), self.read_body()))

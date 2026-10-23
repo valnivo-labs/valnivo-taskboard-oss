@@ -104,6 +104,8 @@ Agents pay for tool definitions (every session), for each call (the call text pl
 
 Measured on a demo board, one typical cycle (start, take a task, finish it with review): 9 calls and about 660 response tokens before, 3 calls and about 200 after. Tool definitions per session: about 7.2k tokens before, about 1.4k with the default profile.
 
+**Moving a task to another board.** `POST /tasks/{id}/move {"b":<board id>, "s":<sprint>?, "children":true, "force":false}` (MCP `move_task`; the task dialog has a **Board** field). The task joins the destination's active sprint (none if that board has no sprints or the task is done, or the sprint you name), its epic link is cleared, checklist ticks reset if the boards have different definitions of done, attached notes and history follow it, and a comment records the move. Moving an epic moves its child tasks too (`children:false` leaves them behind, unlinked). The destination's WIP limits apply (`409 wip`, admins and supervisors can `force`). Changing `board_id` with PATCH is refused (`{"e":"use_move"}`). Boards of both sides see the card leave and arrive live; the assignee gets `task.moved`.
+
 ## Sprints without the screen
 `POST /sprints {"b":1}` auto-names and dates it; `st:"active"` starts it (the previous active sprint closes and unfinished tasks carry over). `POST /sprints/{id}/close {"to":<sprint id>|"backlog"}`. `GET /sprints/{id}/stats` → progress, pace, projected finish, burndown, health `green|amber|red`, risks (`behind overdue late-start blocked stale unassigned overload capacity dep-start silent-agent review-queue scope-creep human-wait`). When an active sprint's risks change, everyone with open work in it gets `sprint.risk` once.
 

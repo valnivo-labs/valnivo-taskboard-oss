@@ -729,6 +729,9 @@ function onEv(ev) {
   if (a === "commented") return;
   if (k === "spec") { if (view === "specs") renderSpecs(); return; }
   if (k === "task") {
+    if (a === "moved" && ev.d && ev.d.b != null && !(B.multi ? B.boardIds.includes(ev.d.b) : B.id == ev.d.b)) {
+      const j = B.tasks.findIndex(t => t.id == ev.id); if (j >= 0) B.tasks.splice(j, 1); render(); return;
+    }
     if (B.multi && ev.b != null && !B.boardIds.includes(ev.b)) return;
     const i = B.tasks.findIndex(t => t.id == ev.id);
     if (a === "deleted") { if (i >= 0) B.tasks.splice(i, 1); }
@@ -903,6 +906,7 @@ function taskDlg(id, status, title, boardId, pri) {
     <label>Kind<select name="kind">${opt(["agent", "human"], t.kind)}</select></label></div>
     <div class="row2"><label>Status<select name="status">${opt(ST, t.status)}</select></label>
     <label>Priority (1 = high)<select name="priority">${opt([1, 2, 3, 4], t.priority)}</select></label></div>
+    ${id ? `<label>Board<select name="move_board">${boards.map(b => `<option value="${b.id}" ${b.id == bid ? "selected" : ""}>${esc(b.name)}</option>`).join("")}</select><small class="muted hint" id="movehint" hidden></small></label>` : ""}
     <div class="row2"><label>Sprint<select name="sprint_id"><option value="">none</option>${bd.sprints.map(s => `<option value="${s.id}" ${s.id == t.sprint_id ? "selected" : ""}>${esc(s.name)}</option>`).join("")}</select></label>
     <label>Area / project (optional)<input name="channel" list="chl" placeholder="e.g. backend, docs" value="${esc(t.channel || lastChannel())}"><datalist id="chl">${[...new Set([...CHANNELS, ...B.tasks.map(x => x.channel).filter(Boolean)])].map(c => `<option value="${esc(c)}">`).join("")}</datalist></label></div>
     <div class="row2"><label>Type<select name="type">${TYPES.map(x => `<option value="${x}" ${x === (t.type || "task") ? "selected" : ""}>${x}</option>`).join("")}</select></label>
@@ -926,7 +930,9 @@ function taskDlg(id, status, title, boardId, pri) {
       d.priority = +d.priority;
       d.labels = csv(d.labels).join(",");
       d.depends = csv(d.depends).map(Number).filter(Number.isFinite); d.points = +d.points || 0;
-      d.parent = d.parent ? +d.parent : null; if ("target" in d) { d.target = d.target === "" ? null : +d.target; d.current = d.current === "" ? 0 : +d.current; } d.dod_done = [...document.querySelectorAll("#f [name=dodi]:checked")].map(x => +x.value); delete d.dodi;
+      const moveTo = id && d.move_board ? +d.move_board : 0, moving = !!moveTo && moveTo !== bid; delete d.move_board;
+      if (moving) { delete d.sprint_id; delete d.parent; }
+      d.parent = d.parent ? +d.parent : null; if (moving) delete d.parent; if ("target" in d) { d.target = d.target === "" ? null : +d.target; d.current = d.current === "" ? 0 : +d.current; } d.dod_done = [...document.querySelectorAll("#f [name=dodi]:checked")].map(x => +x.value); delete d.dodi;
       if (id) d.ver = t.version;
       d.blocked_by = csv(d.blocked_by).map(Number).filter(Number.isFinite);
       if (d.status !== "blocked") { delete d.blocker; delete d.blocked_by; }
@@ -937,7 +943,13 @@ function taskDlg(id, status, title, boardId, pri) {
       } else { d.decline_reason = ""; }
       if (d.channel) localStorage.tb_ch = d.channel;
       if (id) {
-        try { const r = await api("PATCH", "/tasks/" + id, d); if (r && r.w) toast(r.w[0]); else ensureVisible(id); }
+        try {
+          const r = await api("PATCH", "/tasks/" + id, d);
+          if (moving) {
+            const mv = await api("POST", `/tasks/${id}/move`, {board: moveTo}), dest = boards.find(b => b.id === moveTo);
+            toast(`#${id} moved to ${dest ? dest.name : "the other board"}${mv.moved ? " with " + mv.moved.length + " child task(s)" : ""}${(mv.w || []).length ? " — " + mv.w[0] : ""}`);
+          } else if (r && r.w) toast(r.w[0]); else ensureVisible(id);
+        }
         catch (e) {
           if (e && e.e === "conflict") { toast("Someone changed this task while you were editing — board reloaded, open it again"); await loadBoard(); }
           else if (e && e.e === "dod") toast("Tick every definition-of-done item before moving this to Done");
@@ -949,6 +961,11 @@ function taskDlg(id, status, title, boardId, pri) {
     },
     id ? '<button type="button" id="handoff">Hand off…</button><button type="button" class="danger sp" id="del">Delete task</button>' : "", id ? "Save" : "Create task");
   if (id) {
+    $("f").querySelector("[name=move_board]").onchange = e => {
+      const to = +e.target.value, mv = to !== bid, h = $("movehint");
+      h.hidden = !mv; h.textContent = mv ? "On save the task moves to that board's active sprint (no sprint if it has none) and its epic link is cleared" + (t.type === "epic" ? "; its child tasks move with it" : "") + "." : "";
+      const sps = $("f").querySelector("[name=sprint_id]"); if (sps) sps.disabled = mv;
+    };
     $("handoff").onclick = () => { $("dlg").close(); dirty = false; handoffDlg(id); };
     let actLoaded = false;
     const loadAct = async () => {
