@@ -1,0 +1,16 @@
+services:
+  taskboard:
+    build: .
+    image: valnivo-taskboard
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8790:8790"   # put a TLS reverse proxy in front before exposing it (see README)
+    volumes:
+      - taskboard-data:/data
+    env_file:
+      - path: .env
+        required: false
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+volumes:
+  taskboard-data:

@@ -1,0 +1,13 @@
+.env
+.env.*
+data/
+*.db
+*.db-*
+__pycache__/
+*.pyc
+*.log
+*.bak
+*.bak-*
+.DS_Store
+agent.token
+env.sh

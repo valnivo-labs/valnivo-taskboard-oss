@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Valnivo Taskboard</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head><body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<symbol id="i-home" viewBox="0 0 24 24"><path d="M4 11l8-7 8 7M6 10v9h12v-9"/></symbol>
+<symbol id="i-board" viewBox="0 0 24 24"><rect x="4" y="4" width="5" height="16" rx="1.5"/><rect x="10" y="4" width="5" height="10" rx="1.5"/><rect x="16" y="4" width="4" height="6" rx="1.5"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.5"/><path d="M5 20c1-4 4-5.5 7-5.5s6 1.5 7 5.5"/></symbol>
+<symbol id="i-doc" viewBox="0 0 24 24"><path d="M7 3h7l4 4v14H7zM14 3v4h4M10 12h6M10 16h6"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="5" y="8" width="14" height="10" rx="3"/><path d="M12 4v4"/><circle cx="9.5" cy="13" r="1"/><circle cx="14.5" cy="13" r="1"/></symbol>
+<symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 8h10M18 8h2M4 16h2M10 16h10"/><circle cx="16" cy="8" r="2"/><circle cx="8" cy="16" r="2"/></symbol>
+<symbol id="i-chev" viewBox="0 0 24 24"><path d="M14 7l-5 5 5 5"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+</svg>
+<div class="shell">
+  <aside class="sidebar" role="banner">
+    <div class="brandrow"><div class="brand"><span class="logo" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M9 10.5 16 23l7-12.5" fill="none" stroke="#fff" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="16" cy="7" r="1.9" fill="#c7d2fe"/></svg></span><div><b>Valnivo</b><span class="sub">Taskboard</span></div></div><button id="collapse" class="mini iconbtn" type="button" aria-label="Collapse menu" aria-expanded="true" title="Collapse menu"><svg class="i"><use href="#i-chev"/></svg></button></div>
+    <div class="boardrow">
+      <label class="sel"><span class="sr">Board</span><select id="board" aria-label="Board"></select></label>
+      <button id="nb" class="iconbtn" type="button" title="New board" aria-label="New board"><svg class="i"><use href="#i-plus"/></svg></button>
+    </div>
+    <nav class="nav" id="tabs" aria-label="Views">
+      <button type="button" data-view="overview" class="tab" title="Overview"><span class="ico"><svg class="i"><use href="#i-home"/></svg></span><span class="navlbl">Overview</span></button>
+      <button type="button" data-view="board" class="tab" title="Board"><span class="ico"><svg class="i"><use href="#i-board"/></svg></span><span class="navlbl">Board</span></button>
+      <button type="button" data-view="mywork" class="tab" title="My work"><span class="ico"><svg class="i"><use href="#i-user"/></svg></span><span class="navlbl">My work</span></button>
+      <button type="button" data-view="specs" class="tab" title="Specs"><span class="ico"><svg class="i"><use href="#i-doc"/></svg></span><span class="navlbl">Specs</span></button>
+      <button type="button" data-view="agents" class="tab" title="Agents"><span class="ico"><svg class="i"><use href="#i-bot"/></svg></span><span class="navlbl">Agents</span><b id="inboxn" hidden></b></button>
+      <button type="button" data-view="admin" class="tab" title="Admin"><span class="ico"><svg class="i"><use href="#i-sliders"/></svg></span><span class="navlbl">Admin</span></button>
+    </nav>
+    <div class="sidefoot">
+      <span id="live" class="live" title="Live updates" role="status" aria-live="polite"><span id="dot" class="dot"></span><span id="who" class="livetext">offline</span></span>
+      <div class="footrow"><button id="playbook" class="mini" type="button" title="API and MCP guide for agents">Agent guide</button><button id="theme" class="mini iconbtn" type="button" title="Toggle theme" aria-label="Toggle theme">&#9680;</button></div>
+      <div class="hints"><kbd>n</kbd> new task · <kbd>/</kbd> search · <kbd>?</kbd> help</div>
+    </div>
+  </aside>
+
+  <div class="content">
+    <header class="pagehead">
+      <div><div class="crumb" id="crumb"></div><h1 id="pagetitle">Board</h1></div>
+      <div class="spacer"></div>
+      <button id="bset" class="mini" type="button" title="Method, WIP limits and rules for this board">Board settings</button>
+      <button id="nt" class="primary" type="button"><svg class="i"><use href="#i-plus"/></svg>New task</button>
+    </header>
+
+    <section class="sprintstrip" id="sprintbar" aria-label="Sprint">
+      <label class="sel"><span class="sr">Sprint</span><select id="sprint" aria-label="Sprint"></select></label>
+      <span id="sprintinfo" class="sprintinfo"></span>
+      <span id="prog" class="prog" title="Progress of the visible tasks"><progress id="bar" max="100" value="0" aria-label="Progress"></progress><span id="progt"></span></span>
+      <button id="sstart" class="mini" type="button" hidden>Start sprint</button>
+      <button id="sclose" class="mini" type="button" hidden>Complete sprint</button>
+      <button id="sretro" class="mini" type="button" hidden>Retrospective</button>
+      <button id="ns" class="mini" type="button" title="Create the next sprint (name and dates are automatic)">+ Sprint</button>
+      <button id="es" class="mini" type="button" title="Edit selected sprint">Edit</button>
+    </section>
+
+    <div class="filterbar" id="filters">
+      <div id="presets" class="presets" role="group" aria-label="Filter presets">
+        <button type="button" class="preset" data-preset="open" title="Open tasks (not done/declined)">Open</button>
+        <button type="button" class="preset" data-preset="blocked" title="Blocked tasks">Blocked</button>
+        <button type="button" class="preset" data-preset="gate" title="Tasks labeled gate">Gate</button>
+        <button type="button" class="preset" data-preset="nudged" title="Stale tasks flagged with nudge">Nudged</button>
+      </div>
+      <label class="sel"><span class="sr">Assignee</span><select id="asg" aria-label="Assignee"></select></label>
+      <label class="sel"><span class="sr">App / channel</span><select id="chan" aria-label="App / channel filter"></select></label>
+      <label class="sel"><span class="sr">Saved views</span><select id="views" aria-label="Saved views"></select></label>
+      <button id="saveview" class="mini" type="button" title="Save the current filters as a view">Save view</button>
+      <input id="search" type="search" placeholder="Search title, assignee, label, #id" aria-label="Filter tasks">
+    </div>
+
+    <main id="main">
+      <section id="v-overview" class="view" hidden></section>
+      <section id="v-board" class="view" hidden><div id="cols" class="cols" aria-label="Kanban board"></div><details id="closed" class="closed"><summary>Closed work <span id="closedn"></span></summary><div id="closedcols" class="cols closed-cols"></div></details></section>
+      <section id="v-mywork" class="view" hidden></section>
+      <section id="v-admin" class="view" hidden></section>
+      <section id="v-specs" class="view" hidden></section>
+      <section id="v-agents" class="view" hidden></section>
+    </main>
+  </div>
+</div>
+<div id="bulkbar" class="bulkbar" hidden></div>
+<dialog id="dlg" aria-modal="true"><form method="dialog" id="f"></form></dialog>
+<script src="app.js"></script>
+</body></html>

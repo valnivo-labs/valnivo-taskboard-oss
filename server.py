@@ -1,0 +1,3493 @@
+#!/usr/bin/env python3
+"""Valnivo Taskboard (open source edition): stdlib REST + SSE + static UI, SQLite persistence.
+
+API is compact by default (short keys, empties omitted, no description in lists).
+Add ?full=1 (or header X-TB-Full:1) for verbose column-named JSON (used by the web UI).
+"""
+import calendar, collections, csv, hashlib, hmac, io, ipaddress, json, os, re, secrets, socket, sqlite3, sys, threading, queue, time, urllib.error, urllib.request
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DB = os.environ.get("TASKBOARD_DB", os.path.join(HERE, "data", "taskboard.db"))
+PORT = int(os.environ.get("PORT", "8790"))
+HOST = os.environ.get("HOST", "127.0.0.1")   # the Docker image sets 0.0.0.0
+NUDGE_HOURS = float(os.environ.get("TASKBOARD_NUDGE_HOURS", "24"))  # stale open → set nu
+NUDGE_OPEN = frozenset({"backlog", "todo", "in_progress", "review", "blocked"})
+NUDGE_INTERVAL_SEC = int(os.environ.get("TASKBOARD_NUDGE_INTERVAL", "1200"))  # 20 min
+# Agent notifications: who triggers them ("*" = any actor; else comma list of token names, e.g. "human")
+NOTIFY_ACTORS = {x.strip().lower() for x in os.environ.get("TASKBOARD_NOTIFY_ACTORS", "*").split(",") if x.strip()} or {"*"}
+SYSTEM_ACTORS = frozenset({"system", "nudge-cron", "recurring"})
+NOTIFY_KEYS = ("status", "assignee", "priority", "title", "description", "blocker", "blocked_by", "sprint_id", "decline_reason")
+inbox_cv = threading.Condition()
+hook_q = queue.Queue()
+MAX_BODY = int(os.environ.get("TASKBOARD_MAX_BODY", str(2 * 1024 * 1024)))          # JSON request bodies
+MAX_IMPORT = int(os.environ.get("TASKBOARD_MAX_IMPORT", str(32 * 1024 * 1024)))    # /import, /import/csv
+RATE_PER_MIN = int(os.environ.get("TASKBOARD_RATE_PER_MIN", "1200"))               # requests per token per minute (0 = off)
+AUTH_FAILS_PER_MIN = int(os.environ.get("TASKBOARD_AUTH_FAILS_PER_MIN", "10"))     # bad tokens per client IP per minute (0 = off)
+TRUST_PROXY = os.environ.get("TASKBOARD_TRUST_PROXY", "") in ("1", "true", "yes")  # honour X-Forwarded-For / -Proto
+ALLOW_PRIVATE_WEBHOOKS = os.environ.get("TASKBOARD_ALLOW_PRIVATE_WEBHOOKS", "") in ("1", "true", "yes")
+# Optional "needs a human" convention: assignees starting with one of these names are treated as human-gated.
+HUMAN_NAMES = [x.strip().lower() for x in os.environ.get("TASKBOARD_HUMAN_NAMES", "").split(",") if x.strip()]
+HUMAN_RULE = os.environ.get("TASKBOARD_HUMAN_RULE", "") in ("1", "true", "yes")   # require 'Missing:' and 'Do exactly:' in human-gated cards
+ROLES = ("admin", "supervisor", "agent", "viewer")
+GENERIC_ACTORS = frozenset({"agent", "human", "anon", "admin"})
+TOKENS = {}   # token -> (name, role). Env: name:token[:role],...  role admin|agent|viewer (default: admin for human/admin/owner, else agent)
+for p in os.environ.get("TASKBOARD_TOKENS", "").split(","):
+    parts = p.strip().split(":")
+    if len(parts) < 2:
+        continue
+    n, role = parts[0].strip(), None
+    if len(parts) >= 3 and parts[-1].strip() in ROLES:
+        role, tk = parts[-1].strip(), ":".join(parts[1:-1])
+    else:
+        tk = ":".join(parts[1:])
+    TOKENS[tk.strip()] = (n, role or ("admin" if n.lower() in ("human", "admin", "owner") else "supervisor" if "supervisor" in n.lower() else "agent"))
+BACKUP_DIR = os.environ.get("TASKBOARD_BACKUP_DIR", os.path.join(os.path.dirname(DB), "backups"))
+STATUSES = ["backlog", "todo", "in_progress", "review", "blocked", "done", "declined"]
+SPRINT_STATES = ["planned", "active", "closed"]
+SILENT_MIN = int(os.environ.get("TASKBOARD_SILENT_MIN", "60"))
+SPRINT_DAYS = int(os.environ.get("TASKBOARD_SPRINT_DAYS", "14"))
+
+os.makedirs(os.path.dirname(DB), exist_ok=True)
+lock = threading.Lock()
+db = sqlite3.connect(DB, check_same_thread=False, isolation_level=None)
+db.row_factory = sqlite3.Row
+db.execute("PRAGMA journal_mode=WAL")
+db.execute("PRAGMA foreign_keys=ON")
+db.executescript("""
+CREATE TABLE IF NOT EXISTS boards(id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT DEFAULT '', created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS sprints(id INTEGER PRIMARY KEY, board_id INTEGER NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+  name TEXT NOT NULL, goal TEXT DEFAULT '', start TEXT, end TEXT, state TEXT DEFAULT 'planned', created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY, board_id INTEGER NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+  sprint_id INTEGER REFERENCES sprints(id) ON DELETE SET NULL, title TEXT NOT NULL, description TEXT DEFAULT '',
+  status TEXT DEFAULT 'backlog', priority INTEGER DEFAULT 3, assignee TEXT DEFAULT '', kind TEXT DEFAULT 'human',
+  created TEXT DEFAULT CURRENT_TIMESTAMP, updated TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, ts TEXT DEFAULT CURRENT_TIMESTAMP, actor TEXT, type TEXT, payload TEXT);
+CREATE TABLE IF NOT EXISTS docs(id INTEGER PRIMARY KEY, scope TEXT NOT NULL, ref_id INTEGER NOT NULL, title TEXT NOT NULL,
+  body TEXT DEFAULT '', url TEXT DEFAULT '', board_id INTEGER, created TEXT DEFAULT CURRENT_TIMESTAMP, updated TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS ix_d_ref ON docs(scope, ref_id);
+CREATE TABLE IF NOT EXISTS agents(name TEXT PRIMARY KEY COLLATE NOCASE, webhook TEXT DEFAULT '', secret TEXT DEFAULT '', created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS notifications(id INTEGER PRIMARY KEY, agent TEXT NOT NULL COLLATE NOCASE, task_id INTEGER, board_id INTEGER,
+  type TEXT, actor TEXT, summary TEXT, payload TEXT DEFAULT '', read INTEGER DEFAULT 0, hook TEXT DEFAULT '', ts TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS risk_state(sprint_id INTEGER PRIMARY KEY, sig TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS specs(id INTEGER PRIMARY KEY, board_id INTEGER, title TEXT NOT NULL, body TEXT DEFAULT '', tags TEXT DEFAULT '',
+  status TEXT DEFAULT 'draft', author TEXT DEFAULT '', updated_by TEXT DEFAULT '', rev INTEGER DEFAULT 1, tasks TEXT DEFAULT '',
+  created TEXT DEFAULT CURRENT_TIMESTAMP, updated TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS spec_revs(id INTEGER PRIMARY KEY, spec_id INTEGER NOT NULL REFERENCES specs(id) ON DELETE CASCADE, rev INTEGER,
+  title TEXT, body TEXT, actor TEXT, note TEXT DEFAULT '', ts TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS ix_sr_spec ON spec_revs(spec_id, rev);
+CREATE TABLE IF NOT EXISTS tokens(id INTEGER PRIMARY KEY, name TEXT NOT NULL, hash TEXT NOT NULL UNIQUE, role TEXT DEFAULT 'agent',
+  created TEXT DEFAULT CURRENT_TIMESTAMP, used TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS templates(id INTEGER PRIMARY KEY, board_id INTEGER REFERENCES boards(id) ON DELETE CASCADE, name TEXT NOT NULL,
+  title TEXT DEFAULT '', description TEXT DEFAULT '', assignee TEXT DEFAULT '', kind TEXT DEFAULT 'agent', priority INTEGER DEFAULT 3,
+  channel TEXT DEFAULT '', labels TEXT DEFAULT '', points INTEGER DEFAULT 0, checklist TEXT DEFAULT '', recur TEXT DEFAULT '', next_run TEXT DEFAULT '',
+  active INTEGER DEFAULT 1, last_task INTEGER, created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS locks(name TEXT PRIMARY KEY, owner TEXT NOT NULL, note TEXT DEFAULT '', expires TEXT NOT NULL, created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS asks(id INTEGER PRIMARY KEY, from_agent TEXT NOT NULL, to_agent TEXT NOT NULL COLLATE NOCASE, task_id INTEGER, board_id INTEGER,
+  question TEXT NOT NULL, answer TEXT DEFAULT '', status TEXT DEFAULT 'open', due TEXT, escalated INTEGER DEFAULT 0,
+  created TEXT DEFAULT CURRENT_TIMESTAMP, answered TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS reviews(id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, requester TEXT NOT NULL,
+  reviewer TEXT NOT NULL COLLATE NOCASE, status TEXT DEFAULT 'pending', note TEXT DEFAULT '', decision_note TEXT DEFAULT '',
+  created TEXT DEFAULT CURRENT_TIMESTAMP, decided TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS envs(name TEXT PRIMARY KEY, sha TEXT DEFAULT '', url TEXT DEFAULT '', deployed_by TEXT DEFAULT '', deployed_at TEXT DEFAULT '',
+  task_id INTEGER, frozen_until TEXT DEFAULT '', freeze_note TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS watches(id INTEGER PRIMARY KEY, agent TEXT NOT NULL COLLATE NOCASE, kind TEXT NOT NULL, ref TEXT NOT NULL, UNIQUE(agent, kind, ref));
+CREATE TABLE IF NOT EXISTS attachments(id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, name TEXT NOT NULL,
+  url TEXT DEFAULT '', kind TEXT DEFAULT 'link', note TEXT DEFAULT '', actor TEXT DEFAULT '', created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS retros(id INTEGER PRIMARY KEY, sprint_id INTEGER NOT NULL UNIQUE REFERENCES sprints(id) ON DELETE CASCADE,
+  well TEXT DEFAULT '', improve TEXT DEFAULT '', actions TEXT DEFAULT '[]', author TEXT DEFAULT '', created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS ix_n_agent ON notifications(agent, read, id);
+CREATE TABLE IF NOT EXISTS comments(id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  actor TEXT, body TEXT NOT NULL, ts TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS ix_t_board ON tasks(board_id); CREATE INDEX IF NOT EXISTS ix_t_sprint ON tasks(sprint_id);
+""")
+
+for _t, _c, _d in (("tasks", "blocker", "TEXT DEFAULT ''"), ("tasks", "blocked_by", "TEXT DEFAULT ''"),
+                   ("tasks", "labels", "TEXT DEFAULT ''"), ("tasks", "channel", "TEXT DEFAULT ''"),
+                   ("tasks", "watch", "TEXT DEFAULT ''"), ("tasks", "short_url", "TEXT DEFAULT ''"),
+                   ("tasks", "video_id", "TEXT DEFAULT ''"), ("tasks", "publish_at", "TEXT DEFAULT ''"),
+                   ("tasks", "pr_url", "TEXT DEFAULT ''"), ("tasks", "sha", "TEXT DEFAULT ''"), ("tasks", "commits", "TEXT DEFAULT ''"), ("tasks", "decline_reason", "TEXT DEFAULT ''"), ("tasks", "nudge", "TEXT DEFAULT ''"),
+                   ("tasks", "depends", "TEXT DEFAULT ''"), ("tasks", "points", "INTEGER DEFAULT 0"), ("agents", "capacity", "INTEGER DEFAULT 0"),
+                   ("tasks", "claimed_by", "TEXT DEFAULT ''"), ("tasks", "claim_until", "TEXT DEFAULT ''"), ("tasks", "version", "INTEGER DEFAULT 1"), ("tasks", "dod_done", "TEXT DEFAULT ''"),
+                   ("boards", "dod", "TEXT DEFAULT ''"), ("agents", "last_seen", "TEXT DEFAULT ''"), ("agents", "status_text", "TEXT DEFAULT ''"), ("agents", "status_task", "INTEGER"), ("agents", "skills", "TEXT DEFAULT ''"),
+                   ("boards", "method", "TEXT DEFAULT 'scrum'"), ("boards", "cfg", "TEXT DEFAULT ''"), ("tasks", "type", "TEXT DEFAULT 'task'"), ("tasks", "parent", "INTEGER"),
+                   ("sprints", "committed", "INTEGER DEFAULT 0"),
+                   ("boards", "team", "TEXT DEFAULT ''")):
+    if _c not in [r[1] for r in db.execute(f"PRAGMA table_info({_t})")]:
+        db.execute(f"ALTER TABLE {_t} ADD COLUMN {_c} {_d}")
+
+FIELDS = {
+    "boards": ["name", "description", "team", "dod", "method", "cfg"],
+    "docs": ["scope", "ref_id", "title", "body", "url"],
+    "sprints": ["board_id", "name", "goal", "start", "end", "state"],
+    "tasks": ["board_id", "sprint_id", "title", "description", "status", "priority", "assignee", "kind", "blocker", "blocked_by", "labels", "channel", "watch", "short_url", "video_id", "publish_at", "pr_url", "sha", "commits", "decline_reason", "nudge", "depends", "points", "dod_done", "type", "parent"],
+}
+REQUIRED = {"docs": ["scope", "ref_id", "title"], "boards": ["name"], "sprints": ["board_id"], "tasks": ["board_id", "title"]}
+# db column -> short key (compact mode). Input accepts short or long keys.
+CK = {
+    "boards": {"id": "id", "name": "n", "description": "d", "team": "tm", "dod": "dd", "method": "mt", "cfg": "cf"},
+    "docs": {"id": "id", "scope": "sc", "ref_id": "r", "title": "t", "body": "d", "url": "u", "board_id": "b"},
+    "sprints": {"id": "id", "board_id": "b", "name": "n", "goal": "g", "start": "from", "end": "to", "state": "st", "committed": "cmt"},
+    "tasks": {"id": "id", "board_id": "b", "sprint_id": "s", "title": "t", "description": "d", "status": "st",
+              "priority": "pr", "assignee": "as", "kind": "k", "updated": "u", "blocker": "bl", "blocked_by": "bb", "labels": "lb", "channel": "ch",
+              "watch": "w", "short_url": "sh", "video_id": "vid", "publish_at": "at", "pr_url": "pu", "sha": "sha", "commits": "cm", "decline_reason": "dr", "nudge": "nu", "depends": "dp", "points": "pt", "dod_done": "dn", "claimed_by": "cb", "claim_until": "cu", "version": "v", "type": "ty", "parent": "pa"},
+}
+IN = {t: {**{v: k for k, v in m.items()}, **{k: k for k in m}} for t, m in CK.items()}
+
+subs = set()
+subs_lock = threading.Lock()
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def check_public_url(url):
+    """Webhook targets must be http(s) and, unless TASKBOARD_ALLOW_PRIVATE_WEBHOOKS=1, resolve only to public addresses
+    (blocks loopback, private ranges, link-local/cloud-metadata, multicast, reserved). Redirects are never followed."""
+    from urllib.parse import urlparse
+    u = urlparse(str(url))
+    if u.scheme not in ("http", "https") or not u.hostname:
+        raise ApiError("bad", 400, "hook")
+    if ALLOW_PRIVATE_WEBHOOKS:
+        return True
+    try:
+        infos = socket.getaddrinfo(u.hostname, u.port or (443 if u.scheme == "https" else 80), proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        raise ApiError("bad", 400, "hook")
+    for inf in infos:
+        ip = ipaddress.ip_address(inf[4][0].split("%")[0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+            raise ApiError("private_url", 400, "hook")
+    return True
+
+
+class ApiError(Exception):
+    def __init__(self, code, status=400, field=None):
+        self.code, self.status, self.field = code, status, field
+
+
+
+def is_owner_assignee(asg):
+    """Human-gated cards: assignee name starts with one of TASKBOARD_HUMAN_NAMES (off by default)."""
+    a = (asg or "").strip().lower()
+    return bool(a) and any(a.startswith(n) for n in HUMAN_NAMES)
+
+
+
+def _lbl_set(labels):
+    return {x.strip().lower() for x in str(labels or "").split(",") if x.strip()}
+
+
+def _lbl_csv(ls):
+    return ",".join(sorted(ls))[:200]
+
+
+def nudge_tick(board_id=None, actor="system"):
+    """Flag stale open tasks: set nu=timestamp + lb contains nudge; clear both when not stale.
+    Also auto-unblock: if st=blocked and every bb id is done/declined, clear bl/bb → todo.
+    """
+    import datetime as _dt
+    n_set = n_clr = n_ub = 0
+    now = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+    cutoff = now - _dt.timedelta(hours=max(NUDGE_HOURS, 0))
+    stamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    with lock:
+        wh, args = [], []
+        if board_id is not None:
+            wh.append("board_id=?")
+            args.append(board_id)
+        sql = "SELECT id, board_id, status, updated, nudge, labels, blocked_by, blocker, assignee, title, priority FROM tasks" + (" WHERE " + " AND ".join(wh) if wh else "")
+        for r in rows(sql, args):
+            lbs = _lbl_set(r["labels"])
+            has_nu = bool(r["nudge"]) or ("nudge" in lbs)
+            try:
+                upd = _dt.datetime.strptime((r["updated"] or "")[:19], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                upd = None
+            stale = (NUDGE_HOURS > 0 and upd is not None and upd <= cutoff and r["status"] in NUDGE_OPEN)
+            if stale and not has_nu:
+                lbs.add("nudge")
+                db.execute("UPDATE tasks SET nudge=?, labels=? WHERE id=?", (stamp, _lbl_csv(lbs), r["id"]))
+                emit(actor, "task.nudged", r["id"], r["board_id"], {"nu": stamp, "lb": _lbl_csv(lbs)})
+                notify(r["assignee"], "task.nudged", actor, r["id"], r["board_id"],
+                       "#%d '%s' has had no update for %gh - please act or update it" % (r["id"], r["title"][:80], NUDGE_HOURS), {"nu": stamp})
+                if r["priority"] <= 2 or is_owner_assignee(r["assignee"]):
+                    escalate("stale", actor, r["id"], r["board_id"], "#%d '%s' (p%s) stale for %gh" % (r["id"], r["title"][:70], r["priority"], NUDGE_HOURS), skip=(r["assignee"],))
+                n_set += 1
+            elif (not stale) and has_nu and r["status"] not in NUDGE_OPEN:
+                # done/declined: clear
+                lbs.discard("nudge")
+                db.execute("UPDATE tasks SET nudge='', labels=? WHERE id=?", (_lbl_csv(lbs), r["id"]))
+                n_clr += 1
+            # auto-unblock (#12)
+            if r["status"] == "blocked":
+                bbs = [int(x) for x in re.findall(r"\d+", str(r["blocked_by"] or ""))]
+                if bbs:
+                    doneish = {x["id"] for x in rows(
+                        "SELECT id FROM tasks WHERE id IN (%s) AND status IN ('done','declined')" % ",".join("?" * len(bbs)), bbs)}
+                    if len(doneish) == len(set(bbs)):
+                        lbs.discard("nudge")
+                        db.execute(
+                            "UPDATE tasks SET status='todo', blocker='', blocked_by='', nudge='', labels=?, updated=CURRENT_TIMESTAMP WHERE id=?",
+                            (_lbl_csv(lbs), r["id"]))
+                        emit(actor, "task.updated", r["id"], r["board_id"], {"st": "todo", "bl": "", "bb": "", "nu": ""})
+                        notify(r["assignee"], "task.unblocked", actor, r["id"], r["board_id"],
+                               "#%d '%s' is unblocked (all blockers done) -> todo" % (r["id"], r["title"][:80]), {"st": "todo"})
+                        n_ub += 1
+        try:
+            risk_alerts()
+            housekeeping(actor)
+        except Exception:
+            pass
+    return {"set": n_set, "cleared": n_clr, "unblocked": n_ub}
+
+
+def has_owner_steps(desc):
+    if not HUMAN_RULE:
+        return True
+    d = desc or ""
+    return "Missing:" in d and "Do exactly:" in d
+
+
+def rows(sql, args=()):
+    return [dict(r) for r in db.execute(sql, args).fetchall()]
+
+
+def last_event():
+    return db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
+
+
+def emit(actor, typ, eid, board, delta):
+    """Event = type + entity id + board + changed fields (short keys). Full compact entity only on create."""
+    data = {"id": eid, "b": board}
+    if delta is not None:
+        data["d"] = delta
+    cur = db.execute("INSERT INTO events(actor,type,payload) VALUES(?,?,?)",
+                     (actor, typ, json.dumps(data, separators=(",", ":"))))
+    ev = {"i": cur.lastrowid, "t": typ, "a": actor, **data}
+    with subs_lock:
+        for q in list(subs):
+            q.put(ev)
+
+
+MAX_CM = 20
+
+
+def norm_commits(v):
+    """Normalize commit list -> [{h,u,m,r?}], deduped by h+u, capped (keeps newest). Accepts h|sha, u|url, m|msg."""
+    if isinstance(v, str):
+        try:
+            v = json.loads(v) if v.strip() else []
+        except Exception:
+            raise ApiError("bad", 400, "cm")
+    if isinstance(v, dict):
+        v = [v]
+    if not isinstance(v, list):
+        raise ApiError("bad", 400, "cm")
+    out, seen = [], set()
+    for c in v:
+        if not isinstance(c, dict):
+            raise ApiError("bad", 400, "cm")
+        h = str(c.get("h") or c.get("sha") or "").strip()[:64]
+        u = str(c.get("u") or c.get("url") or "").strip()[:500]
+        m = " ".join(str(c.get("m") or c.get("msg") or "").split())[:200]
+        r = str(c.get("r") or c.get("repo") or "").strip()[:100]
+        if not u and r and h:
+            u = "https://github.com/%s/commit/%s" % (r, h)
+        if not (h or u) or (h, u) in seen:
+            continue
+        seen.add((h, u))
+        o = {"h": h, "u": u, "m": m, "r": r}
+        out.append({k: x for k, x in o.items() if x or k == "h"})
+    return out[-MAX_CM:]
+
+
+def parse_task_ids(msg):
+    """Task ids referenced in a commit message: #42, task:42, task #42, task 42."""
+    ids = []
+    for m in re.finditer(r"(?:\btask\s*[:#]?\s*|(?<![\w&/])#)(\d+)\b", str(msg or ""), re.I):
+        i = int(m.group(1))
+        if i not in ids:
+            ids.append(i)
+    return ids
+
+
+def commits_of(r):
+    try:
+        return json.loads(r.get("commits") or "[]")
+    except Exception:
+        return []
+
+
+def append_commit(actor, tid, body):
+    cs = norm_commits(body)
+    if not cs:
+        raise ApiError("missing", 400, "h")
+    with lock:
+        r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+        if not r:
+            raise ApiError("nf", 404)
+        r = r[0]
+        new = norm_commits(commits_of(r) + cs)
+        db.execute("UPDATE tasks SET commits=?, updated=CURRENT_TIMESTAMP WHERE id=?", (json.dumps(new, separators=(",", ":")), tid))
+        emit(actor, "task.updated", tid, r["board_id"], {"cm": new})
+    return {"id": tid, "cm": new}
+
+
+def append_commit_by_msg(actor, body):
+    """POST /tasks/commits {h,u,m,r?,ids?}: attach to tasks named in ids or parsed from m (#N / task:N)."""
+    ids = body.get("ids") or parse_task_ids(body.get("m") or body.get("msg"))
+    if not ids:
+        raise ApiError("missing", 400, "ids")
+    res = []
+    for i in ids:
+        try:
+            res.append(append_commit(actor, int(i), body))
+        except ApiError as e:
+            if e.code != "nf":
+                raise
+    return {"n": len(res), "i": res}
+
+
+def cdict(table, r, full, skip=()):
+    if table == "tasks" and "commits" in r:
+        r = {**r, "commits": commits_of(r)}
+    if full:
+        return r
+    m = CK[table]
+    return {m[k]: v for k, v in r.items() if k in m and k not in skip and v is not None and v != "" and v != [] and not (k == "points" and not v)}
+
+
+def validate(table, body, partial):
+    out = {}
+    amap = IN[table]
+    for k, v in body.items():
+        if k in amap and amap[k] in FIELDS[table]:
+            out[amap[k]] = v
+    if not partial:
+        for k in REQUIRED[table]:
+            if not out.get(k):
+                raise ApiError("missing", 400, CK[table][k])
+    if "status" in out and out["status"] not in STATUSES:
+        raise ApiError("bad", 400, "st")
+    if "state" in out and out["state"] not in SPRINT_STATES:
+        raise ApiError("bad", 400, "st")
+    if "kind" in out and out["kind"] not in ("human", "agent"):
+        raise ApiError("bad", 400, "k")
+    if "priority" in out:
+        try:
+            out["priority"] = int(out["priority"])
+            assert 1 <= out["priority"] <= 4
+        except Exception:
+            raise ApiError("bad", 400, "pr")
+    if "blocked_by" in out:
+        bb = out["blocked_by"]
+        ids = bb if isinstance(bb, list) else re.findall(r"\d+", str(bb or ""))
+        out["blocked_by"] = ",".join(str(int(i)) for i in ids)
+    if "channel" in out:
+        out["channel"] = " ".join(str(out["channel"] or "").split())[:40]
+    if "labels" in out:
+        ls = out["labels"] if isinstance(out["labels"], list) else str(out["labels"] or "").split(",")
+        # stored lowercase
+        out["labels"] = ",".join(sorted({x.strip().lower() for x in ls if x.strip()}))[:200]
+    if "watch" in out:
+        out["watch"] = str(out["watch"] or "").strip()[:500]
+    if "short_url" in out:
+        out["short_url"] = str(out["short_url"] or "").strip()[:500]
+    if "pr_url" in out:
+        out["pr_url"] = str(out["pr_url"] or "").strip()[:500]
+    if "commits" in out:
+        out["commits"] = json.dumps(norm_commits(out["commits"]), separators=(",", ":"))
+    if "sha" in out:
+        out["sha"] = str(out["sha"] or "").strip()[:200]
+    if "video_id" in out:
+        vid = re.sub(r"[^A-Za-z0-9_-]", "", str(out["video_id"] or ""))[:32]
+        out["video_id"] = vid
+    if "publish_at" in out:
+        out["publish_at"] = str(out["publish_at"] or "").strip()[:40]
+    if "decline_reason" in out:
+        out["decline_reason"] = str(out["decline_reason"] or "").strip()[:500]
+    if "nudge" in out:
+        out["nudge"] = str(out["nudge"] or "").strip()[:40]
+    if "depends" in out:
+        dv = out["depends"]
+        ids = dv if isinstance(dv, list) else re.findall(r"\d+", str(dv or ""))
+        out["depends"] = ",".join(str(i) for i in sorted({int(x) for x in ids}))[:200]
+    if "dod_done" in out:
+        dv = out["dod_done"]
+        ids = dv if isinstance(dv, list) else re.findall(r"\d+", str(dv or ""))
+        out["dod_done"] = ",".join(str(i) for i in sorted({int(x) for x in ids}))[:200]
+    if "dod" in out:
+        out["dod"] = "\n".join(ln.strip() for ln in str(out["dod"] or "").splitlines() if ln.strip())[:2000]
+    if "points" in out:
+        try:
+            out["points"] = int(out["points"] or 0)
+            assert 0 <= out["points"] <= 1000
+        except Exception:
+            raise ApiError("bad", 400, "pt")
+    if "method" in out and out["method"] not in METHODS:
+        raise ApiError("bad", 400, "mt")
+    if "cfg" in out:
+        out["cfg"] = norm_cfg(out["cfg"])
+    if "type" in out and out["type"] not in TASK_TYPES:
+        raise ApiError("bad", 400, "ty")
+    if "parent" in out:
+        try:
+            out["parent"] = int(out["parent"]) if out["parent"] not in (None, "", 0, "0") else None
+        except (TypeError, ValueError):
+            raise ApiError("bad", 400, "pa")
+    if table == "docs":
+        if "scope" in out and out["scope"] not in DOC_SCOPES:
+            raise ApiError("bad", 400, "sc")
+        if "ref_id" in out:
+            try:
+                out["ref_id"] = int(out["ref_id"])
+            except Exception:
+                raise ApiError("bad", 400, "r")
+    return out
+
+
+DOC_SCOPES = {"board": "boards", "sprint": "sprints", "task": "tasks"}
+
+
+def doc_board(scope, ref):
+    t = DOC_SCOPES[scope]
+    r = db.execute(f"SELECT {'id' if t == 'boards' else 'board_id'} FROM {t} WHERE id=?", (ref,)).fetchone()
+    if not r:
+        raise ApiError("nf", 404, "r")
+    return r[0]
+
+
+def docs_for(pairs, full, body=True):
+    """pairs: [(scope, ref_id)] -> compact doc list."""
+    out = []
+    for sc, rf in pairs:
+        for r in rows("SELECT * FROM docs WHERE scope=? AND ref_id=? ORDER BY id", (sc, rf)):
+            out.append(cdict("docs", r, full, () if body else ("body",)))
+    return out
+
+
+def sprint_row(s, full):
+    by = {r["status"]: r["n"] for r in rows("SELECT status, COUNT(*) n FROM tasks WHERE sprint_id=? GROUP BY status", (s["id"],))}
+    total = sum(by.values())
+    if full:
+        s["progress"] = {"total": total, "done": by.get("done", 0), "by_status": by}
+        return s
+    o = cdict("sprints", s, False)
+    o["p"] = [by.get("done", 0), total]  # [done,total]
+    return o
+
+
+def qint(q, k, default=None):
+    try:
+        return int(q[k][0])
+    except (KeyError, ValueError, IndexError):
+        return default
+
+
+def _qv(q, *keys, default=None):
+    """First present query value among short/long aliases."""
+    for k in keys:
+        if k in q and q[k]:
+            return q[k][0]
+    return default
+
+
+def list_tasks(q, full):
+    bid0 = _qv(q, "b", "board_id")
+    try:
+        nudge_tick(int(bid0) if bid0 is not None else None)
+    except Exception:
+        pass
+    where, args = [], []
+    # short+long aliases: st/status, as/assignee, k/kind, b/board_id, s/sprint_id
+    st = _qv(q, "st", "status")
+    if st:
+        if st in ("open", "!done"):
+            where.append("status NOT IN ('done','declined')")
+        else:
+            sts = [x.strip() for x in st.split(",") if x.strip()]
+            bad = [x for x in sts if x not in STATUSES]
+            if bad:
+                raise ApiError("bad", 400, "st")
+            if len(sts) == 1:
+                where.append("status=?")
+                args.append(sts[0])
+            elif sts:
+                where.append("status IN (%s)" % ",".join("?" * len(sts)))
+                args.extend(sts)
+    if q.get("open", ["0"])[0] == "1":
+        where.append("status NOT IN ('done','declined')")
+    if q.get("blocked", ["0"])[0] == "1":
+        where.append("status='blocked'")
+    if q.get("nu", ["0"])[0] in ("1", "yes", "true"):
+        where.append("nudge!=''")
+    if _qv(q, "ty", "type"):
+        where.append("type=?")
+        args.append(_qv(q, "ty", "type"))
+    if _qv(q, "parent", "pa"):
+        where.append("parent=?")
+        args.append(_qv(q, "parent", "pa"))
+    if q.get("ready", ["0"])[0] in ("1", "yes", "true"):
+        where.append("status NOT IN ('done','declined') AND NOT EXISTS (SELECT 1 FROM tasks dd WHERE dd.status NOT IN ('done','declined') AND (',' || tasks.depends || ',') LIKE '%,' || dd.id || ',%')")
+    asg = _qv(q, "as", "assignee")
+    if asg is not None:
+        if asg.startswith("~"):
+            where.append("assignee LIKE ? COLLATE NOCASE")
+            args.append("%" + asg[1:] + "%")
+        else:
+            where.append("assignee=?")
+            args.append(asg)
+    kind = _qv(q, "k", "kind")
+    if kind is not None:
+        where.append("kind=?")
+        args.append(kind)
+    bid = _qv(q, "b", "board_id")
+    if bid is not None:
+        where.append("board_id=?")
+        args.append(bid)
+    else:
+        sids = scope_ids(q)
+        if sids is not None:
+            frag, fargs = _in("board_id", sids)
+            where.append(frag.replace(" AND ", "", 1))
+            args.extend(fargs)
+    sid = _qv(q, "s", "sprint_id")
+    if sid is not None:
+        if sid in ("none", "null"):
+            where.append("sprint_id IS NULL")
+        else:
+            where.append("sprint_id=?")
+            args.append(sid)
+    if "ch" in q:
+        if q["ch"][0] in ("none", "null"):
+            where.append("channel=''")
+        else:
+            where.append("channel=? COLLATE NOCASE")
+            args.append(q["ch"][0].strip())
+    if "lb" in q:
+        where.append("(',' || labels || ',') LIKE ?")
+        args.append("%," + q["lb"][0].strip().lower() + ",%")
+    if "q" in q:
+        where.append("title LIKE ?")
+        args.append("%" + q["q"][0] + "%")
+    w = (" WHERE " + " AND ".join(where)) if where else ""
+    total = db.execute(f"SELECT COUNT(*) FROM tasks{w}", args).fetchone()[0]
+    limit = max(1, min(qint(q, "limit", 200), 500))
+    off = max(0, qint(q, "offset", 0))
+    rs = rows(f"SELECT * FROM tasks{w} ORDER BY priority, id LIMIT ? OFFSET ?", args + [limit, off])
+    skip = () if ("d" in q or full) else ("description",)
+    items = [cdict("tasks", r, full, skip) for r in rs]
+    if full:
+        return {"total": total, "offset": off, "items": items}
+    return {"n": total, "o": off, "i": items}
+
+
+def bulk_set_tasks(actor, body, full):
+    """PATCH /tasks body {"ids":[1,2], ...fields} — multi-id set; tiny response."""
+    ids = body.get("ids") or body.get("id")
+    if ids is None:
+        raise ApiError("missing", 400, "ids")
+    if not isinstance(ids, list):
+        ids = [ids]
+    try:
+        ids = [int(i) for i in ids]
+    except Exception:
+        raise ApiError("bad", 400, "ids")
+    if not ids or len(ids) > 200:
+        raise ApiError("bad", 400, "ids")
+    patch = {k: v for k, v in body.items() if k not in ("ids", "id")}
+    d = validate("tasks", patch, True)
+    if not d:
+        raise ApiError("empty", 400)
+    if "status" in d and d["status"] != "blocked":
+        d.setdefault("blocker", "")
+        d.setdefault("blocked_by", "")
+    m = CK["tasks"]
+    out = []
+    for rid in ids:
+        old = rows("SELECT * FROM tasks WHERE id=?", (rid,))
+        if not old:
+            continue
+        old = old[0]
+        sets = ",".join(f"{k}=?" for k in d) + ",updated=CURRENT_TIMESTAMP"
+        db.execute(f"UPDATE tasks SET {sets} WHERE id=?", list(d.values()) + [rid])
+        delta = {m[k]: (json.loads(v) if k == "commits" else v) for k, v in d.items() if old.get(k) != v}
+        emit(actor, "task.updated", rid, old["board_id"], delta)
+        notify_task(actor, old, rows("SELECT * FROM tasks WHERE id=?", (rid,))[0])
+        if d.get("status") in ("done", "declined") and old["status"] not in ("done", "declined"):
+            deps_released(actor, rid)
+        out.append({"id": rid, **delta} if not full else cdict("tasks", rows("SELECT * FROM tasks WHERE id=?", (rid,))[0], True))
+    return {"n": len(out), "i": out} if not full else {"total": len(out), "items": out}
+
+
+def crud(actor, method, table, rid, body, q, full):
+    sing = table[:-1]
+    if method == "GET" and rid is None:
+        if table == "tasks":
+            return list_tasks(q, full)
+        if table == "sprints":
+            bid = q.get("board_id", [None])[0]
+            rs = rows("SELECT * FROM sprints" + (" WHERE board_id=?" if bid else "") + " ORDER BY id", (bid,) if bid else ())
+            items = [sprint_row(r, full) for r in rs]
+        elif table == "docs":
+            wh, ar = [], []
+            for k, col in (("scope", "scope"), ("sc", "scope"), ("ref", "ref_id"), ("r", "ref_id"), ("board_id", "board_id")):
+                if k in q:
+                    wh.append(col + "=?")
+                    ar.append(q[k][0])
+            rs = rows("SELECT * FROM docs" + (" WHERE " + " AND ".join(wh) if wh else "") + " ORDER BY id", ar)
+            items = [cdict("docs", r, full, () if ("d" in q or full) else ("body",)) for r in rs]
+        else:
+            bs = rows("SELECT * FROM boards" + (" WHERE team=?" if "tm" in q else "") + " ORDER BY id", (q["tm"][0],) if "tm" in q else ())
+            items = [cdict("boards", r, full, () if full else ("description",)) for r in bs]
+        return items if full else {"n": len(items), "i": items}
+    if method == "GET":
+        r = rows(f"SELECT * FROM {table} WHERE id=?", (rid,))
+        if not r:
+            raise ApiError("nf", 404)
+        r = r[0]
+        if table == "sprints":
+            return sprint_row(r, full)
+        if table == "boards":
+            o = cdict("boards", r, full)
+            sp = [sprint_row(s, full) for s in rows("SELECT * FROM sprints WHERE board_id=? ORDER BY id", (rid,))]
+            skip = () if ("d" in q or full) else ("description",)
+            nudge_tick(rid)
+            ts = [cdict("tasks", t, full, skip) for t in rows("SELECT * FROM tasks WHERE board_id=? ORDER BY priority, id", (rid,))]
+            o["sprints" if full else "sp"] = sp
+            o["tasks" if full else "t"] = ts
+            if not full:
+                dx = docs_for([("board", rid)] + [("sprint", s_["id"]) for s_ in sp], False, False)
+                if dx:
+                    o["dc"] = dx
+            return o
+        if table == "tasks" and "ctx" in q and not full:
+            o = cdict("tasks", r, False)
+            bk = [x["id"] for x in rows("SELECT id FROM tasks WHERE (',' || depends || ',') LIKE ?", ("%," + str(rid) + ",%",))]
+            if bk:
+                o["bk"] = bk
+            od = open_dep_ids(r["depends"])
+            if od:
+                o["dpo"] = od
+            if r["type"] == "epic":
+                kids = rows("SELECT id, title, status FROM tasks WHERE parent=? ORDER BY id", (rid,))
+                o["kids"] = [{"id": k["id"], "t": k["title"], "st": k["status"]} for k in kids]
+                o["prog"] = [sum(1 for k in kids if k["status"] == "done"), len(kids)]
+            ats = atts_get(rid)["i"]
+            if ats:
+                o["att"] = ats
+            rv = rows("SELECT * FROM reviews WHERE task_id=? ORDER BY id DESC LIMIT 5", (rid,))
+            if rv:
+                o["rv"] = [review_out(x) for x in rv]
+            cc = rows("SELECT id, actor, body, ts FROM comments WHERE task_id=? ORDER BY id DESC LIMIT 5", (rid,))
+            if cc:
+                o["cc"] = [comment_out(c) for c in reversed(cc)]
+            o["dc"] = docs_for([("task", rid)] + ([("sprint", r["sprint_id"])] if r["sprint_id"] else []) + [("board", r["board_id"])], False)
+            return o
+        return cdict(table, r, full)
+    with lock:
+        if method == "POST" and rid is None:
+            d = validate(table, body, False)
+            if table == "tasks":
+                if d.get("status") == "declined" and not d.get("decline_reason"):
+                    raise ApiError("missing", 400, "dr")
+                if d.get("parent"):
+                    check_parent(0, d["parent"], d["board_id"])
+                _w = check_wip(d["board_id"], d.get("status", "backlog"), force=body.get("force"))
+                if str(d.get("assignee", "")).lower() == "auto":
+                    cand = route_candidates("", d.get("labels", ""))
+                    if not cand:
+                        raise ApiError("route", 400, "as")
+                    d["assignee"] = cand[0]["n"]
+                if is_owner_assignee(d.get("assignee")) and not has_owner_steps(d.get("description", "")):
+                    raise ApiError("owner_fmt", 400, "d")
+                if d.get("depends"):
+                    check_deps(0, d["depends"])
+            if table == "docs":
+                d["board_id"] = doc_board(d["scope"], d["ref_id"])
+            if table == "tasks" and "sprint_id" not in d and board_has_sprints(d["board_id"]):
+                act = rows("SELECT id FROM sprints WHERE board_id=? AND state='active' ORDER BY id DESC LIMIT 1", (d["board_id"],))
+                if act:
+                    d["sprint_id"] = act[0]["id"]
+            if table == "sprints":
+                if not board_has_sprints(d["board_id"]):
+                    raise ApiError("no_sprints", 400, "b")
+                if not d.get("name"):
+                    d["name"] = "Sprint %d" % (db.execute("SELECT COUNT(*) FROM sprints WHERE board_id=?", (d["board_id"],)).fetchone()[0] + 1)
+                if d.get("state") == "active":
+                    d["start"] = d.get("start") or time.strftime("%Y-%m-%d")
+                    d["end"] = d.get("end") or time.strftime("%Y-%m-%d", time.gmtime(time.time() + sprint_days_for(d["board_id"]) * 86400))
+            cur = db.execute(f"INSERT INTO {table}({','.join(d)}) VALUES({','.join('?' * len(d))})", list(d.values()))
+            r = rows(f"SELECT * FROM {table} WHERE id=?", (cur.lastrowid,))[0]
+            bid = r["id"] if table == "boards" else r["board_id"]
+            emit(actor, f"{sing}.created", r["id"], bid, cdict(table, r, False))
+            if table == "tasks":
+                notify_task(actor, None, r)
+            if table == "sprints" and r["state"] == "active":
+                close_other_active(actor, r["id"], r["board_id"])
+            return cdict(table, r, full)
+        if rid is None and method in ("PATCH", "PUT") and table == "tasks":
+            return bulk_set_tasks(actor, body, full)
+        if rid is None:
+            raise ApiError("method", 405)
+        old = rows(f"SELECT * FROM {table} WHERE id=?", (rid,))
+        if not old:
+            raise ApiError("nf", 404)
+        old = old[0]
+        bid = rid if table == "boards" else old["board_id"]
+        if method in ("PATCH", "PUT"):
+            d = validate(table, body, True)
+            if not d:
+                raise ApiError("empty", 400)
+            if table == "tasks" and body.get("ver") not in (None, "") and int(body["ver"]) != (old.get("version") or 1):
+                raise ApiError("conflict", 409, "ver")
+            if table == "tasks":
+                _wip = None
+                if "status" in d and d["status"] != old["status"]:
+                    _wip = check_wip(old["board_id"], d["status"], tid=rid, force=body.get("force"))
+                if "parent" in d:
+                    check_parent(rid, d["parent"], old["board_id"])
+                if d.get("status") in ("done", "declined"):
+                    d["claimed_by"] = ""
+                    d["claim_until"] = ""
+                if d.get("status") == "done" and old["status"] != "done":
+                    check_done_gate(rid, old["board_id"], d.get("dod_done", old["dod_done"]))
+                # Leaving blocked clears bl/bb (Reopen / any non-blocked status)
+                if "status" in d and d["status"] != "blocked":
+                    d.setdefault("blocker", "")
+                    d.setdefault("blocked_by", "")
+                # Leaving declined clears dr; entering declined keeps dr (validated above)
+                if "status" in d and d["status"] != "declined":
+                    d.setdefault("decline_reason", "")
+                # Any agent/human bump clears auto-nudge (nu + lb=nudge) unless explicitly setting nu
+                if "nudge" not in d and any(k != "nudge" for k in d):
+                    d["nudge"] = ""
+                    if "labels" in d:
+                        lbs = _lbl_set(d["labels"]); lbs.discard("nudge"); d["labels"] = _lbl_csv(lbs)
+                    else:
+                        lbs = _lbl_set(old["labels"]); lbs.discard("nudge")
+                        if "nudge" in _lbl_set(old["labels"]):
+                            d["labels"] = _lbl_csv(lbs)
+                # Owner-gated cards: description must include Missing: + Do exactly:
+                asg = d["assignee"] if "assignee" in d else old["assignee"]
+                desc = d["description"] if "description" in d else old["description"]
+                if is_owner_assignee(asg) and ("assignee" in d or "description" in d) and not has_owner_steps(desc):
+                    raise ApiError("owner_fmt", 400, "d")
+                if "depends" in d:
+                    check_deps(rid, d["depends"])
+                # Decline requires reason even if only patching st without dr when already declined? require on transition
+                if d.get("status") == "declined" and not (d.get("decline_reason") or old["decline_reason"]):
+                    raise ApiError("missing", 400, "dr")
+                if d.get("status") == "declined" and not d.get("decline_reason") and old["decline_reason"]:
+                    d["decline_reason"] = old["decline_reason"]
+            if table == "sprints" and d.get("state") == "active" and old["state"] != "active":
+                d.setdefault("start", old["start"] or time.strftime("%Y-%m-%d"))
+                d.setdefault("end", old["end"] or time.strftime("%Y-%m-%d", time.gmtime(time.time() + sprint_days_for(old["board_id"]) * 86400)))
+                d["committed"] = sprint_weight(rid)
+                close_other_active(actor, rid, bid)
+            sets = ",".join(f"{k}=?" for k in d)
+            if table in ("tasks", "docs"):
+                sets += ",updated=CURRENT_TIMESTAMP"
+            if table == "tasks":
+                sets += ",version=COALESCE(version,1)+1"
+            db.execute(f"UPDATE {table} SET {sets} WHERE id=?", list(d.values()) + [rid])
+            m = CK[table]
+            emit(actor, f"{sing}.updated", rid, bid, {m[k]: (json.loads(v) if k == "commits" else v) for k, v in d.items() if old.get(k) != v})
+            if table == "tasks":
+                notify_task(actor, old, rows("SELECT * FROM tasks WHERE id=?", (rid,))[0])
+                if d.get("status") in ("done", "declined") and old["status"] not in ("done", "declined"):
+                    deps_released(actor, rid)
+            if full:
+                return cdict(table, rows(f"SELECT * FROM {table} WHERE id=?", (rid,))[0], True)
+            res = {"id": rid, **{m[k]: (json.loads(v) if k == "commits" else v) for k, v in d.items() if k in m}}
+            if table == "tasks":
+                res["v"] = (old.get("version") or 1) + 1
+            if table == "tasks" and d.get("status") in ("in_progress", "review", "done"):
+                od = open_dep_ids(d.get("depends", old["depends"]))
+                if od:
+                    res["w"] = ["depends on open " + " ".join("#%d" % i for i in od)]
+            if table == "tasks" and _wip:
+                res["w"] = res.get("w", []) + [_wip]
+            return res
+        if method == "DELETE":
+            db.execute(f"DELETE FROM {table} WHERE id=?", (rid,))
+            if table in ("boards", "sprints", "tasks"):
+                db.execute("DELETE FROM docs WHERE scope=? AND ref_id=?", (sing, rid))
+                if table == "boards":
+                    db.execute("DELETE FROM docs WHERE board_id=?", (rid,))
+            emit(actor, f"{sing}.deleted", rid, bid, None)
+            return {"deleted": rid} if full else {"id": rid, "x": 1}
+    raise ApiError("method", 405)
+
+
+# ---------------------------------------------------------------- agent notifications
+def comment_out(c):
+    return {"id": c["id"], "by": c["actor"], "c": c["body"], "ts": c["ts"]}
+
+
+def ndict(r):
+    o = {"id": r["id"], "tk": r["task_id"], "b": r["board_id"], "ty": r["type"], "by": r["actor"], "m": r["summary"], "ts": r["ts"]}
+    if r["payload"]:
+        o["d"] = json.loads(r["payload"])
+    if r["hook"]:
+        o["hk"] = r["hook"]
+    return {k: v for k, v in o.items() if v not in (None, "")}
+
+
+def notify(agent, typ, actor, task_id, board_id, summary, delta=None):
+    """Queue an inbox item (+ webhook push if the agent registered one). Caller holds `lock`."""
+    agent = (agent or "").strip()
+    actor = actor or ""
+    if not agent or agent.lower() == actor.lower():
+        return
+    if actor.lower() not in SYSTEM_ACTORS and "*" not in NOTIFY_ACTORS and actor.lower() not in NOTIFY_ACTORS:
+        return
+    cur = db.execute("INSERT INTO notifications(agent,task_id,board_id,type,actor,summary,payload) VALUES(?,?,?,?,?,?,?)",
+                     (agent, task_id, board_id, typ, actor, summary[:300], json.dumps(delta, separators=(",", ":")) if delta else ""))
+    with inbox_cv:
+        inbox_cv.notify_all()
+    h = db.execute("SELECT webhook, secret FROM agents WHERE name=?", (agent,)).fetchone()
+    if h and h["webhook"]:
+        db.execute("UPDATE notifications SET hook='pending' WHERE id=?", (cur.lastrowid,))
+        hook_q.put((cur.lastrowid, agent, h["webhook"], h["secret"]))
+        ensure_hook_thread()
+
+
+def notify_task(actor, old, new):
+    _notify_task_core(actor, old, new)
+    _notify_watchers(actor, old, new)
+
+
+def _notify_task_core(actor, old, new):
+    _escalate_task(actor, old, new)
+    """Tell the assigned agent (and a previous assignee) that a task was created or changed."""
+    tid, bid, title = new["id"], new["board_id"], new["title"][:80]
+    if old is None:
+        notify(new["assignee"], "task.assigned", actor, tid, bid,
+               "#%d '%s' created and assigned to you by %s [%s, p%s]" % (tid, title, actor, new["status"], new["priority"]),
+               {"st": new["status"], "pr": new["priority"]})
+        return
+    ch = {k: (old.get(k), new.get(k)) for k in NOTIFY_KEYS if old.get(k) != new.get(k)}
+    if not ch:
+        return
+    short = CK["tasks"]
+    delta = {short[k]: v[1] for k, v in ch.items() if k != "description"}
+    what = []
+    for k, (a, b) in ch.items():
+        if k in ("status", "priority", "sprint_id"):
+            what.append("%s %s->%s" % (short[k], a, b))
+        elif k == "blocker":
+            what.append("blocker: %s" % (b or "cleared"))
+        elif k == "title":
+            what.append("retitled")
+        elif k == "description":
+            what.append("description edited")
+        elif k == "assignee":
+            what.append("assignee %s->%s" % (a or "-", b or "-"))
+    what = ", ".join(what)
+    if "assignee" in ch:
+        a, b = ch["assignee"]
+        notify(a, "task.unassigned", actor, tid, bid, "#%d '%s' was reassigned to %s by %s" % (tid, title, b or "nobody", actor), delta)
+        notify(b, "task.assigned", actor, tid, bid, "#%d '%s' assigned to you by %s [%s, p%s]" % (tid, title, actor, new["status"], new["priority"]), delta)
+        return
+    typ = "task.status" if "status" in ch else "task.updated"
+    notify(new["assignee"], typ, actor, tid, bid, "#%d '%s' updated by %s: %s" % (tid, title, actor, what), delta)
+
+
+_hook_thread = []
+
+
+def ensure_hook_thread():
+    if not _hook_thread:
+        t = threading.Thread(target=_hook_loop, name="hooks", daemon=True)
+        _hook_thread.append(t)
+        t.start()
+
+
+def _hook_loop():
+    while True:
+        nid, agent, url, secret = hook_q.get()
+        r = db.execute("SELECT * FROM notifications WHERE id=?", (nid,)).fetchone()
+        if not r:
+            continue
+        body = json.dumps({"agent": agent, "n": ndict(dict(r))}, separators=(",", ":")).encode()
+        hd = {"Content-Type": "application/json", "User-Agent": "ValnivoTaskboard"}
+        if secret:
+            hd["X-Taskboard-Signature"] = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        status = "failed"
+        for wait in (0, 2, 8):
+            time.sleep(wait)
+            try:
+                check_public_url(url)
+                with _opener.open(urllib.request.Request(url, data=body, headers=hd, method="POST"), timeout=6) as x:
+                    if 200 <= x.status < 300:
+                        status = "ok"
+                        break
+            except Exception:
+                pass
+        with lock:
+            db.execute("UPDATE notifications SET hook=? WHERE id=?", (status, nid))
+
+
+def inbox_get(q, actor=""):
+    agent = _qv(q, "as", "agent") or (actor if actor and actor.lower() not in GENERIC_ACTORS else "")
+    if not agent:
+        raise ApiError("missing", 400, "as")
+    unread = q.get("all", ["0"])[0] in ("0", "")
+    since = qint(q, "since", 0)
+    lim = max(1, min(qint(q, "limit", 50), 200))
+    wait = max(0, min(qint(q, "wait", 0), 30))
+    sql = "SELECT * FROM notifications WHERE agent=? AND id>?" + (" AND read=0" if unread else "") + " ORDER BY id LIMIT ?"
+
+    def fetch():
+        return rows(sql, (agent, since, lim))
+    items = fetch()
+    if not items and wait:
+        end = time.time() + wait
+        while not items and time.time() < end:
+            with inbox_cv:
+                inbox_cv.wait(min(end - time.time(), 5))
+            items = fetch()
+    if q.get("ack", ["0"])[0] not in ("0", "") and items:
+        with lock:
+            db.execute("UPDATE notifications SET read=1 WHERE id IN (%s)" % ",".join("?" * len(items)), [i["id"] for i in items])
+    left = db.execute("SELECT COUNT(*) FROM notifications WHERE agent=? AND read=0", (agent,)).fetchone()[0]
+    return {"n": len(items), "unread": left, "i": [ndict(i) for i in items]}
+
+
+def inbox_ack(body):
+    agent = body.get("as") or body.get("agent")
+    if not agent:
+        raise ApiError("missing", 400, "as")
+    with lock:
+        if body.get("ids"):
+            ids = [int(i) for i in body["ids"]]
+            cur = db.execute("UPDATE notifications SET read=1 WHERE agent=? AND read=0 AND id IN (%s)" % ",".join("?" * len(ids)), [agent] + ids)
+        elif body.get("upto"):
+            cur = db.execute("UPDATE notifications SET read=1 WHERE agent=? AND read=0 AND id<=?", (agent, int(body["upto"])))
+        else:
+            cur = db.execute("UPDATE notifications SET read=1 WHERE agent=? AND read=0", (agent,))
+    return {"ok": 1, "n": cur.rowcount}
+
+
+def agents_list():
+    reg = {r["name"].lower(): r for r in rows("SELECT * FROM agents")}
+    names = {r["assignee"].lower(): r["assignee"] for r in rows("SELECT DISTINCT assignee FROM tasks WHERE assignee!=''")}
+    names.update({k: v["name"] for k, v in reg.items()})
+    unread = {r["agent"].lower(): r["n"] for r in rows("SELECT agent, COUNT(*) n FROM notifications WHERE read=0 GROUP BY agent COLLATE NOCASE")}
+    silent_set = silent_agents()
+    items = []
+    for k in sorted(names):
+        o = {"n": names[k], "inbox": unread.get(k, 0)}
+        if k in reg and reg[k]["capacity"]:
+            o["cap"] = reg[k]["capacity"]
+        if k in reg:
+            for key, col in (("seen", "last_seen"), ("stx", "status_text"), ("stk", "status_task"), ("sk", "skills")):
+                if reg[k][col]:
+                    o[key] = reg[k][col]
+            if k in silent_set:
+                o["silent"] = 1
+        if k in reg and reg[k]["webhook"]:
+            o["hook"] = reg[k]["webhook"]
+            o["hs"] = bool(reg[k]["secret"])
+        items.append(o)
+    return {"n": len(items), "i": items}
+
+
+def agent_set(body):
+    name = " ".join(str(body.get("n") or body.get("name") or body.get("as") or "").split())[:60]
+    if not name:
+        raise ApiError("missing", 400, "n")
+    hook = str(body.get("hook") or body.get("webhook") or "").strip()[:500]
+    if hook:
+        check_public_url(hook)
+    with lock:
+        old = db.execute("SELECT * FROM agents WHERE name=?", (name,)).fetchone()
+        secret = str(body["secret"])[:200] if "secret" in body else (old["secret"] if old else "")
+        if old:
+            db.execute("UPDATE agents SET webhook=?, secret=? WHERE name=?", (hook if ("hook" in body or "webhook" in body) else old["webhook"], secret, name))
+        else:
+            db.execute("INSERT INTO agents(name,webhook,secret) VALUES(?,?,?)", (name, hook, secret))
+        if "capacity" in body:
+            db.execute("UPDATE agents SET capacity=? WHERE name=?", (max(0, int(body["capacity"] or 0)), name))
+        if "skills" in body:
+            sk = ",".join(sorted({re.sub(r"[^a-z0-9._-]", "", x.strip().lower()) for x in (body["skills"] if isinstance(body["skills"], list) else str(body["skills"] or "").split(",")) if x.strip()}))[:200]
+            db.execute("UPDATE agents SET skills=? WHERE name=?", (sk, name))
+    return {"n": name, "ok": 1}
+
+
+def agent_del(name):
+    with lock:
+        db.execute("DELETE FROM agents WHERE name=?", (name,))
+    return {"n": name, "x": 1}
+
+
+# ---------------------------------------------------------------- comments
+def comment_add(actor, tid, body, notify_assignee=True):
+    text = str(body.get("c") or body.get("body") or "").strip()[:4000]
+    if not text:
+        raise ApiError("missing", 400, "c")
+    with lock:
+        t = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+        if not t:
+            raise ApiError("nf", 404)
+        t = t[0]
+        cur = db.execute("INSERT INTO comments(task_id,actor,body) VALUES(?,?,?)", (tid, actor, text))
+        db.execute("UPDATE tasks SET updated=CURRENT_TIMESTAMP, nudge='' WHERE id=?", (tid,))
+        emit(actor, "task.commented", tid, t["board_id"], {"cm_id": cur.lastrowid})
+        to = body.get("to") or []
+        to = [to] if isinstance(to, str) else to
+        for a in {x.strip() for x in ([t["assignee"]] if notify_assignee else []) + list(to) if x and x.strip()}:
+            notify(a, "task.comment", actor, tid, t["board_id"], "#%d '%s' comment by %s: %s" % (tid, t["title"][:60], actor, text[:140]))
+    return {"id": cur.lastrowid, "tk": tid}
+
+
+def comments_get(tid):
+    if not rows("SELECT id FROM tasks WHERE id=?", (tid,)):
+        raise ApiError("nf", 404)
+    cs = rows("SELECT id, actor, body, ts FROM comments WHERE task_id=? ORDER BY id", (tid,))
+    return {"n": len(cs), "i": [comment_out(c) for c in cs]}
+
+
+# ---------------------------------------------------------------- decline / reopen (any assignee: human or agent)
+REOPEN_FROM = ("declined", "blocked", "done")
+REOPEN_TO = ("todo", "in_progress", "backlog", "review")
+
+
+def task_decline(actor, tid, body):
+    """Refuse a task with a written reason. Anyone may decline (human or agent); the reason is logged as a comment
+    and `to` (agent names, e.g. the requester) is notified in addition to the assignee."""
+    reason = " ".join(str(body.get("r") or body.get("reason") or body.get("dr") or "").split())[:500]
+    if not reason:
+        raise ApiError("missing", 400, "r")
+    t = rows("SELECT status, assignee, title, board_id FROM tasks WHERE id=?", (tid,))
+    if not t:
+        raise ApiError("nf", 404)
+    if t[0]["status"] == "declined":
+        raise ApiError("bad", 400, "st")
+    crud(actor, "PATCH", "tasks", tid, {"st": "declined", "dr": reason}, {}, False)
+    with lock:
+        escalate("declined", actor, tid, t[0]["board_id"], "#%d '%s' declined by %s: %s" % (tid, t[0]["title"][:60], actor, reason[:140]), skip=(t[0]["assignee"],))
+    comment_add(actor, tid, {"c": "Declined: " + reason, "to": body.get("to") or []}, notify_assignee=False)
+    return {"id": tid, "st": "declined", "dr": reason}
+
+
+def task_reopen(actor, tid, body):
+    """Put a declined/blocked/done task back in flight (default todo); clears decline reason and blockers."""
+    to = str(body.get("to") or body.get("st") or "todo")
+    if to not in REOPEN_TO:
+        raise ApiError("bad", 400, "to")
+    t = rows("SELECT status FROM tasks WHERE id=?", (tid,))
+    if not t:
+        raise ApiError("nf", 404)
+    if t[0]["status"] not in REOPEN_FROM:
+        raise ApiError("bad", 400, "st")
+    crud(actor, "PATCH", "tasks", tid, {"st": to, "bl": "", "bb": []}, {}, False)
+    note = " ".join(str(body.get("note") or body.get("r") or "").split())[:500]
+    comment_add(actor, tid, {"c": "Reopened -> %s" % to + (": " + note if note else ""), "to": body.get("to_notify") or body.get("notify") or []}, notify_assignee=False)
+    return {"id": tid, "st": to}
+
+
+# ---------------------------------------------------------------- shared technical specs
+SPEC_STATUS = ("draft", "review", "approved", "deprecated")
+SPEC_MAX = 100000
+
+
+def _sp_tags(v):
+    ls = v if isinstance(v, list) else str(v or "").split(",")
+    return ",".join(sorted({re.sub(r"[^a-z0-9._/-]", "", x.strip().lower()) for x in ls if x.strip()} - {""}))[:200]
+
+
+def _sp_tasks(v):
+    ids = v if isinstance(v, list) else re.findall(r"\d+", str(v or ""))
+    return ",".join(str(i) for i in sorted({int(x) for x in ids}))[:200]
+
+
+def spec_out(r, body=True, q=None):
+    o = {"id": r["id"], "b": r["board_id"], "t": r["title"], "tg": r["tags"], "st": r["status"], "au": r["author"],
+         "by": r["updated_by"], "rv": r["rev"], "tk": r["tasks"], "u": r["updated"]}
+    if body:
+        o["d"] = r["body"]
+    elif q:
+        i = max(r["body"].lower().find(q.lower()), 0)
+        o["sn"] = " ".join(r["body"][max(i - 40, 0):i + 140].split())
+    return {k: v for k, v in o.items() if v not in (None, "")}
+
+
+def specs_list(q):
+    wh, ar = [], []
+    if _qv(q, "q"):
+        like = "%" + _qv(q, "q") + "%"
+        wh.append("(title LIKE ? OR body LIKE ? OR tags LIKE ?)")
+        ar += [like, like, like]
+    if _qv(q, "tag"):
+        wh.append("(',' || tags || ',') LIKE ?")
+        ar.append("%," + _qv(q, "tag").strip().lower() + ",%")
+    if _qv(q, "st", "status"):
+        wh.append("status=?")
+        ar.append(_qv(q, "st", "status"))
+    if _qv(q, "b", "board_id"):
+        wh.append("(board_id=? OR board_id IS NULL)")
+        ar.append(_qv(q, "b", "board_id"))
+    if _qv(q, "tk"):
+        wh.append("(',' || tasks || ',') LIKE ?")
+        ar.append("%," + str(int(_qv(q, "tk"))) + ",%")
+    w = (" WHERE " + " AND ".join(wh)) if wh else ""
+    lim = max(1, min(qint(q, "limit", 100), 300))
+    rs = rows("SELECT * FROM specs" + w + " ORDER BY updated DESC, id DESC LIMIT ?", ar + [lim])
+    full = q.get("d", ["0"])[0] not in ("0", "")
+    return {"n": len(rs), "i": [spec_out(r, full, _qv(q, "q")) for r in rs]}
+
+
+def spec_get(sid, rev=None):
+    r = rows("SELECT * FROM specs WHERE id=?", (sid,))
+    if not r:
+        raise ApiError("nf", 404)
+    o = spec_out(r[0])
+    if rev is not None:
+        h = rows("SELECT * FROM spec_revs WHERE spec_id=? AND rev=?", (sid, rev))
+        if not h:
+            raise ApiError("nf", 404)
+        o.update({"t": h[0]["title"], "d": h[0]["body"], "rv": rev, "by": h[0]["actor"], "u": h[0]["ts"], "note": h[0]["note"]})
+    return o
+
+
+def spec_revs(sid):
+    if not rows("SELECT id FROM specs WHERE id=?", (sid,)):
+        raise ApiError("nf", 404)
+    rs = rows("SELECT rev, actor, note, ts, length(body) n FROM spec_revs WHERE spec_id=? ORDER BY rev DESC", (sid,))
+    return {"n": len(rs), "i": [{"rv": r["rev"], "by": r["actor"], "note": r["note"], "u": r["ts"], "len": r["n"]} for r in rs]}
+
+
+def _spec_notify(actor, sp, verb, extra_to, rev):
+    who = set(x.strip() for x in (extra_to if isinstance(extra_to, list) else [extra_to]) if x and str(x).strip())
+    for tid in re.findall(r"\d+", sp["tasks"] or ""):
+        for r in rows("SELECT assignee FROM tasks WHERE id=? AND assignee!=''", (int(tid),)):
+            who.add(r["assignee"])
+    who |= _watchers([("spec", sp["id"])] + [("tag", x) for x in (sp["tags"] or "").split(",") if x], skip=(actor,))
+    for a in who:
+        notify(a, "spec." + verb, actor, None, sp["board_id"], "spec #%d '%s' %s by %s (rev %d)" % (sp["id"], sp["title"][:70], verb, actor, rev), {"spec": sp["id"], "rv": rev})
+
+
+def spec_create(actor, body):
+    title = " ".join(str(body.get("t") or body.get("title") or "").split())[:200]
+    if not title:
+        raise ApiError("missing", 400, "t")
+    text = str(body.get("d") or body.get("body") or "")[:SPEC_MAX]
+    st = body.get("st") or body.get("status") or "draft"
+    if st not in SPEC_STATUS:
+        raise ApiError("bad", 400, "st")
+    bid = body.get("b") if "b" in body else body.get("board_id")
+    if bid not in (None, ""):
+        try:
+            bid = int(bid)
+        except Exception:
+            raise ApiError("bad", 400, "b")
+        if not rows("SELECT id FROM boards WHERE id=?", (bid,)):
+            raise ApiError("bad", 400, "b")
+    else:
+        bid = None
+    with lock:
+        cur = db.execute("INSERT INTO specs(board_id,title,body,tags,status,author,updated_by,tasks) VALUES(?,?,?,?,?,?,?,?)",
+                         (bid, title, text, _sp_tags(body.get("tg", body.get("tags"))), st, actor, actor, _sp_tasks(body.get("tk", body.get("tasks")))))
+        sid = cur.lastrowid
+        db.execute("INSERT INTO spec_revs(spec_id,rev,title,body,actor,note) VALUES(?,?,?,?,?,?)", (sid, 1, title, text, actor, str(body.get("note") or "")[:300]))
+        sp = rows("SELECT * FROM specs WHERE id=?", (sid,))[0]
+        emit(actor, "spec.created", sid, bid, {"t": title})
+        _spec_notify(actor, sp, "created", body.get("to") or [], 1)
+    return spec_out(sp, False)
+
+
+def spec_update(actor, sid, body):
+    with lock:
+        r = rows("SELECT * FROM specs WHERE id=?", (sid,))
+        if not r:
+            raise ApiError("nf", 404)
+        r = r[0]
+        if body.get("base") not in (None, "") and int(body["base"]) != r["rev"]:
+            raise ApiError("conflict", 409, "rv")
+        sets, args = {}, {}
+        title = " ".join(str(body["t"] if "t" in body else body.get("title", r["title"])).split())[:200]
+        if not title:
+            raise ApiError("bad", 400, "t")
+        text = r["body"]
+        if "d" in body or "body" in body:
+            text = str(body.get("d", body.get("body")) or "")
+        if body.get("append"):
+            text = (text.rstrip() + "\n\n" + str(body["append"]).strip()) if text.strip() else str(body["append"]).strip()
+        text = text[:SPEC_MAX]
+        st = body.get("st") or body.get("status") or r["status"]
+        if st not in SPEC_STATUS:
+            raise ApiError("bad", 400, "st")
+        tags = _sp_tags(body["tg"] if "tg" in body else body["tags"] if "tags" in body else r["tags"])
+        tasks = _sp_tasks(body["tk"] if "tk" in body else body["tasks"] if "tasks" in body else r["tasks"])
+        bid = r["board_id"]
+        if "b" in body or "board_id" in body:
+            v = body.get("b", body.get("board_id"))
+            bid = int(v) if v not in (None, "", 0) else None
+        content = (title != r["title"]) or (text != r["body"])
+        rev = r["rev"] + (1 if content else 0)
+        if not content and (st, tags, tasks, bid) == (r["status"], r["tags"], r["tasks"], r["board_id"]):
+            raise ApiError("empty", 400)
+        db.execute("UPDATE specs SET board_id=?, title=?, body=?, tags=?, status=?, tasks=?, rev=?, updated_by=?, updated=CURRENT_TIMESTAMP WHERE id=?",
+                   (bid, title, text, tags, st, tasks, rev, actor, sid))
+        if content:
+            db.execute("INSERT INTO spec_revs(spec_id,rev,title,body,actor,note) VALUES(?,?,?,?,?,?)", (sid, rev, title, text, actor, str(body.get("note") or "")[:300]))
+        sp = rows("SELECT * FROM specs WHERE id=?", (sid,))[0]
+        emit(actor, "spec.updated", sid, bid, {"rv": rev, "st": st})
+        _spec_notify(actor, sp, "updated" if content else "changed", body.get("to") or [], rev)
+    return spec_out(sp, False)
+
+
+def spec_delete(actor, sid):
+    with lock:
+        r = rows("SELECT board_id FROM specs WHERE id=?", (sid,))
+        if not r:
+            raise ApiError("nf", 404)
+        db.execute("DELETE FROM specs WHERE id=?", (sid,))
+        emit(actor, "spec.deleted", sid, r[0]["board_id"], None)
+    return {"id": sid, "x": 1}
+
+
+# ---------------------------------------------------------------- dependencies, handoff, activity, supervisor
+def open_dep_ids(dep_csv):
+    ids = [int(x) for x in re.findall(r"\d+", str(dep_csv or ""))]
+    if not ids:
+        return []
+    return [r["id"] for r in rows("SELECT id FROM tasks WHERE id IN (%s) AND status NOT IN ('done','declined')" % ",".join("?" * len(ids)), ids)]
+
+
+def check_deps(tid, dep_csv):
+    ids = [int(x) for x in re.findall(r"\d+", str(dep_csv or ""))]
+    if tid and tid in ids:
+        raise ApiError("bad", 400, "dp")
+    if ids and len(rows("SELECT id FROM tasks WHERE id IN (%s)" % ",".join("?" * len(ids)), ids)) != len(set(ids)):
+        raise ApiError("bad", 400, "dp")
+    if tid:                                   # cycle: can any dependency (transitively) depend on tid?
+        seen, stack = set(), list(ids)
+        while stack:
+            i = stack.pop()
+            if i == tid:
+                raise ApiError("cycle", 400, "dp")
+            if i in seen:
+                continue
+            seen.add(i)
+            r = rows("SELECT depends FROM tasks WHERE id=?", (i,))
+            if r:
+                stack += [int(x) for x in re.findall(r"\d+", r[0]["depends"] or "")]
+
+
+def deps_released(actor, tid):
+    """A task finished: tell assignees of tasks that were waiting on it and now have no open dependency left."""
+    for r in rows("SELECT * FROM tasks WHERE (',' || depends || ',') LIKE ? AND status NOT IN ('done','declined')", ("%," + str(tid) + ",%",)):
+        if not open_dep_ids(r["depends"]):
+            notify(r["assignee"], "task.ready", actor, r["id"], r["board_id"], "#%d '%s' is ready: all its dependencies are done" % (r["id"], r["title"][:70]), {"ready": 1})
+
+
+def task_handoff(actor, tid, body):
+    """Reassign with a structured summary: what was done + what is next. One notification (task.handoff) to the receiver."""
+    to = " ".join(str(body.get("to") or "").split())[:60]
+    summary = str(body.get("summary") or body.get("m") or "").strip()[:2000]
+    nxt = str(body.get("next") or "").strip()[:1000]
+    if not to:
+        raise ApiError("missing", 400, "to")
+    if not summary:
+        raise ApiError("missing", 400, "summary")
+    with lock:
+        r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+        if not r:
+            raise ApiError("nf", 404)
+        t = r[0]
+        desc = t["description"]
+        if is_owner_assignee(to) and not has_owner_steps(desc):
+            combo = summary + "\n" + nxt
+            if not has_owner_steps(combo):
+                raise ApiError("owner_fmt", 400, "d")
+            desc = (desc + "\n\n" + combo).strip()
+        st = body.get("st") or ("todo" if t["status"] == "backlog" else t["status"])
+        if st not in STATUSES:
+            raise ApiError("bad", 400, "st")
+        clear = st != "blocked"
+        db.execute("UPDATE tasks SET assignee=?, description=?, status=?, nudge='', updated=CURRENT_TIMESTAMP" + (", blocker='', blocked_by=''" if clear else "") + " WHERE id=?",
+                   (to, desc, st, tid))
+        db.execute("INSERT INTO comments(task_id,actor,body) VALUES(?,?,?)",
+                   (tid, actor, "Handoff %s -> %s\\n%s%s" % (t["assignee"] or "-", to, summary, ("\\nNext: " + nxt) if nxt else "")))
+        delta = {"as": to, **({"st": st} if st != t["status"] else {})}
+        emit(actor, "task.updated", tid, t["board_id"], delta)
+        notify(to, "task.handoff", actor, tid, t["board_id"],
+               "#%d '%s' handed to you by %s: %s%s" % (tid, t["title"][:60], actor, summary[:160], (" | next: " + nxt[:120]) if nxt else ""), {"st": st})
+        if t["assignee"] and t["assignee"].lower() not in (to.lower(), actor.lower()):
+            notify(t["assignee"], "task.unassigned", actor, tid, t["board_id"], "#%d '%s' was handed to %s by %s" % (tid, t["title"][:60], to, actor), delta)
+    return {"id": tid, "as": to, "st": st}
+
+
+_ACT_LABEL = {"st": "status", "as": "assignee", "pr": "priority", "s": "sprint", "bl": "blocker", "bb": "blocked by", "dr": "decline reason", "pu": "PR", "sha": "deployed sha", "dp": "depends on", "pt": "points", "t": "title", "lb": "labels", "ch": "channel", "k": "kind"}
+
+
+def task_activity(tid):
+    """One chronological timeline: field changes (from the event log) + comments."""
+    if not rows("SELECT id FROM tasks WHERE id=?", (tid,)):
+        raise ApiError("nf", 404)
+    items = []
+    for e in rows("SELECT id, ts, actor, type, payload FROM events WHERE type LIKE 'task.%' AND payload LIKE ? ORDER BY id", ('{"id":%d,"b":%%' % tid,)):
+        if e["type"] == "task.commented":
+            continue
+        try:
+            d = (json.loads(e["payload"]).get("d") or {})
+        except Exception:
+            d = {}
+        if e["type"] == "task.created":
+            msg = "created" + (" [%s]" % d["st"] if d.get("st") else "")
+        else:
+            parts = []
+            for k, v in d.items():
+                if k in ("u", "nu", "d", "id", "b"):
+                    continue
+                if k == "cm":
+                    parts.append("commits linked")
+                elif k in _ACT_LABEL:
+                    parts.append("%s -> %s" % (_ACT_LABEL[k], v if v not in ("", None, []) else "cleared"))
+            if not parts:
+                continue
+            msg = ", ".join(parts)
+        items.append({"ts": e["ts"], "by": e["actor"], "ty": e["type"].split(".")[1], "m": msg, "_o": e["id"]})
+    for c in rows("SELECT id, actor, body, ts FROM comments WHERE task_id=? ORDER BY id", (tid,)):
+        items.append({"ts": c["ts"], "by": c["actor"], "ty": "comment", "m": c["body"], "_o": 10 ** 9 + c["id"]})
+    items.sort(key=lambda x: (x["ts"], x["_o"]))
+    for x in items:
+        x.pop("_o")
+    return {"n": len(items), "i": items}
+
+
+def supervisor_names():
+    names = {x.strip() for x in get_setting("supervisors").split(",") if x.strip()}
+    names |= {n for n, r in TOKENS.values() if r == "supervisor"}
+    names |= {r["name"] for r in rows("SELECT name FROM tokens WHERE role='supervisor'")}
+    return names
+
+
+def escalate(typ, actor, tid, bid, msg, delta=None, skip=()):
+    """Tell the supervisor agent(s) about things a human/lead should see. Skips people who already got the direct notification."""
+    sk = {str(x).lower() for x in skip}
+    for n in supervisor_names():
+        if n.lower() not in sk:
+            notify(n, "esc." + typ, actor, tid, bid, "[escalation] " + msg, delta)
+
+
+def _escalate_task(actor, old, new):
+    tid, bid, title, asg = new["id"], new["board_id"], new["title"][:70], new["assignee"]
+    if is_owner_assignee(asg) and (old is None or not is_owner_assignee(old["assignee"])):
+        escalate("human-card", actor, tid, bid, "#%d '%s' now waits on a human (%s)" % (tid, title, asg), skip=(asg,))
+    if new["status"] == "blocked" and (old is None or old["status"] != "blocked") and new["priority"] <= 2:
+        escalate("blocked", actor, tid, bid, "#%d '%s' (p%s) is blocked: %s" % (tid, title, new["priority"], new["blocker"] or "no note"), skip=(asg,))
+
+
+def attention(bid=None):
+    """What a supervisor should look at now, most severe first."""
+    items = []
+    for r in active_risks(bid):
+        if r["health"] == "red":
+            items.append({"k": "sprint-red", "sev": "high", "m": "Sprint '%s' at risk: %s" % (r["n"], "; ".join(x["m"] for x in r["risks"][:2])), "ids": []})
+    wb, a = _in("board_id", bid)
+    op = rows("SELECT * FROM tasks WHERE status NOT IN ('done','declined')" + wb, a)
+    def add(k, sev, msg, ts):
+        if ts:
+            items.append({"k": k, "sev": sev, "m": msg % len(ts), "ids": [t["id"] for t in ts][:30]})
+    add("blocked-p12", "high", "%d high-priority task(s) blocked", [t for t in op if t["status"] == "blocked" and t["priority"] <= 2])
+    add("human-wait", "med", "%d task(s) waiting on a human", [t for t in op if is_owner_assignee(t["assignee"])])
+    add("stale", "med", "%d important/owner task(s) stale", [t for t in op if t["nudge"] and (t["priority"] <= 2 or is_owner_assignee(t["assignee"]))])
+    add("unassigned-p12", "med", "%d high-priority task(s) without assignee", [t for t in op if not t["assignee"] and t["priority"] <= 2])
+    fr, fp = _in("id", bid)
+    for fb in rows("SELECT id, name, method FROM boards WHERE 1=1" + fr, fp):
+        if METHODS.get(fb["method"] or "scrum", {}).get("wip"):
+            fl = board_flow(fb["id"], 14)
+            if fl["over"]:
+                items.append({"k": "wip-exceeded", "sev": "med", "m": "'%s' is over its WIP limit in: %s" % (fb["name"], ", ".join(fl["over"])), "ids": []})
+            if fl["stuck"]:
+                items.append({"k": "aging-wip", "sev": "med", "m": "%d task(s) on '%s' have been in flight unusually long" % (len(fl["stuck"]), fb["name"]), "ids": fl["stuck"][:30]})
+    sil = silent_agents()
+    add("silent-agent", "high", "%d in-progress task(s) belong to silent agents", [t for t in op if t["status"] == "in_progress" and (t["assignee"] or "").lower() in sil])
+    od_asks = rows("SELECT id, task_id FROM asks WHERE status='open' AND due<?" + wb.replace("board_id", "board_id"), [now_s()] + a)
+    if od_asks:
+        items.append({"k": "ask-overdue", "sev": "med", "m": "%d question(s) between agents are overdue" % len(od_asks), "ids": [x["task_id"] for x in od_asks if x["task_id"]][:30]})
+    old_rv = rows("SELECT task_id FROM reviews WHERE status='pending' AND created<?", (plus_min(-60 * 24),))
+    if old_rv:
+        items.append({"k": "review-stale", "sev": "med", "m": "%d review request(s) pending for over 24h" % len(old_rv), "ids": [x["task_id"] for x in old_rv][:30]})
+    add("declined", "low", "%d task(s) declined in the last 7 days", rows("SELECT id FROM tasks WHERE status='declined' AND updated >= datetime('now','-7 day')" + wb, a))
+    items.sort(key=lambda x: -SEV[x["sev"]])
+    return items
+
+
+# ---------------------------------------------------------------- templates + recurring tasks
+RECUR_HELP = "daily | weekdays | weekly:mon..sun | monthly:1..31"
+_WD = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def _recur_ok(rc):
+    return rc == "" or rc in ("daily", "weekdays") or bool(re.fullmatch(r"weekly:(%s)" % "|".join(_WD), rc)) or bool(re.fullmatch(r"monthly:([1-9]|[12]\d|3[01])", rc))
+
+
+def _recur_match(rc, d):
+    if rc == "daily":
+        return True
+    if rc == "weekdays":
+        return d.weekday() < 5
+    if rc.startswith("weekly:"):
+        return d.weekday() == _WD.index(rc[7:])
+    if rc.startswith("monthly:"):
+        last = (d.replace(day=28) + _datetime.timedelta(days=4)).replace(day=1) - _datetime.timedelta(days=1)
+        return d.day == min(int(rc[8:]), last.day)
+    return False
+
+
+def _recur_next(rc, frm):
+    """First date >= frm that matches the rule."""
+    for i in range(0, 400):
+        d = frm + _datetime.timedelta(days=i)
+        if _recur_match(rc, d):
+            return d.isoformat()
+    return ""
+
+
+def tpl_out(r):
+    o = {"id": r["id"], "b": r["board_id"], "n": r["name"], "t": r["title"], "d": r["description"], "as": r["assignee"], "k": r["kind"], "pr": r["priority"],
+         "ch": r["channel"], "lb": r["labels"], "pt": r["points"], "cl": r["checklist"], "rc": r["recur"], "nx": r["next_run"], "on": bool(r["active"]), "last": r["last_task"]}
+    return {k: v for k, v in o.items() if v not in (None, "", 0) or k in ("pr", "on")}
+
+
+def tpl_save(body, tid=None):
+    cur = rows("SELECT * FROM templates WHERE id=?", (tid,))[0] if tid else {}
+    if tid and not cur:
+        raise ApiError("nf", 404)
+    g = lambda *ks, default="": next((body[k] for k in ks if k in body), cur.get({"n": "name", "t": "title", "d": "description", "as": "assignee", "k": "kind", "pr": "priority", "ch": "channel", "lb": "labels", "pt": "points", "cl": "checklist", "rc": "recur", "b": "board_id"}.get(ks[0], ks[0]), default))
+    name = " ".join(str(g("n", "name")).split())[:80]
+    if not name:
+        raise ApiError("missing", 400, "n")
+    bid = g("b", "board_id", default=None)
+    if bid in ("", 0):
+        bid = None
+    if bid is not None and not rows("SELECT id FROM boards WHERE id=?", (int(bid),)):
+        raise ApiError("bad", 400, "b")
+    rc = str(g("rc", "recur")).strip().lower()
+    if not _recur_ok(rc):
+        raise ApiError("bad", 400, "rc")
+    pr = int(g("pr", "priority", default=3) or 3)
+    if not 1 <= pr <= 4:
+        raise ApiError("bad", 400, "pr")
+    cl = g("cl", "checklist")
+    cl = "\n".join(str(x).strip() for x in cl) if isinstance(cl, list) else str(cl or "").strip()
+    nx = str(body.get("nx") or body.get("at") or "")[:10]
+    if rc and (not nx or "rc" in body or "recur" in body):
+        nx = nx or _recur_next(rc, _datetime.datetime.now(_datetime.timezone.utc).replace(tzinfo=None).date())
+    if not rc:
+        nx = ""
+    vals = (None if bid is None else int(bid), name, str(g("t", "title"))[:200], str(g("d", "description"))[:10000], str(g("as", "assignee"))[:60],
+            "human" if g("k", "kind", default="agent") == "human" else "agent", pr, str(g("ch", "channel"))[:40], _lbl_csv(_lbl_set(g("lb", "labels"))),
+            int(g("pt", "points", default=0) or 0), cl[:4000], rc, nx, 0 if body.get("on") is False else 1)
+    with lock:
+        if tid:
+            db.execute("UPDATE templates SET board_id=?,name=?,title=?,description=?,assignee=?,kind=?,priority=?,channel=?,labels=?,points=?,checklist=?,recur=?,next_run=?,active=? WHERE id=?", vals + (tid,))
+        else:
+            tid = db.execute("INSERT INTO templates(board_id,name,title,description,assignee,kind,priority,channel,labels,points,checklist,recur,next_run,active) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", vals).lastrowid
+        return tpl_out(rows("SELECT * FROM templates WHERE id=?", (tid,))[0])
+
+
+def tpl_make_task(actor, t, over=None, suffix=""):
+    over = over or {}
+    bid = over.get("b") or over.get("board_id") or t["board_id"]
+    if not bid:
+        raise ApiError("missing", 400, "b")
+    desc = (over.get("d") or t["description"] or "").strip()
+    if t["checklist"]:
+        desc = (desc + "\n\n## Checklist\n" + "\n".join("- [ ] " + ln.lstrip("-[] ").strip() for ln in t["checklist"].splitlines() if ln.strip())).strip()
+    body = {"board_id": int(bid), "title": (over.get("t") or t["title"] or t["name"]) + suffix, "description": desc, "assignee": over.get("as") or t["assignee"],
+            "kind": t["kind"], "priority": t["priority"], "channel": t["channel"] or "Template", "labels": t["labels"], "points": t["points"]}
+    if over.get("s") is not None:
+        body["sprint_id"] = over["s"]
+    return crud(actor, "POST", "tasks", None, body, {}, False)
+
+
+def tpl_use(actor, tid, over):
+    r = rows("SELECT * FROM templates WHERE id=?", (tid,))
+    if not r:
+        raise ApiError("nf", 404)
+    res = tpl_make_task(actor, r[0], over)
+    with lock:
+        db.execute("UPDATE templates SET last_task=? WHERE id=?", (res["id"], tid))
+    return res
+
+
+def recur_tick(actor="recurring"):
+    today = _datetime.datetime.now(_datetime.timezone.utc).replace(tzinfo=None).date()
+    made, skipped, failed = [], 0, 0
+    for t in rows("SELECT * FROM templates WHERE active=1 AND recur!='' AND next_run!='' AND next_run<=?", (today.isoformat(),)):
+        nxt = _recur_next(t["recur"], today + _datetime.timedelta(days=1))
+        prev = rows("SELECT status FROM tasks WHERE id=?", (t["last_task"],)) if t["last_task"] else []
+        if prev and prev[0]["status"] not in ("done", "declined"):   # previous occurrence still open: do not pile up
+            skipped += 1
+        else:
+            try:
+                res = tpl_make_task(actor, t, suffix=" - " + today.isoformat())
+                made.append(res["id"])
+                with lock:
+                    db.execute("UPDATE templates SET last_task=? WHERE id=?", (res["id"], t["id"]))
+            except ApiError:
+                failed += 1
+        with lock:
+            db.execute("UPDATE templates SET next_run=? WHERE id=?", (nxt, t["id"]))
+    return {"made": made, "skipped": skipped, "failed": failed}
+
+
+# ---------------------------------------------------------------- per-agent statistics
+def agent_stats(bid=None, days=30):
+    now = _datetime.datetime.now(_datetime.timezone.utc).replace(tzinfo=None)
+    cut = now - _datetime.timedelta(days=days)
+    fr, fp = _in("board_id", bid)
+    ts = rows("SELECT * FROM tasks WHERE assignee!=''" + fr, fp)
+    byid = {t["id"]: t for t in ts}
+    tl = {}
+    acts = {}
+    for e in rows("SELECT ts, actor, type, payload FROM events WHERE type LIKE 'task.%' ORDER BY id"):
+        try:
+            pj = json.loads(e["payload"])
+        except Exception:
+            continue
+        when = _datetime.datetime.strptime(e["ts"][:19], "%Y-%m-%d %H:%M:%S")
+        if when >= cut:
+            acts[e["actor"]] = acts.get(e["actor"], 0) + 1
+        d = pj.get("d") or {}
+        if pj.get("id") in byid and isinstance(d, dict) and d.get("st"):
+            tl.setdefault(pj["id"], []).append((when, d["st"]))
+    com = {r["actor"]: r["n"] for r in rows("SELECT actor, COUNT(*) n FROM comments WHERE ts >= ? GROUP BY actor", (cut.strftime("%Y-%m-%d %H:%M:%S"),))}
+    agg = {}
+    for t in ts:
+        a = agg.setdefault(t["assignee"], {"as": t["assignee"], "done": 0, "declined": 0, "open": 0, "blocked": 0, "cyc": [], "dur": {"in_progress": [], "review": [], "blocked": []}})
+        line = tl.get(t["id"], [])
+        upd = _datetime.datetime.strptime(t["updated"][:19], "%Y-%m-%d %H:%M:%S") if t["updated"] else now
+        if t["status"] in ("done", "declined"):
+            fin = next((w for w, st in reversed(line) if st == t["status"]), upd)
+            if fin >= cut:
+                a["done" if t["status"] == "done" else "declined"] += 1
+                if t["status"] == "done":
+                    a["cyc"].append((fin - _datetime.datetime.strptime(t["created"][:19], "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600)
+        else:
+            a["open"] += 1
+            a["blocked"] += t["status"] == "blocked"
+        spent = {}
+        for i, (w, st) in enumerate(line):
+            end = line[i + 1][0] if i + 1 < len(line) else (now if t["status"] not in ("done", "declined") else w)
+            spent[st] = spent.get(st, 0) + max((end - w).total_seconds(), 0) / 3600
+        for st in a["dur"]:
+            if st in spent:
+                a["dur"][st].append(spent[st])
+    avg = lambda l: round(sum(l) / len(l), 1) if l else None
+    out = []
+    for a in sorted(agg.values(), key=lambda x: x["as"]):
+        o = {"as": a["as"], "done": a["done"], "declined": a["declined"], "open": a["open"], "blocked": a["blocked"], "cycle_h": avg(a["cyc"]),
+             "ip_h": avg(a["dur"]["in_progress"]), "rv_h": avg(a["dur"]["review"]), "bl_h": avg(a["dur"]["blocked"]),
+             "events": acts.get(a["as"], 0), "comments": com.get(a["as"], 0)}
+        o["decline_rate"] = round(a["declined"] / (a["done"] + a["declined"]), 2) if (a["done"] + a["declined"]) else None
+        out.append({k: v for k, v in o.items() if v is not None})
+    return {"days": days, "i": out}
+
+
+# ---------------------------------------------------------------- coordination: claims, locks, asks, reviews, presence, routing, envs, watchers, attachments
+def now_s():
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+
+
+def plus_min(m):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + m * 60))
+
+
+def parse_due(v, default_min=60):
+    if v in (None, ""):
+        return plus_min(default_min)
+    if isinstance(v, (int, float)) or re.fullmatch(r"\d+", str(v)):
+        return plus_min(max(1, min(int(v), 60 * 24 * 90)))
+    t = str(v).replace("T", " ")[:19]
+    for f in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.strptime(t, f))
+        except ValueError:
+            pass
+    raise ApiError("bad", 400, "due")
+
+
+_ctx = threading.local()
+
+
+def _ident(actor, body):
+    """Who is acting. A named, non-privileged token is always itself (cannot impersonate); shared/generic or admin/supervisor tokens may say `as`."""
+    named = bool(actor) and actor.lower() not in GENERIC_ACTORS
+    asn = " ".join(str(body.get("as") or body.get("agent") or "").split())[:60]
+    if named and not (asn and _priv(getattr(_ctx, "role", "agent"))):
+        return actor
+    return asn or (actor if named else "")
+
+
+def _me(actor, body):
+    n = _ident(actor, body)
+    if not n or n.lower() in GENERIC_ACTORS:
+        raise ApiError("missing", 400, "as")
+    return n
+
+
+def _priv(role):
+    return role in ("admin", "supervisor")
+
+
+_seen = {}
+
+
+def touch_presence(name):
+    if not name or name.lower() in GENERIC_ACTORS or time.time() - _seen.get(name, 0) < 20:
+        return
+    _seen[name] = time.time()
+    with lock:
+        db.execute("INSERT OR IGNORE INTO agents(name) VALUES(?)", (name,))
+        db.execute("UPDATE agents SET last_seen=? WHERE name=?", (now_s(), name))
+
+
+def silent_agents():
+    cut = plus_min(-SILENT_MIN)
+    return {r["name"].lower() for r in rows("SELECT name FROM agents WHERE last_seen!='' AND last_seen<?", (cut,))}
+
+
+def presence_set(actor, body):
+    me = _me(actor, body)
+    st = " ".join(str(body.get("status") or body.get("text") or "").split())[:200]
+    tk = body.get("task")
+    with lock:
+        db.execute("INSERT OR IGNORE INTO agents(name) VALUES(?)", (me,))
+        db.execute("UPDATE agents SET last_seen=?, status_text=?, status_task=? WHERE name=?", (now_s(), st, int(tk) if tk not in (None, "") else None, me))
+    return {"n": me, "ok": 1}
+
+
+# ---- claims
+READY_SQL = "NOT EXISTS (SELECT 1 FROM tasks dd WHERE dd.status NOT IN ('done','declined') AND (',' || tasks.depends || ',') LIKE '%,' || dd.id || ',%')"
+
+
+def claim_task(actor, tid, body):
+    me = _me(actor, body)
+    ttl = max(1, min(int(body.get("ttl") or 120), 1440))
+    with lock:
+        r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+        if not r:
+            raise ApiError("nf", 404)
+        t = r[0]
+        if t["status"] in ("done", "declined"):
+            raise ApiError("bad", 400, "st")
+        if t["status"] in ("backlog", "todo"):
+            check_wip(t["board_id"], "in_progress", tid=tid)
+        if t["claimed_by"] and t["claimed_by"].lower() != me.lower() and t["claim_until"] > now_s():
+            raise ApiError("claimed", 409, t["claimed_by"])
+        until = plus_min(ttl)
+        st = "in_progress" if t["status"] in ("backlog", "todo") else t["status"]
+        db.execute("UPDATE tasks SET claimed_by=?, claim_until=?, assignee=?, status=?, nudge='', updated=CURRENT_TIMESTAMP, version=COALESCE(version,1)+1 WHERE id=?", (me, until, me, st, tid))
+        delta = {"cb": me, "cu": until, "as": me, **({"st": st} if st != t["status"] else {})}
+        emit(actor, "task.updated", tid, t["board_id"], delta)
+        if t["assignee"] and t["assignee"].lower() not in (me.lower(), (actor or "").lower()):
+            notify(t["assignee"], "task.unassigned", me, tid, t["board_id"], "#%d '%s' was claimed by %s" % (tid, t["title"][:60], me), delta)
+        od = open_dep_ids(t["depends"])
+    out = {"id": tid, "cb": me, "cu": until, "st": st}
+    if od:
+        out["w"] = ["depends on open " + " ".join("#%d" % i for i in od)]
+    return out
+
+
+def release_task(actor, role, tid, body):
+    with lock:
+        r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+        if not r:
+            raise ApiError("nf", 404)
+        t = r[0]
+        me = _ident(actor, body)
+        if t["claimed_by"] and t["claimed_by"].lower() != me.lower() and not _priv(role):
+            raise ApiError("forbidden", 403)
+        db.execute("UPDATE tasks SET claimed_by='', claim_until='', version=COALESCE(version,1)+1, updated=CURRENT_TIMESTAMP WHERE id=?", (tid,))
+        emit(actor, "task.updated", tid, t["board_id"], {"cb": ""})
+    return {"id": tid, "released": 1}
+
+
+def claim_next(actor, body):
+    me = _me(actor, body)
+    wh = ["status='todo'", "(claimed_by='' OR claim_until<?)", "(assignee='' OR assignee=? COLLATE NOCASE)", READY_SQL]
+    ar = [now_s(), me]
+    if body.get("b") or body.get("board_id"):
+        wh.append("board_id=?")
+        ar.append(int(body.get("b") or body.get("board_id")))
+    labels = [x for x in (body.get("lb") or body.get("skill") or "").split(",") if x.strip()] if isinstance(body.get("lb") or body.get("skill") or "", str) else []
+    if labels:
+        wh.append("(" + " OR ".join("(',' || labels || ',') LIKE ?" for _ in labels) + ")")
+        ar += ["%," + x.strip().lower() + ",%" for x in labels]
+    r = rows("SELECT id FROM tasks WHERE " + " AND ".join(wh) + " ORDER BY priority, id LIMIT 1", ar)
+    if not r:
+        return {"none": 1}
+    res = claim_task(actor, r[0]["id"], {**body, "as": me})
+    return {**res, "t": rows("SELECT title FROM tasks WHERE id=?", (r[0]["id"],))[0]["title"]}
+
+
+# ---- locks
+def locks_list():
+    with lock:
+        db.execute("DELETE FROM locks WHERE expires<?", (now_s(),))
+    return {"n": 0, "i": [{"name": r["name"], "owner": r["owner"], "until": r["expires"], "note": r["note"]} for r in rows("SELECT * FROM locks ORDER BY name")]}
+
+
+def lock_acquire(actor, body):
+    me = _me(actor, body)
+    name = re.sub(r"[^A-Za-z0-9_.:/-]", "", str(body.get("name") or ""))[:80]
+    if not name:
+        raise ApiError("missing", 400, "name")
+    ttl = max(1, min(int(body.get("ttl") or 30), 1440))
+    with lock:
+        db.execute("DELETE FROM locks WHERE expires<?", (now_s(),))
+        r = db.execute("SELECT * FROM locks WHERE name=?", (name,)).fetchone()
+        if r and r["owner"].lower() != me.lower():
+            raise ApiError("locked", 409, r["owner"])
+        until = plus_min(ttl)
+        db.execute("INSERT OR REPLACE INTO locks(name,owner,note,expires) VALUES(?,?,?,?)", (name, me, str(body.get("note") or "")[:200], until))
+    return {"name": name, "owner": me, "until": until}
+
+
+def lock_release(actor, role, name, body):
+    me = _ident(actor, body)
+    with lock:
+        r = db.execute("SELECT * FROM locks WHERE name=?", (name,)).fetchone()
+        if not r:
+            return {"name": name, "released": 0}
+        if r["owner"].lower() != me.lower() and not _priv(role):
+            raise ApiError("forbidden", 403)
+        db.execute("DELETE FROM locks WHERE name=?", (name,))
+    return {"name": name, "released": 1}
+
+
+# ---- asks (questions with a deadline)
+def ask_out(r):
+    o = {"id": r["id"], "from": r["from_agent"], "to": r["to_agent"], "q": r["question"], "st": r["status"], "due": r["due"], "tk": r["task_id"], "a": r["answer"], "c": r["created"]}
+    return {k: v for k, v in o.items() if v not in (None, "")}
+
+
+def ask_create(actor, body):
+    frm = _me(actor, body)
+    to = " ".join(str(body.get("to") or "").split())[:60]
+    q = str(body.get("q") or body.get("question") or "").strip()[:2000]
+    if not to:
+        raise ApiError("missing", 400, "to")
+    if not q:
+        raise ApiError("missing", 400, "q")
+    tk = body.get("task") or body.get("tk")
+    bid = None
+    if tk not in (None, ""):
+        t = rows("SELECT board_id FROM tasks WHERE id=?", (int(tk),))
+        if not t:
+            raise ApiError("bad", 400, "task")
+        bid, tk = t[0]["board_id"], int(tk)
+    else:
+        tk = None
+    due = parse_due(body.get("due"), 60)
+    with lock:
+        aid = db.execute("INSERT INTO asks(from_agent,to_agent,task_id,board_id,question,due) VALUES(?,?,?,?,?,?)", (frm, to, tk, bid, q, due)).lastrowid
+        notify(to, "ask.new", frm, tk, bid, "question #%d from %s (answer by %s UTC)%s: %s" % (aid, frm, due[11:16], " about task #%d" % tk if tk else "", q[:160]), {"ask": aid})
+    return {"id": aid, "to": to, "due": due}
+
+
+def ask_answer(actor, role, aid, body):
+    me = _me(actor, body)
+    a = str(body.get("a") or body.get("answer") or "").strip()[:4000]
+    if not a:
+        raise ApiError("missing", 400, "a")
+    with lock:
+        r = rows("SELECT * FROM asks WHERE id=?", (aid,))
+        if not r:
+            raise ApiError("nf", 404)
+        r = r[0]
+        if r["status"] != "open":
+            raise ApiError("bad", 400, "st")
+        if r["to_agent"].lower() != me.lower() and not _priv(role):
+            raise ApiError("forbidden", 403)
+        db.execute("UPDATE asks SET answer=?, status='answered', answered=? WHERE id=?", (a, now_s(), aid))
+        notify(r["from_agent"], "ask.answered", me, r["task_id"], r["board_id"], "%s answered your question #%d: %s" % (me, aid, a[:200]), {"ask": aid})
+    return {"id": aid, "st": "answered"}
+
+
+def ask_cancel(actor, role, aid, body):
+    me = _me(actor, body)
+    with lock:
+        r = rows("SELECT * FROM asks WHERE id=?", (aid,))
+        if not r:
+            raise ApiError("nf", 404)
+        if r[0]["from_agent"].lower() != me.lower() and not _priv(role):
+            raise ApiError("forbidden", 403)
+        db.execute("UPDATE asks SET status='cancelled' WHERE id=? AND status='open'", (aid,))
+    return {"id": aid, "st": "cancelled"}
+
+
+def asks_list(q, actor=""):
+    wh, ar = [], []
+    st = _qv(q, "st", "status", default="open")
+    if st != "all":
+        wh.append("status=?")
+        ar.append(st)
+    for k, col in (("to", "to_agent"), ("from", "from_agent")):
+        if _qv(q, k):
+            wh.append(col + "=? COLLATE NOCASE")
+            ar.append(_qv(q, k))
+    if _qv(q, "task", "tk"):
+        wh.append("task_id=?")
+        ar.append(int(_qv(q, "task", "tk")))
+    rs = rows("SELECT * FROM asks" + (" WHERE " + " AND ".join(wh) if wh else "") + " ORDER BY due LIMIT 200", ar)
+    return {"n": len(rs), "i": [ask_out(r) for r in rs]}
+
+
+# ---- reviews
+def review_out(r):
+    o = {"id": r["id"], "tk": r["task_id"], "from": r["requester"], "to": r["reviewer"], "st": r["status"], "note": r["note"], "dn": r["decision_note"], "c": r["created"]}
+    return {k: v for k, v in o.items() if v not in (None, "")}
+
+
+def review_request(actor, tid, body):
+    me = _me(actor, body)
+    rv = " ".join(str(body.get("reviewer") or body.get("to") or "").split())[:60]
+    if not rv:
+        raise ApiError("missing", 400, "reviewer")
+    with lock:
+        r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+        if not r:
+            raise ApiError("nf", 404)
+        t = r[0]
+        ex = rows("SELECT * FROM reviews WHERE task_id=? AND reviewer=? COLLATE NOCASE AND status='pending'", (tid, rv))
+        if ex:
+            return review_out(ex[0])
+        rid = db.execute("INSERT INTO reviews(task_id,requester,reviewer,note) VALUES(?,?,?,?)", (tid, me, rv, str(body.get("note") or "")[:1000])).lastrowid
+        if t["status"] in ("backlog", "todo", "in_progress", "blocked"):
+            db.execute("UPDATE tasks SET status='review', updated=CURRENT_TIMESTAMP, version=COALESCE(version,1)+1 WHERE id=?", (tid,))
+            emit(actor, "task.updated", tid, t["board_id"], {"st": "review"})
+        notify(rv, "review.requested", me, tid, t["board_id"], "%s asks you to review #%d '%s'%s" % (me, tid, t["title"][:60], ": " + body["note"][:140] if body.get("note") else ""), {"review": rid})
+        return review_out(rows("SELECT * FROM reviews WHERE id=?", (rid,))[0])
+
+
+def review_decide(actor, role, rid, body):
+    me = _me(actor, body)
+    dec = str(body.get("decision") or "").lower()
+    if dec not in ("approve", "changes"):
+        raise ApiError("bad", 400, "decision")
+    note = str(body.get("note") or "").strip()[:1000]
+    if dec == "changes" and not note:
+        raise ApiError("missing", 400, "note")
+    with lock:
+        r = rows("SELECT * FROM reviews WHERE id=?", (rid,))
+        if not r:
+            raise ApiError("nf", 404)
+        r = r[0]
+        if r["status"] != "pending":
+            raise ApiError("bad", 400, "st")
+        if r["reviewer"].lower() != me.lower() and not _priv(role):
+            raise ApiError("forbidden", 403)
+        st = "approved" if dec == "approve" else "changes"
+        db.execute("UPDATE reviews SET status=?, decision_note=?, decided=? WHERE id=?", (st, note, now_s(), rid))
+        t = rows("SELECT * FROM tasks WHERE id=?", (r["task_id"],))[0]
+        db.execute("INSERT INTO comments(task_id,actor,body) VALUES(?,?,?)", (t["id"], me, ("Review approved" if st == "approved" else "Changes requested") + (": " + note if note else "")))
+        if st == "changes":
+            db.execute("UPDATE tasks SET status='in_progress', updated=CURRENT_TIMESTAMP, version=COALESCE(version,1)+1 WHERE id=?", (t["id"],))
+            emit(actor, "task.updated", t["id"], t["board_id"], {"st": "in_progress"})
+        pend = rows("SELECT id FROM reviews WHERE task_id=? AND status IN ('pending','changes')", (t["id"],))
+        msg = ("%s approved #%d '%s'%s" % (me, t["id"], t["title"][:60], " - all reviews approved" if not pend else "")) if st == "approved" else \
+              ("%s requested changes on #%d '%s': %s" % (me, t["id"], t["title"][:60], note[:160]))
+        notify(r["requester"], "review." + st, me, t["id"], t["board_id"], msg, {"review": rid})
+    return {"id": rid, "st": st}
+
+
+def reviews_list(q):
+    wh, ar = [], []
+    st = _qv(q, "st", "status", default="pending")
+    if st != "all":
+        wh.append("status=?")
+        ar.append(st)
+    for k, col in (("reviewer", "reviewer"), ("to", "reviewer"), ("from", "requester")):
+        if _qv(q, k):
+            wh.append(col + "=? COLLATE NOCASE")
+            ar.append(_qv(q, k))
+    if _qv(q, "task", "tk"):
+        wh.append("task_id=?")
+        ar.append(int(_qv(q, "task", "tk")))
+    rs = rows("SELECT * FROM reviews" + (" WHERE " + " AND ".join(wh) if wh else "") + " ORDER BY id DESC LIMIT 200", ar)
+    return {"n": len(rs), "i": [review_out(r) for r in rs]}
+
+
+def check_done_gate(tid, bid, dod_done):
+    """Definition of done (board checklist) + open reviews must be satisfied before a task can reach done."""
+    b = rows("SELECT dod FROM boards WHERE id=?", (bid,))
+    items = [x for x in (b[0]["dod"] if b else "").splitlines() if x.strip()]
+    if items:
+        done = {int(x) for x in re.findall(r"\d+", str(dod_done or ""))}
+        if not set(range(len(items))) <= done:
+            raise ApiError("dod", 400, "dn")
+    if rows("SELECT id FROM reviews WHERE task_id=? AND status IN ('pending','changes')", (tid,)):
+        raise ApiError("review", 400, "st")
+
+
+# ---- skills routing
+def route_candidates(skill="", labels="", bid=None):
+    want = {x.strip().lower() for x in (str(skill) + "," + str(labels)).split(",") if x.strip()}
+    sil = silent_agents()
+    out = []
+    for a in rows("SELECT * FROM agents"):
+        sk = {x.strip().lower() for x in (a["skills"] or "").split(",") if x.strip()}
+        if not sk or (want and not (sk & want)):
+            continue
+        load = db.execute("SELECT COUNT(*) FROM tasks WHERE assignee=? COLLATE NOCASE AND status NOT IN ('done','declined')", (a["name"],)).fetchone()[0]
+        cap = a["capacity"] or 8
+        out.append({"n": a["name"], "load": load, "cap": a["capacity"] or 0, "silent": a["name"].lower() in sil, "_s": (a["name"].lower() in sil, load / cap, load)})
+    out.sort(key=lambda x: x["_s"])
+    for o in out:
+        o.pop("_s")
+    return out
+
+
+# ---- environments
+def envs_list():
+    now = now_s()
+    return {"i": [{**{k: v for k, v in {"n": r["name"], "sha": r["sha"], "url": r["url"], "by": r["deployed_by"], "at": r["deployed_at"], "tk": r["task_id"]}.items() if v not in (None, "")},
+                   **({"frozen": r["frozen_until"], "fn": r["freeze_note"]} if r["frozen_until"] > now else {})} for r in rows("SELECT * FROM envs ORDER BY name")]}
+
+
+def _env_name(v):
+    n = re.sub(r"[^a-z0-9._-]", "", str(v or "").lower())[:40]
+    if not n:
+        raise ApiError("missing", 400, "n")
+    return n
+
+
+def env_deploy(actor, role, body):
+    me = _me(actor, body)
+    name = _env_name(body.get("n") or body.get("name"))
+    sha = str(body.get("sha") or "").strip()[:200]
+    with lock:
+        r = db.execute("SELECT * FROM envs WHERE name=?", (name,)).fetchone()
+        if r and r["frozen_until"] > now_s() and not (body.get("force") and _priv(role)):
+            raise ApiError("frozen", 423, r["frozen_until"])
+        lk = db.execute("SELECT * FROM locks WHERE name=? AND expires>=?", ("env:" + name, now_s())).fetchone()
+        if lk and lk["owner"].lower() != me.lower():
+            raise ApiError("locked", 409, lk["owner"])
+        tk = int(body["task"]) if body.get("task") not in (None, "") else None
+        db.execute("INSERT INTO envs(name,sha,url,deployed_by,deployed_at,task_id) VALUES(?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET sha=excluded.sha, url=CASE WHEN excluded.url!='' THEN excluded.url ELSE envs.url END, deployed_by=excluded.deployed_by, deployed_at=excluded.deployed_at, task_id=excluded.task_id",
+                   (name, sha, str(body.get("url") or "")[:300], me, now_s(), tk))
+        if tk and sha:
+            t = rows("SELECT board_id FROM tasks WHERE id=?", (tk,))
+            if t:
+                db.execute("UPDATE tasks SET sha=?, version=COALESCE(version,1)+1, updated=CURRENT_TIMESTAMP WHERE id=?", (sha, tk))
+                emit(actor, "task.updated", tk, t[0]["board_id"], {"sha": sha})
+        emit(actor, "env.updated", 0, None, {"n": name, "sha": sha})
+    return {"n": name, "sha": sha, "by": me}
+
+
+def env_freeze(actor, name, body, on=True):
+    name = _env_name(name)
+    with lock:
+        db.execute("INSERT OR IGNORE INTO envs(name) VALUES(?)", (name,))
+        if on:
+            until = parse_due(body.get("until"), 60 * 24)
+            note = str(body.get("note") or "")[:200]
+            db.execute("UPDATE envs SET frozen_until=?, freeze_note=? WHERE name=?", (until, note, name))
+            for a in rows("SELECT name FROM agents"):
+                notify(a["name"], "env.frozen", actor, None, None, "environment '%s' is frozen until %s UTC%s" % (name, until[:16], ": " + note if note else ""), {"env": name})
+        else:
+            db.execute("UPDATE envs SET frozen_until='', freeze_note='' WHERE name=?", (name,))
+    return {"n": name, "frozen": bool(on)}
+
+
+# ---- watchers
+WATCH_KINDS = ("task", "spec", "label", "board", "tag")
+
+
+def watch_add(actor, body):
+    me = _me(actor, body)
+    kind, ref = str(body.get("kind") or ""), str(body.get("ref") or "").strip().lower()
+    if kind not in WATCH_KINDS:
+        raise ApiError("bad", 400, "kind")
+    if not ref:
+        raise ApiError("missing", 400, "ref")
+    with lock:
+        db.execute("INSERT OR IGNORE INTO watches(agent,kind,ref) VALUES(?,?,?)", (me, kind, ref[:80]))
+    return {"as": me, "kind": kind, "ref": ref}
+
+
+def watch_del(actor, q):
+    me = _qv(q, "as") or actor
+    with lock:
+        db.execute("DELETE FROM watches WHERE agent=? AND kind=? AND ref=?", (me, _qv(q, "kind", default=""), (_qv(q, "ref", default="")).lower()))
+    return {"ok": 1}
+
+
+def watch_list(q, actor=""):
+    me = _qv(q, "as") or actor
+    rs = rows("SELECT * FROM watches" + (" WHERE agent=? COLLATE NOCASE" if me and me.lower() not in GENERIC_ACTORS else "") + " ORDER BY id", (me,) if me and me.lower() not in GENERIC_ACTORS else ())
+    return {"n": len(rs), "i": [{"as": r["agent"], "kind": r["kind"], "ref": r["ref"]} for r in rs]}
+
+
+def _watchers(pairs, skip=()):
+    sk = {x.lower() for x in skip if x}
+    out = set()
+    for kind, ref in pairs:
+        for r in rows("SELECT agent FROM watches WHERE kind=? AND ref=?", (kind, str(ref).lower())):
+            if r["agent"].lower() not in sk:
+                out.add(r["agent"])
+    return out
+
+
+def _notify_watchers(actor, old, new):
+    if old is not None and not any(old.get(k) != new.get(k) for k in NOTIFY_KEYS):
+        return
+    pairs = [("task", new["id"]), ("board", new["board_id"])] + [("label", x) for x in _lbl_set(new["labels"])]
+    for a in _watchers(pairs, skip=(actor, new["assignee"])):
+        notify(a, "watch.task", actor, new["id"], new["board_id"], "watching: #%d '%s' %s by %s [%s]" % (new["id"], new["title"][:60], "created" if old is None else "updated", actor, new["status"]), {"st": new["status"]})
+
+
+# ---- attachments (artifact registry)
+ATT_KINDS = ("file", "pr", "report", "log", "link", "other")
+
+
+def att_add(actor, tid, body):
+    name = " ".join(str(body.get("name") or body.get("n") or "").split())[:120]
+    if not name:
+        raise ApiError("missing", 400, "name")
+    url = str(body.get("url") or body.get("u") or "").strip()[:500]
+    if url and not re.match(r"(https?://|/)", url):
+        raise ApiError("bad", 400, "url")
+    kind = body.get("kind") or body.get("k") or "link"
+    if kind not in ATT_KINDS:
+        raise ApiError("bad", 400, "kind")
+    with lock:
+        t = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+        if not t:
+            raise ApiError("nf", 404)
+        t = t[0]
+        aid = db.execute("INSERT INTO attachments(task_id,name,url,kind,note,actor) VALUES(?,?,?,?,?,?)", (tid, name, url, kind, str(body.get("note") or "")[:300], actor)).lastrowid
+        n = db.execute("SELECT COUNT(*) FROM attachments WHERE task_id=?", (tid,)).fetchone()[0]
+        db.execute("UPDATE tasks SET updated=CURRENT_TIMESTAMP, nudge='' WHERE id=?", (tid,))
+        emit(actor, "task.updated", tid, t["board_id"], {"att": n})
+        notify(t["assignee"], "task.attachment", actor, tid, t["board_id"], "%s attached %s '%s' to #%d" % (actor, kind, name[:60], tid), {"att": aid})
+    return {"id": aid, "tk": tid}
+
+
+def atts_get(tid):
+    if not rows("SELECT id FROM tasks WHERE id=?", (tid,)):
+        raise ApiError("nf", 404)
+    rs = rows("SELECT * FROM attachments WHERE task_id=? ORDER BY id", (tid,))
+    return {"n": len(rs), "i": [{k: v for k, v in {"id": r["id"], "n": r["name"], "u": r["url"], "k": r["kind"], "note": r["note"], "by": r["actor"], "c": r["created"]}.items() if v} for r in rs]}
+
+
+def att_del(aid):
+    with lock:
+        db.execute("DELETE FROM attachments WHERE id=?", (aid,))
+    return {"id": aid, "x": 1}
+
+
+# ---- housekeeping (runs with the periodic tick, under `lock`)
+def housekeeping(actor="system"):
+    nowt = now_s()
+    rollover_tick(actor)
+    replenish_tick(actor)
+    for t in rows("SELECT * FROM tasks WHERE claimed_by!='' AND claim_until<?", (nowt,)):
+        db.execute("UPDATE tasks SET claimed_by='', claim_until='', version=COALESCE(version,1)+1 WHERE id=?", (t["id"],))
+        emit(actor, "task.updated", t["id"], t["board_id"], {"cb": ""})
+        notify(t["claimed_by"], "claim.expired", actor, t["id"], t["board_id"], "your claim on #%d '%s' expired - renew it or release it" % (t["id"], t["title"][:60]))
+    db.execute("DELETE FROM locks WHERE expires<?", (nowt,))
+    for a in rows("SELECT * FROM asks WHERE status='open' AND escalated=0 AND due<?", (nowt,)):
+        db.execute("UPDATE asks SET escalated=1 WHERE id=?", (a["id"],))
+        notify(a["to_agent"], "ask.overdue", actor, a["task_id"], a["board_id"], "question #%d from %s is overdue: %s" % (a["id"], a["from_agent"], a["question"][:140]), {"ask": a["id"]})
+        notify(a["from_agent"], "ask.overdue", actor, a["task_id"], a["board_id"], "%s has not answered your question #%d yet" % (a["to_agent"], a["id"]), {"ask": a["id"]})
+        escalate("ask-overdue", actor, a["task_id"], a["board_id"], "%s has not answered %s's question #%d (due %s UTC)" % (a["to_agent"], a["from_agent"], a["id"], a["due"][:16]), skip=(a["to_agent"], a["from_agent"]))
+    for n in silent_agents():
+        busy = rows("SELECT id FROM tasks WHERE assignee=? COLLATE NOCASE AND status='in_progress'", (n,))
+        last = db.execute("SELECT last_seen FROM agents WHERE name=?", (n,)).fetchone()["last_seen"]
+        if busy and get_setting("silent:" + n) != last:
+            set_setting("silent:" + n, last)
+            escalate("silent", actor, busy[0]["id"], None, "%s has been silent since %s UTC with %d task(s) in progress (#%s)" % (n, last[:16], len(busy), busy[0]["id"]), skip=(n,))
+
+
+# ---------------------------------------------------------------- work methodologies: scrum, kanban, scrumban, shape up, simple
+ALL_STATUSES = ["backlog", "todo", "in_progress", "review", "blocked", "done"]
+METHODS = {
+    "scrum": {"name": "Scrum", "about": "Fixed-length sprints with a commitment, velocity and a retrospective after each one.",
+              "sprints": True, "wip": False, "term": "Sprint", "sprint_days": 14, "columns": ALL_STATUSES,
+              "labels": {}},
+    "kanban": {"name": "Kanban", "about": "Continuous flow, no sprints. Limit work in progress and watch cycle time, throughput and aging work.",
+               "sprints": False, "wip": True, "term": "", "sprint_days": 14, "columns": ALL_STATUSES,
+               "labels": {"todo": "Ready", "in_progress": "Doing"}},
+    "scrumban": {"name": "Scrumban", "about": "Kanban flow with an optional cadence: WIP limits, optional sprints, and a signal to replenish the ready column.",
+                 "sprints": True, "wip": True, "term": "Sprint", "sprint_days": 14, "columns": ALL_STATUSES,
+                 "labels": {"todo": "Ready", "in_progress": "Doing"}},
+    "shapeup": {"name": "Shape Up", "about": "Six-week cycles with fixed appetite: shape pitches, bet on a few, build to ship, then cool down.",
+                "sprints": True, "wip": False, "term": "Cycle", "sprint_days": 42, "columns": ALL_STATUSES,
+                "labels": {"backlog": "Shaping", "todo": "Bets", "in_progress": "Building", "review": "QA", "blocked": "Stuck", "done": "Shipped"}},
+    "simple": {"name": "Simple list", "about": "Just to do, doing and done. No sprints, no limits.",
+               "sprints": False, "wip": False, "term": "", "sprint_days": 14, "columns": ["todo", "in_progress", "done"],
+               "labels": {"in_progress": "Doing"}},
+}
+TASK_TYPES = ("task", "story", "bug", "epic", "spike", "chore")
+
+
+def norm_cfg(v):
+    """Board settings as JSON: wip {status: limit}, wip_mode warn|block, sprint_days, auto_rollover, replenish_below."""
+    if isinstance(v, str):
+        try:
+            v = json.loads(v) if v.strip() else {}
+        except ValueError:
+            raise ApiError("bad", 400, "cf")
+    if not isinstance(v, dict):
+        raise ApiError("bad", 400, "cf")
+    out = {}
+    try:
+        wip = {k: int(n) for k, n in (v.get("wip") or {}).items() if k in ALL_STATUSES and n not in (None, "", 0, "0")}
+        if any(n < 1 or n > 999 for n in wip.values()):
+            raise ValueError
+        if wip:
+            out["wip"] = wip
+        if v.get("wip_mode") in ("warn", "block"):
+            out["wip_mode"] = v["wip_mode"]
+        if v.get("sprint_days") not in (None, "", 0):
+            out["sprint_days"] = max(1, min(int(v["sprint_days"]), 120))
+        if v.get("auto_rollover"):
+            out["auto_rollover"] = True
+        if v.get("replenish_below") not in (None, "", 0, "0"):
+            out["replenish_below"] = max(1, min(int(v["replenish_below"]), 999))
+    except (TypeError, ValueError):
+        raise ApiError("bad", 400, "cf")
+    return json.dumps(out, separators=(",", ":"))
+
+
+def board_cfg(bid):
+    r = rows("SELECT method, cfg FROM boards WHERE id=?", (bid,))
+    if not r:
+        return "scrum", {}
+    try:
+        return r[0]["method"] or "scrum", json.loads(r[0]["cfg"] or "{}")
+    except ValueError:
+        return r[0]["method"] or "scrum", {}
+
+
+def board_has_sprints(bid):
+    return METHODS.get(board_cfg(bid)[0], METHODS["scrum"])["sprints"]
+
+
+def sprint_days_for(bid):
+    m, cfg = board_cfg(bid)
+    return int(cfg.get("sprint_days") or METHODS.get(m, METHODS["scrum"])["sprint_days"] or SPRINT_DAYS)
+
+
+def check_wip(bid, status, tid=None, force=False):
+    """Kanban/scrumban work-in-progress limit. 'block' mode refuses (409 wip); 'warn' mode returns a message. None = fine."""
+    m, cfg = board_cfg(bid)
+    lim = (cfg.get("wip") or {}).get(status)
+    if not METHODS.get(m, {}).get("wip") or not lim:
+        return None
+    n = db.execute("SELECT COUNT(*) FROM tasks WHERE board_id=? AND status=? AND id!=?", (bid, status, tid or 0)).fetchone()[0]
+    if n < lim:
+        return None
+    if cfg.get("wip_mode") == "block" and not (force and _priv(getattr(_ctx, "role", "agent"))):
+        raise ApiError("wip", 409, status)
+    return "WIP limit for %s reached (%d of %d)" % (status, n + 1, lim)
+
+
+def check_parent(tid, parent, bid):
+    if parent is None:
+        return
+    r = rows("SELECT id, board_id, type FROM tasks WHERE id=?", (parent,))
+    if not r or r[0]["board_id"] != bid or r[0]["type"] != "epic" or (tid and parent == tid):
+        raise ApiError("bad", 400, "pa")
+
+
+def sprint_weight(sid):
+    ts = rows("SELECT status, points FROM tasks WHERE sprint_id=? AND status!='declined'", (sid,))
+    pts = any(t["points"] for t in ts)
+    return sum((t["points"] or 1) if pts else 1 for t in ts)
+
+
+# ---- flow metrics (kanban): timelines are rebuilt from the event log
+def _tsd(v):
+    try:
+        return _datetime.datetime.strptime(str(v)[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return _datetime.datetime(1970, 1, 1)
+
+
+def _timelines(ts):
+    byid = {t["id"]: t for t in ts}
+    tl = {}
+    for e in rows("SELECT ts, payload FROM events WHERE type LIKE 'task.%' ORDER BY id"):
+        try:
+            pj = json.loads(e["payload"])
+        except ValueError:
+            continue
+        d = pj.get("d")
+        if pj.get("id") in byid and isinstance(d, dict) and d.get("st"):
+            tl.setdefault(pj["id"], []).append((_tsd(e["ts"]), d["st"]))
+    for t in ts:
+        line = tl.setdefault(t["id"], [])
+        created = _tsd(t["created"])
+        if not line:
+            line.append((created, t["status"]))
+        elif line[0][0] > created + _datetime.timedelta(seconds=5):
+            line.insert(0, (created, "backlog"))
+        line.sort(key=lambda x: x[0])
+    return tl
+
+
+def _pct(vals, p):
+    if not vals:
+        return None
+    v = sorted(vals)
+    return round(v[min(len(v) - 1, int(round(p * (len(v) - 1))))], 1)
+
+
+def board_flow(bid, days=30):
+    now = _datetime.datetime.now(_datetime.timezone.utc).replace(tzinfo=None)
+    cut = now - _datetime.timedelta(days=days)
+    ts = rows("SELECT id, title, status, created, assignee, priority FROM tasks WHERE board_id=?", (bid,))
+    tl = _timelines(ts)
+    m, cfg = board_cfg(bid)
+    done_at, start_at = {}, {}
+    for t in ts:
+        line = tl[t["id"]]
+        start_at[t["id"]] = next((w for w, st in line if st == "in_progress"), None)
+        if t["status"] == "done":
+            done_at[t["id"]] = max((w for w, st in line if st == "done"), default=_tsd(t["created"]))
+    comp = [t for t in ts if t["id"] in done_at and done_at[t["id"]] >= cut]
+    cyc = [(done_at[t["id"]] - start_at[t["id"]]).total_seconds() / 3600 for t in comp if start_at[t["id"]]]
+    lead = [(done_at[t["id"]] - _tsd(t["created"])).total_seconds() / 3600 for t in comp]
+    weeks = []
+    for i in range(max(1, (days + 6) // 7) - 1, -1, -1):
+        hi, lo = now - _datetime.timedelta(days=7 * i), now - _datetime.timedelta(days=7 * (i + 1))
+        weeks.append({"from": lo.strftime("%Y-%m-%d"), "n": sum(1 for t in comp if lo < done_at[t["id"]] <= hi)})
+    cfd = []
+    for i in range(days + 1):
+        day = cut.date() + _datetime.timedelta(days=i)
+        end = _datetime.datetime.combine(day, _datetime.time.max)
+        counts = {k: 0 for k in ALL_STATUSES}
+        for t in ts:
+            cur = None
+            for w, st in tl[t["id"]]:
+                if w <= end:
+                    cur = st
+            if cur in counts:
+                counts[cur] += 1
+        cfd.append({"d": day.isoformat(), **counts})
+    wip = {st: sum(1 for t in ts if t["status"] == st) for st in ALL_STATUSES}
+    thr = max(72, 2 * (_pct(cyc, 0.5) or 0))
+    aging = []
+    for t in ts:
+        if t["status"] in ("in_progress", "review", "blocked"):
+            since = tl[t["id"]][-1][0]
+            age = (now - since).total_seconds() / 3600
+            aging.append({"id": t["id"], "t": t["title"], "st": t["status"], "age_h": round(age, 1), "as": t["assignee"], "stuck": age > thr})
+    aging.sort(key=lambda x: -x["age_h"])
+    limits = cfg.get("wip") or {}
+    return {"b": bid, "mt": m, "days": days, "wip": wip, "limits": limits, "over": [k for k, n in limits.items() if wip.get(k, 0) > n],
+            "done_n": len(comp), "per_week": weeks, "cycle_h": {"avg": round(sum(cyc) / len(cyc), 1) if cyc else None, "p50": _pct(cyc, 0.5), "p85": _pct(cyc, 0.85)},
+            "lead_h": {"avg": round(sum(lead) / len(lead), 1) if lead else None, "p50": _pct(lead, 0.5), "p85": _pct(lead, 0.85)},
+            "aging": aging[:10], "stuck": [a["id"] for a in aging if a["stuck"]], "cfd": cfd}
+
+
+# ---- velocity and retrospectives (scrum, shape up, scrumban)
+def board_velocity(bid, n=8):
+    rs = rows("SELECT * FROM sprints WHERE board_id=? ORDER BY id DESC LIMIT ?", (bid, n))
+    out = []
+    for sp in reversed(rs):
+        ts = rows("SELECT status, points FROM tasks WHERE sprint_id=?", (sp["id"],))
+        pts = any(t["points"] for t in ts)
+        w = lambda t: (t["points"] or 1) if pts else 1
+        out.append({"id": sp["id"], "n": sp["name"], "st": sp["state"], "from": sp["start"], "to": sp["end"], "committed": sp["committed"] or 0,
+                    "done": sum(w(t) for t in ts if t["status"] == "done"), "scope": sum(w(t) for t in ts if t["status"] != "declined"), "pts": pts})
+    closed = [x["done"] for x in out if x["st"] == "closed"]
+    return {"b": bid, "i": out, "avg": round(sum(closed) / len(closed), 1) if closed else None}
+
+
+def retro_get(sid):
+    sp = rows("SELECT * FROM sprints WHERE id=?", (sid,))
+    if not sp:
+        raise ApiError("nf", 404)
+    r = rows("SELECT * FROM retros WHERE sprint_id=?", (sid,))
+    ts = rows("SELECT status, points FROM tasks WHERE sprint_id=?", (sid,))
+    o = {"id": sid, "n": sp[0]["name"], "st": sp[0]["state"], "done": sum(1 for t in ts if t["status"] == "done"), "total": len(ts), "committed": sp[0]["committed"] or 0}
+    if r:
+        o.update({"well": r[0]["well"], "improve": r[0]["improve"], "actions": json.loads(r[0]["actions"] or "[]"), "by": r[0]["author"], "c": r[0]["created"]})
+    return o
+
+
+def retro_save(actor, sid, body):
+    sp = rows("SELECT * FROM sprints WHERE id=?", (sid,))
+    if not sp:
+        raise ApiError("nf", 404)
+    sp = sp[0]
+    well, imp = str(body.get("well") or "").strip()[:4000], str(body.get("improve") or "").strip()[:4000]
+    raw = body.get("actions") or []
+    raw = [x for x in raw.splitlines()] if isinstance(raw, str) else list(raw)
+    acts = [" ".join(str(x).split())[:200] for x in raw if str(x).strip()][:20]
+    old = rows("SELECT actions FROM retros WHERE sprint_id=?", (sid,))
+    prev = json.loads(old[0]["actions"]) if old else []
+    done_texts = {a["t"]: a.get("task") for a in prev}
+    items = []
+    for a in acts:
+        tk = done_texts.get(a)
+        if not tk and body.get("make_tasks", True):
+            res = crud(actor, "POST", "tasks", None, {"board_id": sp["board_id"], "title": "Retro action: " + a, "status": "backlog", "labels": "retro", "priority": 2, "channel": "retro"}, {}, False)
+            tk = res["id"]
+        items.append({"t": a, **({"task": tk} if tk else {})})
+    with lock:
+        db.execute("INSERT INTO retros(sprint_id,well,improve,actions,author) VALUES(?,?,?,?,?) ON CONFLICT(sprint_id) DO UPDATE SET well=excluded.well, improve=excluded.improve, actions=excluded.actions, author=excluded.author",
+                   (sid, well, imp, json.dumps(items, separators=(",", ":")), actor))
+        emit(actor, "sprint.updated", sid, sp["board_id"], {"retro": 1})
+    return retro_get(sid)
+
+
+# ---- cadence helpers used by the periodic tick (caller holds `lock`)
+def rollover_tick(actor="system"):
+    """auto_rollover boards: when the active sprint has ended, close it (unfinished work carries over) and start the next one."""
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    for sp in rows("SELECT s.*, b.cfg FROM sprints s JOIN boards b ON b.id=s.board_id WHERE s.state='active' AND s.\"end\"!='' AND s.\"end\"<?", (today,)):
+        try:
+            cfg = json.loads(sp["cfg"] or "{}")
+        except ValueError:
+            continue
+        if not cfg.get("auto_rollover") or not board_has_sprints(sp["board_id"]):
+            continue
+        nxt = rows("SELECT id FROM sprints WHERE board_id=? AND state='planned' ORDER BY id LIMIT 1", (sp["board_id"],))
+        if nxt:
+            nid = nxt[0]["id"]
+        else:
+            n = db.execute("SELECT COUNT(*) FROM sprints WHERE board_id=?", (sp["board_id"],)).fetchone()[0] + 1
+            nid = db.execute("INSERT INTO sprints(board_id,name,goal,state) VALUES(?,?,?,'planned')", (sp["board_id"], "%s %d" % (METHODS[board_cfg(sp["board_id"])[0]]["term"] or "Sprint", n), "")).lastrowid
+            emit(actor, "sprint.created", nid, sp["board_id"], {"auto": 1})
+        sprint_close(actor, sp["id"], move_to=nid)
+        sprint_start(actor, nid)
+
+
+def replenish_tick(actor="system"):
+    """scrumban: when the ready column runs low, tell the supervisors once."""
+    for b in rows("SELECT id, name, method, cfg FROM boards WHERE method='scrumban'"):
+        try:
+            n = json.loads(b["cfg"] or "{}").get("replenish_below")
+        except ValueError:
+            continue
+        if not n:
+            continue
+        ready = db.execute("SELECT COUNT(*) FROM tasks WHERE board_id=? AND status='todo'", (b["id"],)).fetchone()[0]
+        key = "replenish:%d" % b["id"]
+        if ready < n and not get_setting(key):
+            set_setting(key, "1")
+            escalate("replenish", actor, None, b["id"], "'%s' is running low on ready work (%d, wanted at least %d) - replenish the Ready column" % (b["name"], ready, n))
+        elif ready >= n and get_setting(key):
+            set_setting(key, "")
+
+
+# ---------------------------------------------------------------- sprint lifecycle
+def sprint_close(actor, sid, move_to=None):
+    """Close a sprint; unfinished tasks go to `move_to` (sprint id | 'backlog'); default = next planned sprint, else backlog."""
+    s = rows("SELECT * FROM sprints WHERE id=?", (sid,))
+    if not s:
+        raise ApiError("nf", 404)
+    s = s[0]
+    if move_to in (None, ""):
+        nx = rows("SELECT id FROM sprints WHERE board_id=? AND state='planned' AND id!=? ORDER BY id LIMIT 1", (s["board_id"], sid))
+        target = nx[0]["id"] if nx else None
+    elif str(move_to).lower() in ("backlog", "none", "0"):
+        target = None
+    else:
+        target = int(move_to)
+        if not rows("SELECT id FROM sprints WHERE id=? AND board_id=?", (target, s["board_id"])):
+            raise ApiError("bad", 400, "to")
+    ids = [r["id"] for r in rows("SELECT id FROM tasks WHERE sprint_id=? AND status NOT IN ('done','declined')", (sid,))]
+    for i in ids:
+        db.execute("UPDATE tasks SET sprint_id=?, updated=CURRENT_TIMESTAMP WHERE id=?", (target, i))
+        emit(actor, "task.updated", i, s["board_id"], {"s": target})
+    db.execute("UPDATE sprints SET state='closed' WHERE id=?", (sid,))
+    emit(actor, "sprint.updated", sid, s["board_id"], {"st": "closed"})
+    allts = rows("SELECT assignee, status FROM tasks WHERE sprint_id=? OR id IN (%s)" % ",".join("?" * len(ids)) if ids else "SELECT assignee, status FROM tasks WHERE sprint_id=?", ([sid] + ids) if ids else [sid])
+    done_n = sum(1 for t in rows("SELECT status FROM tasks WHERE sprint_id=?", (sid,)) if t["status"] == "done")
+    for a in {t["assignee"] for t in allts if t["assignee"]}:
+        notify(a, "sprint.closed", actor, None, s["board_id"], "'%s' closed: %d done, %d unfinished moved on. Add your notes to the retrospective." % (s["name"], done_n, len(ids)), {"sprint": sid})
+    return {"id": sid, "st": "closed", "mv": len(ids), "to": target}
+
+
+def close_other_active(actor, sid, bid):
+    for p in rows("SELECT id FROM sprints WHERE board_id=? AND state='active' AND id!=?", (bid, sid)):
+        sprint_close(actor, p["id"], move_to=sid)
+
+
+def sprint_start(actor, sid):
+    s = rows("SELECT * FROM sprints WHERE id=?", (sid,))
+    if not s:
+        raise ApiError("nf", 404)
+    s = s[0]
+    close_other_active(actor, sid, s["board_id"])
+    st = s["start"] or time.strftime("%Y-%m-%d")
+    en = s["end"] or time.strftime("%Y-%m-%d", time.gmtime(time.time() + sprint_days_for(s["board_id"]) * 86400))
+    db.execute("UPDATE sprints SET state='active', start=?, \"end\"=?, committed=? WHERE id=?", (st, en, sprint_weight(sid), sid))
+    emit(actor, "sprint.updated", sid, s["board_id"], {"st": "active", "from": st, "to": en})
+    return {"id": sid, "st": "active", "from": st, "to": en}
+
+
+# ---------------------------------------------------------------- sprint statistics + risks
+import datetime as _datetime
+
+SEV = {"high": 3, "med": 2, "low": 1}
+
+
+def _d(v, default=None):
+    try:
+        return _datetime.datetime.strptime(str(v)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return default
+
+
+def sprint_stats(sid):
+    """Progress, pace, projection, burndown and risk list for one sprint (read-only)."""
+    sr = rows("SELECT * FROM sprints WHERE id=?", (sid,))
+    if not sr:
+        raise ApiError("nf", 404)
+    sp = sr[0]
+    ts = rows("SELECT id, title, status, priority, assignee, labels, nudge, created, updated, points, depends FROM tasks WHERE sprint_id=?", (sid,))
+    today = _datetime.datetime.now(_datetime.timezone.utc).replace(tzinfo=None).date()
+    start = _d(sp["start"]) or _d(sp["created"], today)
+    end = _d(sp["end"]) or (start + _datetime.timedelta(days=sprint_days_for(sp["board_id"])))
+    active = sp["state"] == "active"
+    by = {}
+    for t in ts:
+        by[t["status"]] = by.get(t["status"], 0) + 1
+    declined = by.get("declined", 0)
+    use_pts = any(t["points"] for t in ts)
+    wt = (lambda t: t["points"] or 1) if use_pts else (lambda t: 1)
+    scope = sum(wt(t) for t in ts if t["status"] != "declined")
+    done = sum(wt(t) for t in ts if t["status"] == "done")
+    open_ = [t for t in ts if t["status"] not in ("done", "declined")]
+    open_w = sum(wt(t) for t in open_)
+    span = max((end - start).days, 1)
+    elapsed = min(max((today - start).days, 0), span)
+    left = (end - today).days
+    time_pct = round(elapsed / span, 2)
+    done_pct = round(done / scope, 2) if scope else 0.0
+    pace = round(done / elapsed, 2) if elapsed > 0 else 0.0
+    proj = None
+    if scope and not open_:
+        proj = today.isoformat()
+    elif pace > 0:
+        proj = (today + _datetime.timedelta(days=int(round(open_w / pace)))).isoformat()
+    # burndown: remaining open scope per day (actual from done events, ideal linear)
+    ids = {t["id"] for t in ts if t["status"] == "done"}
+    wmap = {t["id"]: wt(t) for t in ts}
+    doned = {t["id"]: _d(t["updated"], today) for t in ts if t["id"] in ids}   # fallback: last update
+    if ids:
+        for r in rows("SELECT ts, payload FROM events WHERE type='task.updated' AND payload LIKE '%\"st\":\"done\"%' ORDER BY id"):
+            try:
+                pj = json.loads(r["payload"])
+            except Exception:
+                continue
+            if pj.get("id") in ids and (pj.get("d") or {}).get("st") == "done":
+                doned[pj["id"]] = _d(r["ts"], today)
+    burn = []
+    for i in range(0, min(span, 90) + 1):
+        day = start + _datetime.timedelta(days=i)
+        ideal = round(scope * (1 - i / span), 1)
+        actual = None
+        if day <= today:
+            actual = scope - sum(wmap[tid] for tid in ids if (doned.get(tid) or today) <= day)
+        burn.append([day.isoformat(), ideal, actual])
+    added = sum(1 for t in ts if _d(t["created"], start) > start)
+    risks = []
+
+    def risk(k, sev, msg, tids=()):
+        risks.append({"k": k, "sev": sev, "m": msg, "ids": sorted(tids)[:20]})
+    prio = lambda t: t["priority"] <= 2
+    if active:
+        if left < 0 and open_:
+            risk("overdue", "high", "Sprint ended %d day(s) ago with %d open task(s)" % (-left, len(open_)), [t["id"] for t in open_])
+        elif scope == 0:
+            risk("empty", "med", "Active sprint has no tasks")
+        elif elapsed >= 1 and time_pct - done_pct >= 0.25:
+            gap = time_pct - done_pct
+            risk("behind", "high" if gap >= 0.4 else "med",
+                 "%d%% of the time used but only %d%% done%s" % (round(time_pct * 100), round(done_pct * 100),
+                                                               "; projected finish %s (ends %s)" % (proj, end.isoformat()) if proj else "; no tasks finished yet"),
+                 [t["id"] for t in open_])
+        late = [t["id"] for t in open_ if prio(t) and t["status"] in ("backlog", "todo")]
+        if late and time_pct >= 0.5:
+            risk("late-start", "high", "%d high-priority task(s) not started with %d%% of the sprint gone" % (len(late), round(time_pct * 100)), late)
+    blk = [t for t in open_ if t["status"] == "blocked"]
+    if blk:
+        risk("blocked", "high" if any(prio(t) for t in blk) else "med", "%d blocked task(s)" % len(blk), [t["id"] for t in blk])
+    owner = [t["id"] for t in open_ if is_owner_assignee(t["assignee"])]
+    if owner:
+        risk("human-wait", "med", "%d task(s) waiting on a human" % len(owner), owner)
+    stale = [t["id"] for t in open_ if t["nudge"] or "nudge" in _lbl_set(t["labels"])]
+    if stale:
+        risk("stale", "med", "%d task(s) with no update for %gh" % (len(stale), NUDGE_HOURS), stale)
+    unas = [t["id"] for t in open_ if not t["assignee"]]
+    if unas and (active or sp["state"] == "planned"):
+        risk("unassigned", "med" if time_pct >= 0.3 and active else "low", "%d open task(s) without an assignee" % len(unas), unas)
+    load = {}
+    for t in open_:
+        if t["assignee"]:
+            load.setdefault(t["assignee"], []).append(t["id"])
+    for a, l in load.items():
+        if len(l) >= 6:
+            risk("overload", "med", "%s has %d open tasks" % (a, len(l)), l)
+    caps = {r["name"].lower(): r["capacity"] for r in rows("SELECT name, capacity FROM agents WHERE capacity>0")}
+    for a in load:
+        mine = sum(wt(t) for t in open_ if t["assignee"] == a)
+        if caps.get(a.lower()) and mine > caps[a.lower()]:
+            risk("capacity", "med", "%s has %d %s open vs capacity %d" % (a, mine, "points" if use_pts else "tasks", caps[a.lower()]), load[a])
+    sil = silent_agents()
+    sl = [t["id"] for t in open_ if t["status"] == "in_progress" and (t["assignee"] or "").lower() in sil]
+    if sl:
+        risk("silent-agent", "med", "%d task(s) in progress belong to agents who have gone quiet" % len(sl), sl)
+    depw = [t["id"] for t in open_ if t["status"] in ("in_progress", "review") and open_dep_ids(t["depends"])]
+    if depw:
+        risk("dep-start", "med", "%d task(s) in flight while their dependencies are still open" % len(depw), depw)
+    rv = [t["id"] for t in open_ if t["status"] == "review"]
+    if len(rv) >= 3:
+        risk("review-queue", "low", "%d task(s) waiting in review" % len(rv), rv)
+    if scope and added >= 3 and added / scope >= 0.3:
+        risk("scope-creep", "low", "%d task(s) added after the sprint started (%d%% of scope)" % (added, round(100 * added / scope)))
+    risks.sort(key=lambda r: -SEV[r["sev"]])
+    health = "red" if any(r["sev"] == "high" for r in risks) else "amber" if any(r["sev"] == "med" for r in risks) else "green"
+    return {"id": sid, "b": sp["board_id"], "n": sp["name"], "g": sp["goal"], "st": sp["state"], "from": start.isoformat(), "to": end.isoformat(),
+            "days": {"total": span, "elapsed": elapsed, "left": left},
+            "w": {"scope": scope, "done": done, "open": len(open_), "open_w": open_w, "pts": use_pts, "declined": declined, "by": by},
+            "pct": {"time": time_pct, "done": done_pct}, "pace": pace, "proj": proj, "added": added,
+            "load": {a: len(l) for a, l in sorted(load.items())}, "health": health, "risks": risks, "burn": burn}
+
+
+def _in(col, bid):
+    """SQL fragment for a board scope: None/0 = all boards, int = one board, list = those boards."""
+    if bid is None or bid == 0:
+        return "", []
+    ids = [bid] if isinstance(bid, int) else [int(x) for x in bid]
+    if not ids:
+        return " AND 1=0", []
+    return " AND %s IN (%s)" % (col, ",".join("?" * len(ids))), ids
+
+
+def scope_ids(q):
+    """Cross-board scope from the query: bs=1,2,3 (board ids) and/or tm=<team label>. None = no scope given (all boards)."""
+    ids = None
+    if _qv(q, "bs"):
+        ids = [int(x) for x in re.findall(r"\d+", _qv(q, "bs"))]
+    if _qv(q, "tm", "team"):
+        tids = [r["id"] for r in rows("SELECT id FROM boards WHERE team=? COLLATE NOCASE", (_qv(q, "tm", "team"),))]
+        ids = tids if ids is None else [i for i in ids if i in tids]
+    return ids
+
+
+def scope_of(q):
+    b = qint(q, "b") or qint(q, "board_id")
+    return [b] if b else scope_ids(q)
+
+
+def active_risks(bid=None):
+    out = []
+    fr, fp = _in("board_id", bid)
+    for sp in rows("SELECT id FROM sprints WHERE state='active'" + fr, fp):
+        st = sprint_stats(sp["id"])
+        out.append({k: st[k] for k in ("id", "b", "n", "to", "health", "pct", "proj", "risks")})
+    return out
+
+
+def risk_alerts(actor="system"):
+    """Notify everyone with open work in an active sprint when its risk picture changes (once per change)."""
+    for sp in rows("SELECT id FROM sprints WHERE state='active'"):
+        st = sprint_stats(sp["id"])
+        sig = st["health"] + ":" + ",".join("%s%s" % (r["k"], len(r["ids"])) for r in st["risks"])
+        old = db.execute("SELECT sig FROM risk_state WHERE sprint_id=?", (sp["id"],)).fetchone()
+        if old and old["sig"] == sig:
+            continue
+        db.execute("INSERT OR REPLACE INTO risk_state(sprint_id, sig) VALUES(?,?)", (sp["id"], sig))
+        if st["health"] == "green" and not old:
+            continue
+        who = {r["assignee"] for r in rows("SELECT assignee FROM tasks WHERE sprint_id=? AND status NOT IN ('done','declined') AND assignee!=''", (sp["id"],))}
+        if st["health"] == "green":
+            msg = "Sprint '%s' is back on track (%d%% done, %d%% of time used)" % (st["n"], round(st["pct"]["done"] * 100), round(st["pct"]["time"] * 100))
+        else:
+            msg = "Sprint '%s' is %s: %s" % (st["n"], "AT RISK" if st["health"] == "red" else "watch", "; ".join(r["m"] for r in st["risks"][:3]))
+        for a in who:
+            notify(a, "sprint.risk", actor, None, st["b"], msg, {"health": st["health"], "sprint": sp["id"]})
+        if st["health"] == "red":
+            escalate("sprint-red", actor, None, st["b"], msg, {"sprint": sp["id"]}, skip=who)
+            post_async(get_setting("alert_url"), msg)
+
+
+# ---------------------------------------------------------------- tokens, settings, backups, digests, export/import
+def lookup_token(t):
+    """-> (name, role) or None. Env tokens first, then DB tokens (stored as sha256)."""
+    if t in TOKENS:
+        return TOKENS[t]
+    if not t:
+        return None
+    r = db.execute("SELECT id, name, role FROM tokens WHERE hash=?", (hashlib.sha256(t.encode()).hexdigest(),)).fetchone()
+    if r:
+        db.execute("UPDATE tokens SET used=CURRENT_TIMESTAMP WHERE id=?", (r["id"],))
+        return (r["name"], r["role"])
+    return None
+
+
+def auth_open():
+    return not TOKENS and not db.execute("SELECT 1 FROM tokens LIMIT 1").fetchone()
+
+
+def token_create(body):
+    name = " ".join(str(body.get("n") or body.get("name") or "").split())[:60]
+    role = body.get("role") or "agent"
+    if not name:
+        raise ApiError("missing", 400, "n")
+    if role not in ROLES:
+        raise ApiError("bad", 400, "role")
+    tk = secrets.token_urlsafe(24)
+    with lock:
+        db.execute("INSERT INTO tokens(name,hash,role) VALUES(?,?,?)", (name, hashlib.sha256(tk.encode()).hexdigest(), role))
+    return {"n": name, "role": role, "token": tk, "note": "shown once - store it now"}
+
+
+def tokens_list():
+    items = [{"n": n, "role": r, "env": 1} for n, r in TOKENS.values()]
+    items += [{"id": r["id"], "n": r["name"], "role": r["role"], "u": r["used"] or None, "c": r["created"]} for r in rows("SELECT * FROM tokens ORDER BY id")]
+    return {"n": len(items), "i": [{k: v for k, v in o.items() if v is not None} for o in items]}
+
+
+def token_delete(tid):
+    with lock:
+        db.execute("DELETE FROM tokens WHERE id=?", (tid,))
+    return {"id": tid, "x": 1}
+
+
+SETTING_KEYS = ("digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors")
+
+
+def get_setting(k, default=""):
+    r = db.execute("SELECT v FROM settings WHERE k=?", (k,)).fetchone()
+    return r["v"] if r and r["v"] != "" else default
+
+
+def set_setting(k, v):
+    db.execute("INSERT OR REPLACE INTO settings(k,v) VALUES(?,?)", (k, str(v)))
+
+
+def settings_get():
+    return {**{k: get_setting(k) for k in SETTING_KEYS}, "digest_last": get_setting("digest_last"), "backup_last": get_setting("backup_last")}
+
+
+def settings_set(body):
+    with lock:
+        for k in SETTING_KEYS:
+            if k in body:
+                v = str(body[k] or "").strip()
+                if k.endswith("_url") and v:
+                    try:
+                        check_public_url(v)
+                    except ApiError as e:
+                        raise ApiError(e.code, 400, k)
+                if k in ("digest_hour", "backup_keep") and v:
+                    try:
+                        assert 0 <= int(v) <= (23 if k == "digest_hour" else 365)
+                    except Exception:
+                        raise ApiError("bad", 400, k)
+                set_setting(k, v)
+    return settings_get()
+
+
+def post_async(url, text):
+    """Slack/Teams/Discord-style incoming webhook: POST {"text": ...}. Fire and forget."""
+    if not url:
+        return
+
+    def run():
+        try:
+            data = json.dumps({"text": text, "content": text}).encode()
+            check_public_url(url)
+            _opener.open(urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST"), timeout=8).read()
+        except Exception:
+            pass
+    threading.Thread(target=run, daemon=True).start()
+
+
+def digest_text():
+    lines = ["Valnivo Taskboard daily digest - " + time.strftime("%Y-%m-%d", time.gmtime())]
+    for r in active_risks():
+        st = sprint_stats(r["id"])
+        w = st["w"]
+        lines.append("%s %s: %d/%d done, %d day(s) left, %d open" % ({"green": "OK", "amber": "WATCH", "red": "RISK"}[st["health"]], st["n"], w["done"], w["scope"], st["days"]["left"], w["open"]))
+        for k in st["risks"][:3]:
+            lines.append("   - [%s] %s" % (k["sev"], k["m"]))
+    bl = rows("SELECT COUNT(*) n FROM tasks WHERE status='blocked'")[0]["n"]
+    nu = rows("SELECT COUNT(*) n FROM tasks WHERE nudge!='' AND status NOT IN ('done','declined')")[0]["n"]
+    lines.append("Blocked: %d, stale: %d" % (bl, nu))
+    return "\n".join(lines)
+
+
+def maybe_digest(force=False):
+    url = get_setting("digest_url")
+    if not url:
+        return {"sent": False, "why": "no digest_url"}
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    hour = int(get_setting("digest_hour", "7"))
+    if not force and (get_setting("digest_last") == today or time.gmtime().tm_hour < hour):
+        return {"sent": False}
+    post_async(url, digest_text())
+    with lock:
+        set_setting("digest_last", today)
+    return {"sent": True}
+
+
+def do_backup():
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    name = "taskboard-%s.db" % time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    path = os.path.join(BACKUP_DIR, name)
+    dst = sqlite3.connect(path)
+    with lock:
+        db.backup(dst)
+    dst.close()
+    chk = sqlite3.connect(path)
+    try:
+        ok = chk.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        counts = {t: chk.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0] for t in ("boards", "sprints", "tasks", "docs", "specs", "comments")}
+    finally:
+        chk.close()
+    src = {t: db.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0] for t in counts}
+    res = {"file": name, "size": os.path.getsize(path), "ok": bool(ok and all(counts[t] <= src[t] for t in counts)), "counts": counts,
+           "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())}
+    keep = int(get_setting("backup_keep", "14"))
+    olds = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith("taskboard-") and f.endswith(".db"))
+    for f in (olds[:-keep] if keep else []):
+        os.remove(os.path.join(BACKUP_DIR, f))
+    with lock:
+        set_setting("backup_last", json.dumps(res, separators=(",", ":")))
+    return res
+
+
+def backups_list():
+    fs = sorted((f for f in os.listdir(BACKUP_DIR) if f.endswith(".db")), reverse=True) if os.path.isdir(BACKUP_DIR) else []
+    last = get_setting("backup_last")
+    return {"n": len(fs), "dir": BACKUP_DIR, "i": [{"file": f, "size": os.path.getsize(os.path.join(BACKUP_DIR, f))} for f in fs],
+            "last": json.loads(last) if last else None}
+
+
+def maybe_backup():
+    last = get_setting("backup_last")
+    try:
+        age = time.time() - calendar.timegm(time.strptime(json.loads(last)["ts"], "%Y-%m-%d %H:%M:%S")) if last else 1e9
+    except Exception:
+        age = 1e9
+    if age >= 86400:
+        return do_backup()
+
+
+EXPORT_TABLES = ("boards", "sprints", "tasks", "docs", "specs", "comments")
+
+
+def export_data(bid=None):
+    """Full JSON snapshot (raw column names) of one board or everything."""
+    out = {"v": 1, "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())}
+    ba = (bid,) if bid else ()
+    out["boards"] = rows("SELECT * FROM boards" + (" WHERE id=?" if bid else ""), ba)
+    out["sprints"] = rows("SELECT * FROM sprints" + (" WHERE board_id=?" if bid else ""), ba)
+    out["tasks"] = rows("SELECT * FROM tasks" + (" WHERE board_id=?" if bid else ""), ba)
+    tids = {t["id"] for t in out["tasks"]}
+    out["docs"] = rows("SELECT * FROM docs" + (" WHERE board_id=?" if bid else ""), ba)
+    out["specs"] = rows("SELECT * FROM specs" + (" WHERE board_id=? OR board_id IS NULL" if bid else ""), ba)
+    out["comments"] = [c for c in rows("SELECT * FROM comments") if not bid or c["task_id"] in tids]
+    return out
+
+
+def import_data(actor, data):
+    """Create COPIES of the exported boards/sprints/tasks/docs/specs/comments with remapped ids (never overwrites)."""
+    if not isinstance(data, dict) or data.get("v") != 1:
+        raise ApiError("bad", 400, "v")
+    bmap, smap, tmap = {}, {}, {}
+    n = {t: 0 for t in EXPORT_TABLES}
+
+    def ins(table, r, cols):
+        cur = db.execute("INSERT INTO %s(%s) VALUES(%s)" % (table, ",".join(cols), ",".join("?" * len(cols))), [r.get(c) for c in cols])
+        n[table] += 1
+        return cur.lastrowid
+    with lock:
+        db.execute("BEGIN")
+        try:
+            for b in data.get("boards", []):
+                bmap[b["id"]] = ins("boards", b, ["name", "description", "team", "dod", "method", "cfg"])
+            for sp in data.get("sprints", []):
+                if sp["board_id"] in bmap:
+                    smap[sp["id"]] = ins("sprints", {**sp, "board_id": bmap[sp["board_id"]]}, ["board_id", "name", "goal", "start", "end", "state"])
+            tcols = [c for c in FIELDS["tasks"] if c not in ("board_id", "sprint_id")]
+            for t in data.get("tasks", []):
+                if t["board_id"] in bmap:
+                    r = {**t, "board_id": bmap[t["board_id"]], "sprint_id": smap.get(t.get("sprint_id")), "blocked_by": "", "depends": "", "parent": None}
+                    tmap[t["id"]] = ins("tasks", r, ["board_id", "sprint_id"] + tcols)
+            for t in data.get("tasks", []):          # second pass: remap links between tasks
+                if t["id"] in tmap:
+                    for col in ("blocked_by", "depends"):
+                        if t.get(col):
+                            ids = ",".join(str(tmap[int(i)]) for i in re.findall(r"\d+", t[col]) if int(i) in tmap)
+                            db.execute("UPDATE tasks SET %s=? WHERE id=?" % col, (ids, tmap[t["id"]]))
+                    if t.get("parent") in tmap:
+                        db.execute("UPDATE tasks SET parent=? WHERE id=?", (tmap[t["parent"]], tmap[t["id"]]))
+            for d in data.get("docs", []):
+                sc, ref = d["scope"], d["ref_id"]
+                new = {"board": bmap, "sprint": smap, "task": tmap}.get(sc, {}).get(ref)
+                if new:
+                    bid = db.execute("SELECT %s FROM %s WHERE id=?" % ("id" if sc == "board" else "board_id", DOC_SCOPES[sc]), (new,)).fetchone()[0]
+                    ins("docs", {**d, "ref_id": new, "board_id": bid}, ["scope", "ref_id", "title", "body", "url", "board_id"])
+            for sp in data.get("specs", []):
+                nb = bmap.get(sp.get("board_id")) if sp.get("board_id") else None
+                if sp.get("board_id") is None or nb:
+                    sid = ins("specs", {**sp, "board_id": nb, "author": sp.get("author") or actor, "updated_by": actor}, ["board_id", "title", "body", "tags", "status", "author", "updated_by", "rev", "tasks"])
+                    db.execute("INSERT INTO spec_revs(spec_id,rev,title,body,actor,note) VALUES(?,?,?,?,?,?)", (sid, sp.get("rev") or 1, sp["title"], sp.get("body", ""), actor, "imported"))
+            for c in data.get("comments", []):
+                if c["task_id"] in tmap:
+                    ins("comments", {**c, "task_id": tmap[c["task_id"]]}, ["task_id", "actor", "body"])
+            db.execute("COMMIT")
+        except Exception:
+            db.execute("ROLLBACK")
+            raise ApiError("bad", 400, "data")
+    return {"ok": 1, "n": n, "boards": bmap}
+
+
+CSV_COLS = ["id", "board_id", "sprint_id", "title", "description", "status", "priority", "assignee", "kind", "channel", "labels", "points", "depends", "created", "updated"]
+
+
+def export_csv(bid=None):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(CSV_COLS)
+    for t in rows("SELECT * FROM tasks" + (" WHERE board_id=?" if bid else "") + " ORDER BY id", (bid,) if bid else ()):
+        w.writerow([t.get(c, "") for c in CSV_COLS])
+    return buf.getvalue()
+
+
+def import_csv(actor, bid, text):
+    """CSV with header (title required; description,status,priority,assignee,kind,channel,labels,points,sprint_id). No notifications."""
+    if not rows("SELECT id FROM boards WHERE id=?", (bid,)):
+        raise ApiError("nf", 404, "b")
+    made, bad = 0, []
+    with lock:
+        for i, r in enumerate(csv.DictReader(io.StringIO(text)), 2):
+            r = {k.strip().lower(): (v or "").strip() for k, v in r.items() if k}
+            body = {k: v for k, v in r.items() if v and k in ("title", "description", "status", "priority", "assignee", "kind", "channel", "labels", "points", "sprint_id")}
+            body["board_id"] = bid
+            body.setdefault("channel", "Import")
+            try:
+                d = validate("tasks", body, False)
+                db.execute("INSERT INTO tasks(%s) VALUES(%s)" % (",".join(d), ",".join("?" * len(d))), list(d.values()))
+                made += 1
+            except ApiError as e:
+                bad.append({"row": i, "e": e.code, "f": e.field})
+        emit(actor, "board.updated", bid, bid, {"import": made})
+    return {"ok": 1, "made": made, "bad": bad[:50]}
+
+
+# ---------------------------------------------------------------- dashboard
+def dashboard(q):
+    bid = qint(q, "b") or qint(q, "board_id")
+    scope = [bid] if bid else scope_ids(q)
+    try:
+        nudge_tick(bid)
+    except Exception:
+        pass
+    fr, fp = _in("id", scope)
+    bs = rows("SELECT * FROM boards WHERE 1=1" + fr + " ORDER BY id", fp)
+    boards = []
+    for b in bs:
+        by = {r["status"]: r["n"] for r in rows("SELECT status, COUNT(*) n FROM tasks WHERE board_id=? GROUP BY status", (b["id"],))}
+        o = {"id": b["id"], "n": b["name"], "by": by, "mt": b["method"] or "scrum"}
+        if b["team"]:
+            o["tm"] = b["team"]
+        if METHODS.get(o["mt"], {}).get("wip"):
+            fl = board_flow(b["id"], 14)
+            o["fl"] = {"wip": fl["wip"], "over": fl["over"], "done14": fl["done_n"], "cycle_h": fl["cycle_h"]["avg"], "stuck": fl["stuck"]}
+        sp = rows("SELECT * FROM sprints WHERE board_id=? AND state='active' ORDER BY id DESC LIMIT 1", (b["id"],))
+        if sp:
+            o["sp"] = sprint_row(sp[0], False)
+            stt = sprint_stats(sp[0]["id"])
+            o["sp"].update({"hl": stt["health"], "tp": stt["pct"]["time"], "rk": len(stt["risks"]), "proj": stt["proj"]})
+        bl = [r["id"] for r in rows("SELECT id FROM tasks WHERE board_id=? AND status='blocked'", (b["id"],))]
+        nu = [r["id"] for r in rows("SELECT id FROM tasks WHERE board_id=? AND nudge!='' AND status NOT IN ('done','declined')", (b["id"],))]
+        if bl:
+            o["bl"] = bl
+        if nu:
+            o["nu"] = nu
+        boards.append(o)
+    wh, ar = _in("board_id", scope)
+    load = {}
+    for r in rows("SELECT assignee, status, COUNT(*) n FROM tasks WHERE assignee!='' AND status NOT IN ('done','declined')" + wh + " GROUP BY assignee COLLATE NOCASE, status", ar):
+        load.setdefault(r["assignee"], {})[r["status"]] = r["n"]
+    unread = {r["agent"].lower(): r["n"] for r in rows("SELECT agent, COUNT(*) n FROM notifications WHERE read=0 GROUP BY agent COLLATE NOCASE")}
+    tot = {"boards": len(boards), "open": 0, "in_progress": 0, "review": 0, "blocked": 0, "done": 0, "red_sprints": 0}
+    for o in boards:
+        for k in ("in_progress", "review", "blocked", "done"):
+            tot[k] += o["by"].get(k, 0)
+        tot["open"] += sum(v for k, v in o["by"].items() if k not in ("done", "declined"))
+        tot["red_sprints"] += 1 if (o.get("sp") or {}).get("hl") == "red" else 0
+    out = {"totals": tot, "scope": {"tm": _qv(q, "tm", "team"), "bs": scope}, "attention": attention(scope)[:8], "risks": [r for r in active_risks(scope) if r["risks"]], "boards": boards, "agents": [{"as": a, "by": v, "inbox": unread.get(a.lower(), 0)} for a, v in sorted(load.items())]}
+    me = _qv(q, "as", "agent")
+    if me:
+        work = rows("SELECT * FROM tasks WHERE assignee=? COLLATE NOCASE AND status NOT IN ('done','declined')" + wh +
+                    " ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'review' THEN 1 WHEN 'todo' THEN 2 WHEN 'blocked' THEN 3 ELSE 4 END, priority, id LIMIT 30", [me] + ar)
+        out["me"] = {"as": me, "inbox": unread.get(me.lower(), 0), "work": [cdict("tasks", t, False, ("description",)) for t in work]}
+    return out
+
+
+
+SEC_HEADERS = (
+    ("X-Content-Type-Options", "nosniff"), ("X-Frame-Options", "DENY"), ("Referrer-Policy", "no-referrer"),
+    ("Cross-Origin-Opener-Policy", "same-origin"), ("Permissions-Policy", "camera=(), microphone=(), geolocation=()"),
+    ("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; "
+                                "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"),
+)
+_rl = collections.defaultdict(collections.deque)
+_rl_lock = threading.Lock()
+
+
+def rate_hit(key, limit, window=60, count=True):
+    """Sliding-window limiter. Returns True when the caller is over `limit`. `count=False` only checks."""
+    if not limit:
+        return False
+    now = time.time()
+    with _rl_lock:
+        q = _rl[key]
+        while q and q[0] < now - window:
+            q.popleft()
+        over = len(q) >= limit
+        if count and not over:
+            q.append(now)
+        if len(_rl) > 5000:
+            for k in [k for k, v in _rl.items() if not v or v[-1] < now - window]:
+                _rl.pop(k, None)
+        return over
+
+
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "ValnivoTaskboard/0.3"
+
+    def log_message(self, *a):
+        pass
+
+    def send_json(self, code, obj, etag=None):
+        b = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.send_header("Cache-Control", "no-cache")
+        if etag:
+            self.send_header("ETag", etag)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(b)
+
+    def err(self, code, status, field=None):
+        self.send_json(status, {"e": code, **({"f": field} if field else {})})
+
+    def actor(self, query):
+        self.role = "admin"
+        if auth_open():
+            return "anon"
+        t = ""
+        a = self.headers.get("Authorization", "")
+        if a.lower().startswith("bearer "):
+            t = a[7:].strip()
+        if not t and self.path.split("?")[0] == "/api/events":    # EventSource cannot set headers; no other endpoint takes a URL token
+            t = query.get("token", [""])[0]
+        r = lookup_token(t)
+        if not r:
+            return None
+        self.role = r[1]
+        touch_presence(r[0])
+        return r[0]
+
+    def send_raw(self, code, body, ctype, filename=None):
+        b = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b)))
+        self.send_header("Cache-Control", "no-cache")
+        if filename:
+            self.send_header("Content-Disposition", 'attachment; filename="%s"' % filename)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(b)
+
+    def end_headers(self):
+        for k, v in SEC_HEADERS:
+            self.send_header(k, v)
+        if TRUST_PROXY and self.headers.get("X-Forwarded-Proto") == "https":
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
+        super().end_headers()
+
+    def client_ip(self):
+        if TRUST_PROXY:
+            xf = self.headers.get("X-Forwarded-For", "")
+            if xf:
+                return xf.split(",")[0].strip()
+        return self.client_address[0]
+
+    def read_body(self, limit=None):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > (limit or MAX_BODY):
+            raise ApiError("too_big", 413)
+        if not n:
+            return {}
+        try:
+            body = json.loads(self.rfile.read(n))
+        except Exception:
+            raise ApiError("json", 400)
+        if not isinstance(body, dict):
+            raise ApiError("json", 400)
+        return body
+
+    def handle_any(self, method):
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        path = u.path
+        if path == "/api/health":
+            return self.send_json(200, {"ok": True})
+        if not path.startswith("/api/"):
+            if method != "GET":
+                return self.err("method", 405)
+            return self.static(path)
+        if rate_hit("authfail:" + self.client_ip(), AUTH_FAILS_PER_MIN, count=False):
+            return self.err("rate", 429)
+        actor = self.actor(q)
+        if actor is None:
+            rate_hit("authfail:" + self.client_ip(), AUTH_FAILS_PER_MIN)
+            return self.err("auth", 401)
+        if rate_hit("tok:" + str(actor), RATE_PER_MIN):
+            return self.err("rate", 429)
+        try:
+            cl = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            cl = 0
+        if cl > (MAX_IMPORT if path.startswith("/api/import") else MAX_BODY):
+            self.close_connection = True
+            return self.err("too_big", 413)
+        _ctx.role = self.role
+        full = (q.get("full", ["0"])[0] not in ("0", "")) or self.headers.get("X-TB-Full") == "1"
+        try:
+            if path in ("/api/nudge", "/api/tasks/nudge/run") and method == "POST":
+                bid = qint(q, "b") or qint(q, "board_id")
+                res = nudge_tick(bid, actor=actor or "agent")
+                return self.send_json(200, {"ok": True, **res, "h": NUDGE_HOURS})
+            if self.role == "viewer" and method != "GET":
+                return self.err("forbidden", 403)
+            if self.role != "admin" and (path.startswith(("/api/admin", "/api/tokens", "/api/settings", "/api/import")) or
+                                         (method == "DELETE" and (re.match(r"/api/boards/", path) or (re.match(r"/api/sprints/", path) and self.role != "supervisor")))):
+                return self.err("forbidden", 403)
+            if path == "/api/tokens":
+                if method == "GET":
+                    return self.send_json(200, tokens_list())
+                if method == "POST":
+                    return self.send_json(201, token_create(self.read_body()))
+                if method == "DELETE":
+                    return self.send_json(200, token_delete(qint(q, "id", 0)))
+            if path == "/api/settings":
+                return self.send_json(200, settings_set(self.read_body()) if method == "POST" else settings_get())
+            if path == "/api/admin/backup" and method == "POST":
+                return self.send_json(200, do_backup())
+            if path == "/api/admin/backups" and method == "GET":
+                return self.send_json(200, backups_list())
+            if path == "/api/admin/digest" and method == "POST":
+                return self.send_json(200, maybe_digest(force=True))
+            if path == "/api/export" and method == "GET":
+                return self.send_raw(200, json.dumps(export_data(qint(q, "b") or qint(q, "board_id")), separators=(",", ":"), default=str), "application/json", "taskboard-export.json")
+            if path == "/api/export.csv" and method == "GET":
+                return self.send_raw(200, export_csv(qint(q, "b") or qint(q, "board_id")), "text/csv; charset=utf-8", "taskboard-tasks.csv")
+            if path == "/api/import" and method == "POST":
+                return self.send_json(200, import_data(actor, self.read_body(MAX_IMPORT)))
+            if path == "/api/import/csv" and method == "POST":
+                n = int(self.headers.get("Content-Length") or 0)
+                if n > MAX_IMPORT:
+                    raise ApiError("too_big", 413)
+                return self.send_json(200, import_csv(actor, qint(q, "b") or qint(q, "board_id") or 0, self.rfile.read(n).decode("utf-8", "replace")))
+            if path in ("/api/dashboard", "/api/portfolio") and method == "GET":
+                return self.send_json(200, dashboard(q))
+            if path == "/api/inbox" and method == "GET":
+                return self.send_json(200, inbox_get(q, actor))
+            if path == "/api/inbox/ack" and method == "POST":
+                return self.send_json(200, inbox_ack(self.read_body()))
+            if path == "/api/agents":
+                if method == "GET":
+                    return self.send_json(200, agents_list())
+                if method == "POST":
+                    return self.send_json(200, agent_set(self.read_body()))
+                if method == "DELETE":
+                    return self.send_json(200, agent_del(_qv(q, "n", "name", default="")))
+            ms = re.fullmatch(r"/api/sprints/(\d+)/(start|close)", path)
+            if ms and method == "POST":
+                body = self.read_body()
+                with lock:
+                    res = sprint_start(actor, int(ms.group(1))) if ms.group(2) == "start" else sprint_close(actor, int(ms.group(1)), body.get("to"))
+                return self.send_json(200, res)
+            if path == "/api/specs":
+                if method == "GET":
+                    return self.send_json(200, specs_list(q))
+                if method == "POST":
+                    return self.send_json(201, spec_create(actor, self.read_body()))
+            msp = re.fullmatch(r"/api/specs/(\d+)(?:/(revs)(?:/(\d+))?)?", path)
+            if msp:
+                sid = int(msp.group(1))
+                if msp.group(2) and method == "GET":
+                    return self.send_json(200, spec_get(sid, int(msp.group(3))) if msp.group(3) else spec_revs(sid))
+                if not msp.group(2):
+                    if method == "GET":
+                        return self.send_json(200, spec_get(sid))
+                    if method in ("PATCH", "PUT"):
+                        return self.send_json(200, spec_update(actor, sid, self.read_body()))
+                    if method == "DELETE":
+                        return self.send_json(200, spec_delete(actor, sid))
+            if path == "/api/templates":
+                if method == "GET":
+                    bb = qint(q, "b") or qint(q, "board_id")
+                    rs = rows("SELECT * FROM templates" + (" WHERE board_id=? OR board_id IS NULL" if bb else "") + " ORDER BY id", (bb,) if bb else ())
+                    return self.send_json(200, {"n": len(rs), "help": RECUR_HELP, "i": [tpl_out(r) for r in rs]})
+                if method == "POST":
+                    return self.send_json(201, tpl_save(self.read_body()))
+            if path == "/api/templates/run" and method == "POST":
+                return self.send_json(200, recur_tick(actor="recurring"))
+            mtp = re.fullmatch(r"/api/templates/(\d+)(?:/(use))?", path)
+            if mtp:
+                tid = int(mtp.group(1))
+                if mtp.group(2) and method == "POST":
+                    return self.send_json(201, tpl_use(actor, tid, self.read_body()))
+                if not mtp.group(2):
+                    if method in ("PATCH", "PUT"):
+                        return self.send_json(200, tpl_save(self.read_body(), tid))
+                    if method == "DELETE":
+                        with lock:
+                            db.execute("DELETE FROM templates WHERE id=?", (tid,))
+                        return self.send_json(200, {"id": tid, "x": 1})
+                    if method == "GET":
+                        r = rows("SELECT * FROM templates WHERE id=?", (tid,))
+                        if not r:
+                            raise ApiError("nf", 404)
+                        return self.send_json(200, tpl_out(r[0]))
+            if path == "/api/stats/agents" and method == "GET":
+                return self.send_json(200, agent_stats(scope_of(q), max(1, min(qint(q, "days", 30), 365))))
+            mcl = re.fullmatch(r"/api/tasks/(\d+)/(claim|release|review|attachments)", path)
+            if mcl:
+                tid, act = int(mcl.group(1)), mcl.group(2)
+                if act == "attachments" and method == "GET":
+                    return self.send_json(200, atts_get(tid))
+                if method == "POST":
+                    body = self.read_body()
+                    if act == "claim":
+                        return self.send_json(200, claim_task(actor, tid, body))
+                    if act == "release":
+                        return self.send_json(200, release_task(actor, self.role, tid, body))
+                    if act == "review":
+                        return self.send_json(201, review_request(actor, tid, body))
+                    return self.send_json(201, att_add(actor, tid, body))
+            if path == "/api/claim-next" and method == "POST":
+                return self.send_json(200, claim_next(actor, self.read_body()))
+            if path == "/api/locks":
+                if method == "GET":
+                    return self.send_json(200, locks_list())
+                if method == "POST":
+                    return self.send_json(200, lock_acquire(actor, self.read_body()))
+                if method == "DELETE":
+                    return self.send_json(200, lock_release(actor, self.role, _qv(q, "name", default=""), {"as": _qv(q, "as")} if _qv(q, "as") else {}))
+            if path == "/api/asks":
+                if method == "GET":
+                    return self.send_json(200, asks_list(q, actor))
+                if method == "POST":
+                    return self.send_json(201, ask_create(actor, self.read_body()))
+            mas = re.fullmatch(r"/api/asks/(\d+)/(answer|cancel)", path)
+            if mas and method == "POST":
+                fn = ask_answer if mas.group(2) == "answer" else ask_cancel
+                return self.send_json(200, fn(actor, self.role, int(mas.group(1)), self.read_body()))
+            if path == "/api/reviews" and method == "GET":
+                return self.send_json(200, reviews_list(q))
+            mrv = re.fullmatch(r"/api/reviews/(\d+)/decide", path)
+            if mrv and method == "POST":
+                return self.send_json(200, review_decide(actor, self.role, int(mrv.group(1)), self.read_body()))
+            if path == "/api/presence" and method == "POST":
+                return self.send_json(200, presence_set(actor, self.read_body()))
+            if path == "/api/route" and method == "GET":
+                return self.send_json(200, {"i": route_candidates(_qv(q, "skill", default=""), _qv(q, "lb", default=""), qint(q, "b"))})
+            if path == "/api/envs":
+                if method == "GET":
+                    return self.send_json(200, envs_list())
+                if method == "POST":
+                    return self.send_json(200, env_deploy(actor, self.role, self.read_body()))
+            mev = re.fullmatch(r"/api/envs/([A-Za-z0-9._-]+)/(freeze|unfreeze)", path)
+            if mev and method == "POST":
+                if self.role not in ("admin", "supervisor"):
+                    return self.err("forbidden", 403)
+                return self.send_json(200, env_freeze(actor, mev.group(1), self.read_body(), mev.group(2) == "freeze"))
+            if path == "/api/watch":
+                if method == "GET":
+                    return self.send_json(200, watch_list(q, actor))
+                if method == "POST":
+                    return self.send_json(200, watch_add(actor, self.read_body()))
+                if method == "DELETE":
+                    return self.send_json(200, watch_del(actor, q))
+            mat = re.fullmatch(r"/api/attachments/(\d+)", path)
+            if mat and method == "DELETE":
+                return self.send_json(200, att_del(int(mat.group(1))))
+            if path == "/api/methods" and method == "GET":
+                return self.send_json(200, {"i": [{"id": k, **v} for k, v in METHODS.items()], "types": list(TASK_TYPES)})
+            mbf = re.fullmatch(r"/api/boards/(\d+)/(flow|velocity)", path)
+            if mbf and method == "GET":
+                return self.send_json(200, board_flow(int(mbf.group(1)), max(7, min(qint(q, "days", 30), 180))) if mbf.group(2) == "flow" else board_velocity(int(mbf.group(1)), max(1, min(qint(q, "n", 8), 30))))
+            mrt = re.fullmatch(r"/api/sprints/(\d+)/retro", path)
+            if mrt and method == "GET":
+                return self.send_json(200, retro_get(int(mrt.group(1))))
+            if mrt and method == "POST":
+                return self.send_json(200, retro_save(actor, int(mrt.group(1)), self.read_body()))
+            if path == "/api/attention" and method == "GET":
+                return self.send_json(200, {"i": attention(scope_of(q))})
+            mha = re.fullmatch(r"/api/tasks/(\d+)/(handoff|activity)", path)
+            if mha and method == "POST" and mha.group(2) == "handoff":
+                return self.send_json(200, task_handoff(actor, int(mha.group(1)), self.read_body()))
+            if mha and method == "GET" and mha.group(2) == "activity":
+                return self.send_json(200, task_activity(int(mha.group(1))))
+            if path == "/api/risks" and method == "GET":
+                return self.send_json(200, {"i": active_risks(scope_of(q))})
+            mst = re.fullmatch(r"/api/sprints/(\d+)/stats", path)
+            if mst and method == "GET":
+                return self.send_json(200, sprint_stats(int(mst.group(1))))
+            mdr = re.fullmatch(r"/api/tasks/(\d+)/(decline|reopen)", path)
+            if mdr and method == "POST":
+                fn = task_decline if mdr.group(2) == "decline" else task_reopen
+                return self.send_json(200, fn(actor, int(mdr.group(1)), self.read_body()))
+            mm = re.fullmatch(r"/api/tasks/(\d+)/comments", path)
+            if mm and method == "GET":
+                return self.send_json(200, comments_get(int(mm.group(1))))
+            if mm and method == "POST":
+                return self.send_json(201, comment_add(actor, int(mm.group(1)), self.read_body()))
+            if path == "/api/events":
+                return self.sse(q)
+            if path == "/api/changes":
+                return self.changes(q)
+            # POST /api/tasks/bulk → same as PATCH /api/tasks with ids
+            if path == "/api/tasks/bulk" and method == "POST":
+                body = {}
+                n = int(self.headers.get("Content-Length") or 0)
+                if n:
+                    try:
+                        body = json.loads(self.rfile.read(n))
+                    except Exception:
+                        raise ApiError("json", 400)
+                    if not isinstance(body, dict):
+                        raise ApiError("json", 400)
+                with lock:
+                    res = bulk_set_tasks(actor, body, full)
+                return self.send_json(200, res)
+            mc = re.fullmatch(r"/api/tasks/(?:(\d+)/)?commits", path)
+            if mc and method == "POST":
+                body = {}
+                n = int(self.headers.get("Content-Length") or 0)
+                if n:
+                    try:
+                        body = json.loads(self.rfile.read(n))
+                    except Exception:
+                        raise ApiError("json", 400)
+                if not isinstance(body, (dict, list)):
+                    raise ApiError("json", 400)
+                if mc.group(1):
+                    res = append_commit(actor, int(mc.group(1)), body)
+                elif isinstance(body, dict):
+                    res = append_commit_by_msg(actor, body)
+                else:
+                    raise ApiError("json", 400)
+                return self.send_json(201, res)
+            m = re.fullmatch(r"/api/(boards|sprints|tasks|docs)(?:/(\d+))?", path)
+            if not m:
+                raise ApiError("route", 404)
+            body = {}
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                try:
+                    body = json.loads(self.rfile.read(n))
+                except Exception:
+                    raise ApiError("json", 400)
+                if not isinstance(body, dict):
+                    raise ApiError("json", 400)
+            rid = int(m.group(2)) if m.group(2) else None
+            etag = None
+            if method == "GET":
+                key = hashlib.md5((u.path + "?" + "&".join(sorted(u.query.split("&"))) + str(full)).encode()).hexdigest()[:8]
+                etag = 'W/"%d-%s"' % (last_event(), key)
+                if self.headers.get("If-None-Match") == etag:
+                    self.send_response(304)
+                    self.send_header("ETag", etag)
+                    self.end_headers()
+                    return
+            res = crud(actor, method, m.group(1), rid, body, q, full)
+            self.send_json(201 if method == "POST" else 200, res, etag)
+        except ApiError as e:
+            self.err(e.code, e.status, e.field)
+        except sqlite3.IntegrityError:
+            self.err("bad", 400, "ref")
+
+    def changes(self, q):
+        """Deltas since event id -> {"c":last_id,"e":[[id,type,entity_id,board,delta],...]}"""
+        since = qint(q, "since", 0)
+        lim = max(1, min(qint(q, "limit", 200), 1000))
+        board = q.get("board_id", [None])[0]
+        out, last = [], since
+        for r in rows("SELECT * FROM events WHERE id>? ORDER BY id LIMIT ?", (since, lim)):
+            last = r["id"]
+            p = json.loads(r["payload"])
+            if board and str(p.get("b")) != board:
+                continue
+            out.append([r["id"], r["type"], p["id"], p.get("b"), p.get("d")])
+        self.send_json(200, {"c": last, "e": out})
+
+    def static(self, path):
+        name = "index.html" if path in ("/", "") else path.lstrip("/")
+        # Agent playbook for humans (also linked from UI header)
+        if name in ("AGENTS.md", "playbook.md"):
+            full = os.path.join(HERE, "docs", "AGENTS.md")
+            if not os.path.isfile(full):
+                return self.err("nf", 404)
+            with open(full, "rb") as f:
+                b = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/markdown; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(b)
+            return
+        base = os.path.join(HERE, "static")
+        full = os.path.normpath(os.path.join(base, name))
+        if not full.startswith(base + os.sep) or not os.path.isfile(full):
+            return self.err("nf", 404)
+        ct = {"html": "text/html", "js": "text/javascript", "css": "text/css", "md": "text/markdown"}.get(full.rsplit(".", 1)[-1], "application/octet-stream")
+        with open(full, "rb") as f:
+            b = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", ct + "; charset=utf-8")
+        self.send_header("Content-Length", str(len(b)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(b)
+
+    def sse(self, q):
+        board = q.get("board", [None])[0]
+        last = self.headers.get("Last-Event-ID") or q.get("last", [None])[0]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        qu = queue.Queue()
+        with subs_lock:
+            subs.add(qu)
+        try:
+            self.wfile.write(b"retry: 2000\n\n")
+            if last and last.isdigit():
+                for r in rows("SELECT * FROM events WHERE id>? ORDER BY id", (int(last),)):
+                    qu.put({"i": r["id"], "t": r["type"], "a": r["actor"], **json.loads(r["payload"])})
+            self.wfile.flush()
+            while True:
+                try:
+                    ev = qu.get(timeout=15)
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    continue
+                if board and ev.get("b") is not None and str(ev["b"]) != board:
+                    continue
+                ev = dict(ev)
+                i = ev.pop("i")
+                self.wfile.write(f"id: {i}\ndata: {json.dumps(ev, separators=(',', ':'))}\n\n".encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            with subs_lock:
+                subs.discard(qu)
+            self.close_connection = True
+
+    do_GET = lambda s: s.handle_any("GET")
+    do_HEAD = lambda s: s.handle_any("GET")
+    do_POST = lambda s: s.handle_any("POST")
+    do_PATCH = lambda s: s.handle_any("PATCH")
+    do_PUT = lambda s: s.handle_any("PUT")
+    do_DELETE = lambda s: s.handle_any("DELETE")
+
+
+class S(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def _nudge_loop():
+    import time
+    while True:
+        time.sleep(max(NUDGE_INTERVAL_SEC, 60))
+        try:
+            nudge_tick(actor="nudge-cron")
+        except Exception:
+            pass
+        for fn in (maybe_digest, maybe_backup, recur_tick):
+            try:
+                fn()
+            except Exception:
+                pass
+
+
+def bootstrap_admin(name="admin", quiet=False):
+    """Create an admin token (stored hashed) and return it. Called on first start when no token exists."""
+    r = token_create({"n": name, "role": "admin"})
+    if not quiet:
+        bar = "=" * 64
+        print("\n%s\n First start: admin token created (shown once, store it now)\n\n   %s\n\n Open the web UI and paste it when asked, or send it as\n   Authorization: Bearer <token>\n Lost it later?  python3 server.py --new-admin-token\n%s\n" % (bar, r["token"], bar), flush=True)
+    return r["token"]
+
+
+def seed_demo():
+    """Sample board so a fresh install is not empty (python3 server.py --demo)."""
+    if rows("SELECT id FROM boards LIMIT 1"):
+        return False
+    b = crud("demo", "POST", "boards", None, {"name": "Demo project", "dod": "Tests pass\nChange reviewed"}, {}, False)["id"]
+    sp = crud("demo", "POST", "sprints", None, {"board_id": b, "name": "Sprint 1", "goal": "Get the first release out", "state": "active"}, {}, False)["id"]
+    for t, a, st, pr, pt in (("Design the public API", "planner-agent", "done", 2, 3), ("Implement task claiming", "coder-agent", "in_progress", 1, 5),
+                             ("Write the quickstart", "docs-agent", "todo", 3, 2), ("Review the claiming PR", "reviewer-agent", "review", 2, 2),
+                             ("Set up CI", "", "backlog", 3, 3)):
+        crud("demo", "POST", "tasks", None, {"board_id": b, "sprint_id": sp, "title": t, "assignee": a, "status": st, "priority": pr, "points": pt, "kind": "agent" if a else "human"}, {}, False)
+    spec_create("demo", {"t": "Claiming protocol", "tg": "protocol,agents", "st": "approved", "d": "# Goal\nTwo agents must never work the same task.\n\n## Rules\n- `claim` a task before starting it\n- claims expire; renew them while you work\n- use `lock` for shared resources such as environments\n"})
+    return True
+
+
+def main():
+    if "--new-admin-token" in sys.argv:
+        i = sys.argv.index("--new-admin-token")
+        bootstrap_admin(sys.argv[i + 1] if len(sys.argv) > i + 1 and not sys.argv[i + 1].startswith("--") else "admin")
+        return
+    if auth_open():                      # never run an open server: create the first admin token
+        bootstrap_admin()
+    if "--demo" in sys.argv or os.environ.get("TASKBOARD_DEMO") in ("1", "true"):
+        if seed_demo():
+            print("demo project created", flush=True)
+    if NUDGE_HOURS > 0 and NUDGE_INTERVAL_SEC > 0:
+        threading.Thread(target=_nudge_loop, name="nudge", daemon=True).start()
+    print(f"taskboard on http://{HOST}:{PORT} db={DB} nudge={NUDGE_HOURS}h/{NUDGE_INTERVAL_SEC}s", flush=True)
+    S((HOST, PORT), H).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

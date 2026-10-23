@@ -1,0 +1,10 @@
+.git
+.github
+data/
+__pycache__/
+*.db
+*.db-*
+.env
+.env.*
+selftest.py
+test_security.py
