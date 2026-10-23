@@ -1,7 +1,7 @@
 # Security
 
 ## Reporting a vulnerability
-Please do not open a public issue. Email **security@valnivo.example** (replace with your real address before publishing) with steps to reproduce. We aim to reply within 3 working days.
+Please do not open a public issue. Email **security@valnivo.eu** with steps to reproduce. We aim to reply within 3 working days.
 
 ## What the server does for you
 - **Never runs open.** With no token configured, the first start creates an admin token (stored hashed) and prints it once.
