@@ -296,3 +296,23 @@ fieldset.fs{border:1px solid var(--bd2);border-radius:12px;padding:10px 14px 14p
 .chip.bd{background:hsl(var(--h,200) 35% 92%);color:hsl(var(--h,200) 45% 28%)}
 :root[data-theme=dark] .chip.bd{background:hsl(var(--h,200) 25% 22%);color:hsl(var(--h,200) 55% 82%)}
 .boardrow select optgroup{font-weight:600;color:var(--mut)}
+
+/* priority matrix, OKRs, SLA */
+.cols.okrmode{display:block;max-width:1100px}
+.hint2{font-size:12px;color:var(--mut);padding:0 6px;margin-top:-6px}
+.col[data-p="1"]{--sc:#e92020}.col[data-p="2"]{--sc:#326bae}.col[data-p="3"]{--sc:#ba5c33}.col[data-p="4"]{--sc:#939896}
+.col[data-p] h3::before{background:var(--sc)}
+.okrhead{margin-bottom:12px}
+.obj{background:var(--surface);border-radius:var(--r);box-shadow:0 0 0 1px var(--bd2),var(--sh1);padding:16px 18px;margin-bottom:14px}
+.obj header{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:8px}
+button.link.objt{font-size:16px;font-weight:600;color:var(--fg);text-align:left}.objpct{font-size:20px}
+.bar.big{height:10px;margin-bottom:12px}
+.krs{display:flex;flex-direction:column;gap:2px;margin-bottom:10px}
+.kr{display:grid;grid-template-columns:minmax(160px,2fr) minmax(70px,.8fr) minmax(120px,2fr) auto 44px;gap:12px;align-items:center;padding:7px 0;border-top:1px solid var(--bd2);font-size:13px}
+button.link.krt{color:var(--fg);font-weight:500;text-align:left;overflow-wrap:anywhere}.kr .who{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.krnum{display:flex;gap:6px;align-items:center;font:12px var(--mono);white-space:nowrap}.krnum input{width:84px;height:28px;font:12px var(--mono);text-align:right}
+.krpct{text-align:right;font-variant-numeric:tabular-nums}
+.okrrow{display:grid;grid-template-columns:minmax(160px,2fr) minmax(120px,3fr) 44px;gap:14px;align-items:center;padding:8px 0;border-bottom:1px solid var(--bd2)}.okrrow:last-child{border:0}
+.chip.sla.ok{background:var(--ok-bg);color:var(--ok)}.chip.sla.warn{background:var(--warn-bg);color:var(--warn)}.chip.sla.bad{background:var(--bad-bg);color:var(--bad-h);font-weight:600}
+.row4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+@media(max-width:900px){.kr{grid-template-columns:1fr 1fr}.krbar{grid-column:1/-1}.row4{grid-template-columns:repeat(2,1fr)}.okrrow{grid-template-columns:1fr}}

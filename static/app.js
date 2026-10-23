@@ -9,7 +9,7 @@ const lbShow = l => LB_DISP[l] || l;
 const BASE = (location.pathname.match(/^(\/taskboard(?=\/|$))/) || ["", ""])[1];
 // short event keys -> full task/sprint/board fields
 const KM = {
-  task: {b: "board_id", s: "sprint_id", t: "title", d: "description", st: "status", pr: "priority", as: "assignee", k: "kind", u: "updated", bl: "blocker", bb: "blocked_by", lb: "labels", ch: "channel", w: "watch", sh: "short_url", vid: "video_id", at: "publish_at", pu: "pr_url", sha: "sha", cm: "commits", dp: "depends", pt: "points", cb: "claimed_by", cu: "claim_until", v: "version", dn: "dod_done", ty: "type", pa: "parent"},
+  task: {b: "board_id", s: "sprint_id", t: "title", d: "description", st: "status", pr: "priority", as: "assignee", k: "kind", u: "updated", bl: "blocker", bb: "blocked_by", lb: "labels", ch: "channel", w: "watch", sh: "short_url", vid: "video_id", at: "publish_at", pu: "pr_url", sha: "sha", cm: "commits", dp: "depends", pt: "points", cb: "claimed_by", cu: "claim_until", v: "version", dn: "dod_done", ty: "type", pa: "parent", tg: "target", cr: "current"},
   sprint: {b: "board_id", n: "name", g: "goal", from: "start", to: "end", st: "state"},
   board: {n: "name", d: "description", tm: "team"},
 };
@@ -156,6 +156,10 @@ function card(t) {
   if (t.type && t.type !== "task") meta.push(`<span class="chip ty ${esc(t.type)}">${esc(t.type)}</span>`);
   if (t.parent) { const ep = B && B.tasks.find(y => y.id == t.parent); meta.push(`<span class="chip epic" title="Epic">epic: ${ep ? esc(ep.title.slice(0, 18)) : "#" + t.parent}</span>`); }
   if (t.type === "epic" && B) { const ks = B.tasks.filter(y => y.parent == t.id); if (ks.length) meta.push(`<span class="chip" title="Epic progress">${ks.filter(y => y.status === "done").length}/${ks.length} done</span>`); }
+  if (meth().sla && t.status !== "done" && t.status !== "declined" && t.created) {
+    const sla = ({1: 4, 2: 24, 3: 72, 4: 168, ...(bcfg().sla_hours || {})})[t.priority] || 72, left = sla - (Date.now() - Date.parse(t.created.replace(" ", "T") + "Z")) / 3600000;
+    meta.push(`<span class="chip sla ${left < 0 ? "bad" : left < sla * 0.25 ? "warn" : "ok"}" title="Response target ${sla}h">${left < 0 ? "SLA breached " + hrs(-left) : "SLA " + hrs(left) + " left"}</span>`);
+  }
   if (t.points) meta.push(`<span class="chip" title="Points">${t.points}pt</span>`);
   if (t.claimed_by && (t.claim_until || "") > new Date().toISOString().slice(0, 19).replace("T", " ")) meta.push(`<span class="chip claim" title="Claimed until ${esc(t.claim_until)} UTC">claimed · ${esc(t.claimed_by)}</span>`);
   if (t.nudge || csv(t.labels).map(l => l.toLowerCase()).includes("nudge"))
@@ -195,6 +199,29 @@ function colHtml(s, ts) {
     (c.map(card).join("") || `<p class="none">${query() ? "No matches" : HINT[s]}</p>`) + "</div></section>";
 }
 
+function prioCol(p, ts) {
+  const m = meth(), c = ts.filter(t => String(t.priority) === p && t.status !== "done" && t.status !== "declined").sort((x, y) => x.id - y.id);
+  return `<section class="col" data-p="${p}"><h3>${esc(m.groups[p])}<b>${c.length}</b><button type="button" class="add" data-addp="${p}" title="Add task" aria-label="Add task">+</button></h3><div class="hint2">${esc(m.group_hints[p])}</div><div class="cards">${c.map(card).join("") || '<p class="none">Drop tasks here</p>'}</div></section>`;
+}
+
+const okrPct = t => { const tg = t.target || 0; return tg > 0 ? Math.min(1, (t.current || 0) / tg) : (t.status === "done" ? 1 : 0); };
+function okrHtml(ts) {
+  const objs = ts.filter(t => t.type === "epic").sort((a, b) => a.id - b.id), kids = id => ts.filter(t => t.parent == id && t.type !== "epic");
+  const kr = t => `<div class="kr"><button type="button" class="link krt" data-opent="${t.id}">${esc(t.title)}</button><span class="muted who">${esc(t.assignee || "")}</span><div class="krbar"><div class="bar"><i style="width:${Math.round(okrPct(t) * 100)}%"></i></div></div><span class="krnum"><input class="krcur" data-id="${t.id}" type="number" step="any" min="0" value="${t.current ?? 0}" aria-label="Current value"> / ${t.target ?? "—"}</span><b class="krpct">${Math.round(okrPct(t) * 100)}%</b></div>`;
+  const obj = o => { const ks = kids(o.id), p = ks.length ? ks.reduce((a, k) => a + okrPct(k), 0) / ks.length : 0;
+    return `<article class="obj"><header><button type="button" class="link objt" data-opent="${o.id}">${esc(o.title)}</button><b class="objpct">${Math.round(p * 100)}%</b></header><div class="bar big"><i style="width:${Math.round(p * 100)}%"></i></div><div class="krs">${ks.map(kr).join("") || '<p class="muted">No key results yet.</p>'}</div><button type="button" class="mini" data-addkr="${o.id}">+ Key result</button></article>`; };
+  const loose = ts.filter(t => t.type !== "epic" && !t.parent);
+  return `<div class="okr"><div class="okrhead"><button type="button" class="primary mini" data-addobj>+ Objective</button></div>${objs.map(obj).join("") || '<div class="empty"><b>No objectives yet</b><br>Add an objective, then give it measurable key results.</div>'}${loose.length ? `<article class="obj"><header><b>Not linked to an objective</b></header><div class="krs">${loose.map(kr).join("")}</div></article>` : ""}</div>`;
+}
+function okrDlg(parent) {
+  if (!B || B.multi) return;
+  dlg(`<h3>${parent ? "New key result" : "New objective"}</h3><label>${parent ? "Key result" : "Objective"}<input name="title" required placeholder="${parent ? "e.g. 10,000 weekly signups" : "e.g. Grow the user base"}"></label>
+    ${parent ? `<div class="row2"><label>Target value<input type="number" step="any" min="0" name="target" required></label><label>Starts at<input type="number" step="any" min="0" name="current" value="0"></label></div>` : ""}
+    <label>Owner (optional)<input name="assignee"></label>`,
+    async d => { await api("POST", "/tasks", {board_id: B.id, title: d.title, assignee: d.assignee || "", kind: "human", channel: lastChannel() || "okr", ...(parent ? {type: "story", parent, target: +d.target, current: +d.current || 0} : {type: "epic"})}); },
+    "", parent ? "Add key result" : "Add objective");
+}
+
 function sprintBar() {
   const id = $("sprint").value, s = B && B.sprints.find(x => x.id == id);
   const info = $("sprintinfo");
@@ -224,10 +251,19 @@ function render() {
   $("bar").value = ts.length ? 100 * done / ts.length : 0;
   $("progt").textContent = `${done}/${ts.length} done`;
   sprintBar();
-  $("cols").innerHTML = meth().columns.filter(s => s !== "declined").map(s => colHtml(s, ts)).join("");
-  const nd = ts.filter(t => t.status === "declined").length;
-  $("closed").hidden = false; $("closedn").textContent = nd ? `(${nd})` : "";
-  $("closedcols").innerHTML = colHtml("declined", ts);
+  const grp = meth().group || "status";
+  $("cols").classList.toggle("okrmode", grp === "okr");
+  if (grp === "okr") { $("cols").innerHTML = okrHtml(ts); $("closed").hidden = true; }
+  else if (grp === "priority") {
+    $("cols").innerHTML = ["1", "2", "3", "4"].map(p => prioCol(p, ts)).join("");
+    const nc = ts.filter(t => t.status === "done" || t.status === "declined").length;
+    $("closed").hidden = false; $("closedn").textContent = nc ? `(${nc})` : ""; $("closedcols").innerHTML = colHtml("done", ts) + colHtml("declined", ts);
+  } else {
+    $("cols").innerHTML = meth().columns.filter(s => s !== "declined").map(s => colHtml(s, ts)).join("");
+    const nd = ts.filter(t => t.status === "declined").length;
+    $("closed").hidden = false; $("closedn").textContent = nd ? `(${nd})` : "";
+    $("closedcols").innerHTML = colHtml("declined", ts);
+  }
   for (const id of [...picked]) if (!B.tasks.some(t => t.id === id)) picked.delete(id);
   document.querySelectorAll(".card").forEach(c => c.classList.toggle("picked", picked.has(+c.dataset.id)));
   bulkBar();
@@ -510,6 +546,13 @@ function flowPanel(f) {
     <div><h3>Throughput per week</h3><div class="bars2">${f.per_week.map(w => `<div class="b2"><i style="height:${Math.round(100 * w.n / mx)}%"></i><span>${w.n}</span><small>${esc(w.from.slice(5))}</small></div>`).join("")}</div>
     <h3 style="margin-top:14px">Oldest work in flight</h3>${f.aging.length ? f.aging.slice(0, 5).map(a => `<div class="coord"><div><button type="button" class="link" data-open="${a.id}"><span class="mono">#${a.id}</span></button> ${esc(a.t)}<div class="muted">${esc(a.st.replace("_", " "))} · ${hrs(a.age_h)}${a.as ? " · " + esc(a.as) : ""}</div></div>${a.stuck ? '<span class="badge red">stuck</span>' : ""}</div>`).join("") : '<span class="muted">Nothing in flight.</span>'}</div></div></div>`;
 }
+function okrPanel(o) {
+  return `<div class="panel"><h2>Objectives <span class="hl ${o.overall >= 0.7 ? "green" : o.overall >= 0.4 ? "amber" : "red"}">${Math.round(o.overall * 100)}% overall</span></h2>${o.i.length ? o.i.map(x => `<div class="okrrow"><div><b>${esc(x.t)}</b><div class="muted">${x.krs.length} key result(s)${x.as ? " · " + esc(x.as) : ""}</div></div><div class="bar"><i style="width:${Math.round(x.progress * 100)}%"></i></div><b>${Math.round(x.progress * 100)}%</b></div>`).join("") : '<span class="muted">No objectives yet.</span>'}</div>`;
+}
+function slaPanel(s) {
+  const row = (it, cls) => `<div class="coord"><div><button type="button" class="link" data-open="${it.id}"><span class="mono">#${it.id}</span></button> ${esc(it.t)}<div class="muted">P${it.pr} · open ${hrs(it.age_h)} of ${it.sla_h}h target${it.as ? " · " + esc(it.as) : ""}</div></div><span class="badge ${cls}">${cls === "red" ? "breached" : "at risk"}</span></div>`;
+  return `<div class="panel"><h2>Response targets <span class="hl ${s.breached.length ? "red" : s.at_risk.length ? "amber" : "green"}">${s.breached.length} breached · ${s.at_risk.length} at risk · ${s.ok} on track</span></h2>${s.breached.map(i => row(i, "red")).join("")}${s.at_risk.map(i => row(i, "")).join("") || (s.breached.length ? "" : '<span class="muted">Everything is inside its target.</span>')}</div>`;
+}
 function velPanel(v) {
   const mx = Math.max(1, ...v.i.map(x => Math.max(x.committed, x.done)));
   return `<div class="panel"><h2>Velocity ${v.avg != null ? `<span class="hl green">avg ${v.avg} per closed sprint</span>` : ""}</h2><div class="bars2 wide">${v.i.map(x => `<div class="b2"><div class="pair"><i class="c" style="height:${Math.round(100 * x.committed / mx)}%" title="Committed ${x.committed}"></i><i class="d" style="height:${Math.round(100 * x.done / mx)}%" title="Done ${x.done}"></i></div><span>${x.done}/${x.committed || "–"}</span><small>${esc(x.n.slice(0, 10))}</small></div>`).join("")}</div><div class="legend"><span><i style="width:10px;height:10px;border:0;background:var(--bd);margin:0 4px 0 0;border-radius:2px"></i>committed</span><span><i style="width:10px;height:10px;border:0;background:var(--pri);margin:0 4px 0 12px;border-radius:2px"></i>done</span></div></div>`;
@@ -564,6 +607,9 @@ async function renderOverview() {
   let fl = null, vel = null;
   if (mt.wip) { try { fl = await api("GET", `/boards/${b.id}/flow?days=30`); } catch (_) {} }
   if (mt.sprints) { try { vel = await api("GET", `/boards/${b.id}/velocity`); } catch (_) {} }
+  let okr = null, sla = null;
+  if (mt.group === "okr") { try { okr = await api("GET", `/boards/${b.id}/okr`); } catch (_) {} }
+  if (mt.sla) { try { sla = await api("GET", `/boards/${b.id}/sla`); } catch (_) {} }
   if (view !== "overview") return;
   let ss = null;
   if (sp && mt.sprints) { try { ss = await api("GET", `/sprints/${sp.id}/stats`); } catch (_) {} if (view !== "overview") return; }
@@ -584,7 +630,9 @@ async function renderOverview() {
     ${att}
     ${mt.sprints ? sprintPanel(sp, ss) : ""}
     ${fl ? flowPanel(fl) : ""}
-    ${vel && vel.i.length > 1 ? velPanel(vel) : ""}
+    ${vel && vel.i.length > 1 && !mt.gate && mt.group !== "okr" ? velPanel(vel) : ""}
+    ${okr ? okrPanel(okr) : ""}
+    ${sla ? slaPanel(sla) : ""}
     <div class="panel"><h2>Environments</h2>${envs.length ? `<table class="tb"><tr><th>Env</th><th>Deployed</th><th>By</th><th>When</th><th></th></tr>${envs.map(e => `<tr><td><b>${esc(e.n)}</b>${e.frozen ? ` <span class="badge red">Frozen until ${esc(e.frozen.slice(5, 16))} UTC</span>` : ""}</td><td class="num">${esc((e.sha || "—").slice(0, 10))}</td><td>${esc(e.by || "—")}</td><td class="muted">${e.at ? esc(ago(e.at)) + " ago" : "—"}</td><td class="num"><button type="button" class="mini" ${e.frozen ? `data-unfreeze="${esc(e.n)}">Unfreeze` : `data-freeze="${esc(e.n)}">Freeze`}</button></td></tr>`).join("")}</table>` : '<span class="muted">No deploys recorded yet. Agents record them with the deploy_env tool; freezes stop deploys and notify everyone.</span>'}</div>
     <div class="grid2">
       <div class="panel"><h2>Agent workload</h2>${rows ? `<table class="tb"><tr><th>Agent</th><th>Doing</th><th>To do</th><th>Review</th><th>Blocked</th><th>Inbox</th><th>Done 30d</th><th>Cycle</th><th>Decl.</th><th>Cap</th></tr>${rows}</table>` : '<span class="muted">No assigned work yet.</span>'}</div>
@@ -719,10 +767,12 @@ function boardSetDlg() {
     <fieldset class="fs"><legend>Cadence <span class="muted">(scrum, scrumban, shape up)</span></legend>
       <div class="row2"><label>Length in days<input type="number" name="sprint_days" min="1" max="120" value="${cfg.sprint_days || meth().sprint_days || 14}"></label><label>Keep ready column at least<input type="number" name="replenish_below" min="1" value="${cfg.replenish_below || ""}" placeholder="scrumban only"></label></div>
       <label class="chk"><input type="checkbox" name="auto_rollover" ${cfg.auto_rollover ? "checked" : ""}> When a ${term().toLowerCase()} ends, close it automatically and start the next</label></fieldset>
+    <fieldset class="fs"><legend>Support desk <span class="muted">(response target in hours, by priority)</span></legend><div class="row4">${[1, 2, 3, 4].map(p => `<label>P${p}<input type="number" name="sla${p}" min="1" value="${(cfg.sla_hours || {})[p] || ({1: 4, 2: 24, 3: 72, 4: 168})[p]}"></label>`).join("")}</div></fieldset>
+    <label>Phases <span class="muted">(waterfall: one per line; used when the board has no phases yet)</span><textarea name="phases" rows="2">${esc((cfg.phases || []).join("\n"))}</textarea></label>
     <label>Definition of done <span class="muted">(one item per line)</span><textarea name="dod" rows="3">${esc(B.dod || "")}</textarea></label>`,
     async d => {
       const wip = {}; for (const k of ["todo", "in_progress", "review"]) if (d["w_" + k]) wip[k] = +d["w_" + k];
-      await api("PATCH", "/boards/" + B.id, {method: d.method, dod: d.dod, cfg: {wip, wip_mode: d.wip_mode, sprint_days: +d.sprint_days || 0, auto_rollover: d.auto_rollover === "on", replenish_below: +d.replenish_below || 0}});
+      await api("PATCH", "/boards/" + B.id, {method: d.method, dod: d.dod, cfg: {wip, wip_mode: d.wip_mode, sprint_days: +d.sprint_days || 0, auto_rollover: d.auto_rollover === "on", replenish_below: +d.replenish_below || 0, sla_hours: {1: +d.sla1 || 0, 2: +d.sla2 || 0, 3: +d.sla3 || 0, 4: +d.sla4 || 0}, phases: d.phases}});
       await loadBoard(); toast("Board settings saved");
     }, "", "Save settings");
 }
@@ -762,7 +812,9 @@ async function quickSprint() {
 }
 async function sprintAction(id, act) {
   if (act === "close" && !confirm("Complete this " + term().toLowerCase() + "? Unfinished tasks move to the next planned one (or the backlog).")) return;
-  const r = await api("POST", `/sprints/${id}/${act}`, {});
+  let r;
+  try { r = await api("POST", `/sprints/${id}/${act}`, {}); }
+  catch (e) { if (e && e.e === "gate") toast("This " + term().toLowerCase() + " still has open work — finish it first (a supervisor can force the close)."); return; }
   toast(act === "start" ? term() + " started" : `${term()} completed — ${r.mv} unfinished task(s) moved`);
   autoSprint = true; await loadBoard();
   if (act === "close") retroDlg(id);
@@ -802,13 +854,13 @@ function handoffDlg(id) {
     "", "Hand off");
 }
 
-function taskDlg(id, status, title, boardId) {
+function taskDlg(id, status, title, boardId, pri) {
   if (!B) return;
   if (!id && B.multi && !boardId) return dlg(`<h3>New task</h3><label>Which board?<select name="b">${B.boardIds.map(i => `<option value="${i}">${esc(BS[i].name)}</option>`).join("")}</select></label>`,
     async d => { setTimeout(() => taskDlg(0, status, title, +d.b), 60); }, "", "Continue");
   const sp = $("sprint").value;
   const t = (id && B.tasks.find(x => x.id == id)) ||
-    {status: status || "todo", priority: 3, kind: "agent", title: title || "", sprint_id: sp > 0 ? +sp : ""};
+    {status: status || "todo", priority: pri || 3, kind: "agent", title: title || "", sprint_id: sp > 0 ? +sp : ""};
   const people = [...new Set(B.tasks.map(x => x.assignee).filter(Boolean))];
   const bid = id ? t.board_id : (boardId || B.id), bd = BS[bid] || B;
   dlg(`<div class="dlghead"><span class="crumb">${id ? `<span class="mono">#${id}</span> · ` : ""}${esc(bd.name)}</span><h3>${id ? esc(t.title) : "New task"}</h3></div>
@@ -826,6 +878,7 @@ function taskDlg(id, status, title, boardId) {
     <label>Epic<select name="parent"><option value="">none</option>${B.tasks.filter(x => x.type === "epic" && x.board_id == bid && x.id != id).map(x => `<option value="${x.id}" ${x.id == t.parent ? "selected" : ""}>#${x.id} ${esc(x.title)}</option>`).join("")}</select></label></div>
     <div class="row2"><label>Depends on (task ids)<input name="depends" value="${esc(csv(t.depends).join(", "))}" placeholder="e.g. 12, 15"></label>
     <label>Points (estimate)<input type="number" name="points" min="0" max="1000" value="${t.points || ""}"></label></div>
+    ${meth().group === "okr" ? `<div class="row2"><label>Target (key result)<input type="number" step="any" min="0" name="target" value="${t.target ?? ""}"></label><label>Current value<input type="number" step="any" min="0" name="current" value="${t.current ?? ""}"></label></div>` : ""}
     ${(bd.dod || "").trim() ? `<div class="dod"><label>Definition of done — every item before this task can be done</label>${bd.dod.split("\n").filter(x => x.trim()).map((x, i) => `<label class="chk"><input type="checkbox" name="dodi" value="${i}" ${csv(t.dod_done).includes(String(i)) ? "checked" : ""}> ${esc(x)}</label>`).join("")}</div>` : ""}
     <details class="more"><summary>More fields (labels, links, blockers, PR)</summary>
     <label>Labels (comma)<input name="labels" list="lbl" value="${esc(csv(t.labels).map(lbShow).join(", "))}"><datalist id="lbl">${SUG_LB.map(l => `<option value="${esc(lbShow(l))}">`).join("")}</datalist></label>
@@ -842,7 +895,7 @@ function taskDlg(id, status, title, boardId) {
       d.priority = +d.priority;
       d.labels = csv(d.labels).join(",");
       d.depends = csv(d.depends).map(Number).filter(Number.isFinite); d.points = +d.points || 0;
-      d.parent = d.parent ? +d.parent : null; d.dod_done = [...document.querySelectorAll("#f [name=dodi]:checked")].map(x => +x.value); delete d.dodi;
+      d.parent = d.parent ? +d.parent : null; if ("target" in d) { d.target = d.target === "" ? null : +d.target; d.current = d.current === "" ? 0 : +d.current; } d.dod_done = [...document.querySelectorAll("#f [name=dodi]:checked")].map(x => +x.value); delete d.dodi;
       if (id) d.ver = t.version;
       d.blocked_by = csv(d.blocked_by).map(Number).filter(Number.isFinite);
       if (d.status !== "blocked") { delete d.blocker; delete d.blocked_by; }
@@ -995,6 +1048,10 @@ document.addEventListener("keydown", e => {
 const cols = $("v-board");
 cols.addEventListener("click", e => {
   const ad = e.target.closest("[data-add]");
+  const ap = e.target.closest("[data-addp]"); if (ap) return taskDlg(0, "todo", "", 0, +ap.dataset.addp);
+  if (e.target.closest("[data-addobj]")) return okrDlg(0);
+  const ak = e.target.closest("[data-addkr]"); if (ak) return okrDlg(+ak.dataset.addkr);
+  const ot = e.target.closest("[data-opent]"); if (ot) return taskDlg(+ot.dataset.opent);
   if (ad) { if (B.multi) return taskDlg(0, ad.dataset.add); qa = qa && qa.status === ad.dataset.add ? null : {status: ad.dataset.add, text: ""}; return render(); }
   if (e.target.closest("[data-qacancel]")) { qa = null; return render(); }
   const dec = e.target.closest("[data-decline]");
@@ -1021,11 +1078,20 @@ cols.addEventListener("dragstart", e => { const c = e.target.closest(".card"); i
 cols.addEventListener("dragend", () => document.querySelectorAll(".dragging,.over").forEach(x => x.classList.remove("dragging", "over")));
 cols.addEventListener("dragover", e => { const c = e.target.closest(".col"); if (c) { e.preventDefault(); c.classList.add("over"); } });
 cols.addEventListener("dragleave", e => { const c = e.target.closest(".col"); if (c && !c.contains(e.relatedTarget)) c.classList.remove("over"); });
+cols.addEventListener("change", async e => {
+  const k = e.target.closest(".krcur"); if (!k) return;
+  const v = parseFloat(k.value); if (!(v >= 0)) return toast("Enter a number");
+  try { await api("PATCH", "/tasks/" + k.dataset.id, {cr: v}); const t = B.tasks.find(x => x.id == k.dataset.id); if (t) t.current = v; render(); } catch (_) { loadBoard(); }
+});
 cols.addEventListener("drop", async e => {
   const c = e.target.closest(".col");
   if (!c) return;
   e.preventDefault(); c.classList.remove("over");
   const t = B.tasks.find(x => x.id == dragId);
+  if (c.dataset.p) {
+    if (t && t.priority != c.dataset.p) { const prev = t.priority; t.priority = +c.dataset.p; render(); try { await api("PATCH", "/tasks/" + dragId, {pr: +c.dataset.p}); } catch (_) { t.priority = prev; loadBoard(); } }
+    return;
+  }
   if (t && t.status !== c.dataset.s) {
     const ns = c.dataset.s;
     if (ns === "declined") return declineTask(+dragId);
@@ -1042,6 +1108,7 @@ cols.addEventListener("drop", async e => {
 });
 const ovEl = $("v-overview"), agEl = $("v-agents");
 ovEl.addEventListener("click", async e => {
+  const op0 = e.target.closest("[data-open]"); if (op0) return openTask(+op0.dataset.open);
   const ob = e.target.closest("[data-board]"); if (ob) { $("board").value = "b:" + ob.dataset.board; autoSprint = true; await loadBoard(); return; }
   const c = e.target.closest("[data-sclose]"); if (c) return sprintAction(c.dataset.sclose, "close");
   if (e.target.id === "ovnew") sprintDlg(null, "active");

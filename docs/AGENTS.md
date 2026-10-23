@@ -74,8 +74,14 @@ Each board picks a method; change it any time in **Board settings** (nothing is 
 | `scrumban` | optional | yes | kanban flow plus an optional cadence and a **replenish signal** when the Ready column runs low |
 | `shapeup` | 6-week **cycles** | no | cycle length and naming (Shaping, Bets, Building, QA, Stuck, Shipped), everything else as scrum |
 | `simple` | none | no | just To do, Doing, Done |
+| `waterfall` | **phases** (stage-gate) | no | default phases Requirements, Design, Build, Test, Release (or `cf.phases`); a phase only closes when all its work is done (`409 {"e":"gate"}`; admins and supervisors can `force`), then the next one starts automatically |
+| `gtd` | none | no | personal inbox: Inbox, Next actions, Doing, Waiting for, Done |
+| `lean` | none | optional | build-measure-learn columns: Ideas, Hypotheses, Building, Measuring, Pivot or stop, Learned |
+| `eisenhower` | none | no | **priority matrix**: four quadrants by priority (1 do first, 2 schedule, 3 delegate, 4 eliminate); dragging a card changes its priority |
+| `okr` | quarters | no | **objectives and key results**: an objective is an epic, its key results are child tasks with a target (`tg`) and a current value (`cr`); `GET /boards/{id}/okr` (MCP `okr`) rolls progress up per objective |
+| `support` | none | no | **support desk with SLAs**: response target in hours per priority (`cf.sla_hours`, default 4/24/72/168); requests past target are flagged and escalated once (`sla.breach`, `esc.sla-breach`); `GET /boards/{id}/sla` (MCP `board_sla`) |
 
-Settings (`cf`): `wip` `{"todo":5,"in_progress":3,"review":2}`, `wip_mode` `warn|block`, `sprint_days`, `auto_rollover`, `replenish_below`. In `block` mode a move into a full column returns `409 {"e":"wip","f":"<status>"}`; admins and supervisors can pass `force:true`. In `warn` mode the response carries `"w":["WIP limit for in_progress reached (4 of 3)"]`. Kanban and simple boards reject sprint creation (`{"e":"no_sprints"}`).
+Settings (`cf`): `phases` (waterfall), `sla_hours` (support), `wip` `{"todo":5,"in_progress":3,"review":2}`, `wip_mode` `warn|block`, `sprint_days`, `auto_rollover`, `replenish_below`. In `block` mode a move into a full column returns `409 {"e":"wip","f":"<status>"}`; admins and supervisors can pass `force:true`. In `warn` mode the response carries `"w":["WIP limit for in_progress reached (4 of 3)"]`. Kanban and simple boards reject sprint creation (`{"e":"no_sprints"}`).
 APIs: `GET /boards/{id}/flow?days=30` (MCP `board_flow`), `GET /boards/{id}/velocity` (`board_velocity`), `GET|POST /sprints/{id}/retro` (`retro`, `save_retro`). Closing a sprint notifies everyone with work in it (`sprint.closed`); over-limit columns and unusually old work appear in `attention`.
 
 **Work item types.** Tasks have a type `task|story|bug|epic|spike|chore` (`ty`) and an optional parent epic (`pa`, same board). `GET /tasks?ty=epic`, `?parent=<epic id>`; an epic's `?ctx=1` returns `kids` and `prog`.

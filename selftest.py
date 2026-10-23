@@ -338,8 +338,8 @@ r = J("PATCH", f"/tasks/{V['id']}", {"t": "stale", "ver": v0}); assert r[0] == 4
 print("v7 selftest OK")
 
 # ================= v8: work methodologies =================
-st, mm = J("GET", "/methods"); assert {x["id"] for x in mm["i"]} == {"scrum", "kanban", "scrumban", "shapeup", "simple"} and "epic" in mm["types"]
-assert J("POST", "/boards", {"n": "bad", "method": "waterfall"})[1]["e"] == "bad"
+st, mm = J("GET", "/methods"); assert {"scrum", "kanban", "scrumban", "shapeup", "simple"} <= {x["id"] for x in mm["i"]} and "epic" in mm["types"]
+assert J("POST", "/boards", {"n": "bad", "method": "nonsense"})[1]["e"] == "bad"
 # ---- kanban: WIP limits, no sprints, flow metrics
 st, kb = J("POST", "/boards", {"n": "Kanban board", "method": "kanban", "cf": {"wip": {"in_progress": 2}, "wip_mode": "block"}}); K = kb["id"]
 assert kb["mt"] == "kanban" and json.loads(kb["cf"])["wip"] == {"in_progress": 2}, kb
@@ -424,3 +424,56 @@ assert all(set(x["ids"]) <= alpha_ids for x in att if x["k"] == "blocked-p12"), 
 assert not any(x["k"] == "blocked-p12" for x in J("GET", "/attention?tm=nosuchteam")[1]["i"])
 assert isinstance(J("GET", "/risks?tm=alpha")[1]["i"], list) and isinstance(J("GET", "/stats/agents?tm=alpha")[1]["i"], list)
 print("v9 selftest OK")
+
+# ================= v10: more methodologies (waterfall, gtd, lean, priority matrix, okr, support) =================
+st, mm = J("GET", "/methods"); ids_ = {x["id"] for x in mm["i"]}
+assert {"waterfall", "gtd", "lean", "eisenhower", "okr", "support"} <= ids_ and len(ids_) == 11, ids_
+lab = {x["id"]: x for x in mm["i"]}
+assert lab["gtd"]["labels"]["backlog"] == "Inbox" and lab["lean"]["labels"]["review"] == "Measuring" and lab["eisenhower"]["group"] == "priority" and lab["okr"]["group"] == "okr" and lab["support"]["sla"] and lab["waterfall"]["gate"]
+# ---- waterfall: phases are created, gated and advance automatically
+st, wf = J("POST", "/boards", {"n": "Waterfall", "method": "waterfall"}); WF = wf["id"]
+phases = J("GET", f"/sprints?board_id={WF}")[1]["i"]
+assert [p["n"] for p in phases] == ["Requirements", "Design", "Build", "Test", "Release"] and [p["st"] for p in phases] == ["active", "planned", "planned", "planned", "planned"], phases
+wt = [J("POST", "/tasks", {"b": WF, "t": "req %d" % i})[1] for i in range(2)]
+assert all(t["s"] == phases[0]["id"] for t in wt)                                                           # work joins the active phase
+r = J("POST", f"/sprints/{phases[0]['id']}/close", {}); assert r[0] == 409 and r[1]["e"] == "gate", r       # gate closed: open work
+assert J("POST", f"/sprints/{phases[1]['id']}/start")[1]["e"] == "gate"                                     # cannot jump ahead either
+assert J("POST", f"/sprints/{phases[0]['id']}/close", {"force": True}, tok="wtok")[0] == 409                  # agents cannot force
+for t in wt:
+    J("PATCH", f"/tasks/{t['id']}", {"st": "done"})
+r = J("POST", f"/sprints/{phases[0]['id']}/close", {})[1]; assert r["st"] == "closed" and r["next"]["n"] == "Design", r
+assert [p["st"] for p in J("GET", f"/sprints?board_id={WF}")[1]["i"]][:2] == ["closed", "active"]
+J("POST", "/tasks", {"b": WF, "t": "design stuck"})
+assert J("POST", f"/sprints/{phases[1]['id']}/close", {"force": True})[1]["st"] == "closed"                  # admin override moves the work on
+st, wc = J("POST", "/boards", {"n": "Custom phases", "method": "waterfall", "cf": {"phases": ["Plan", "Do"]}})
+assert [p["n"] for p in J("GET", f"/sprints?board_id={wc['id']}")[1]["i"]] == ["Plan", "Do"]
+st, sw = J("POST", "/boards", {"n": "Switch to waterfall"}); J("PATCH", f"/boards/{sw['id']}", {"method": "waterfall"})
+assert len(J("GET", f"/sprints?board_id={sw['id']}")[1]["i"]) == 5                                          # switching creates the phases
+# ---- OKR
+st, ok = J("POST", "/boards", {"n": "OKRs", "method": "okr"}); OK = ok["id"]
+st, ob = J("POST", "/tasks", {"b": OK, "t": "Grow signups", "ty": "epic"})
+k1 = J("POST", "/tasks", {"b": OK, "t": "10k signups", "pa": ob["id"], "tg": 10000, "cr": 2500})[1]
+k2 = J("POST", "/tasks", {"b": OK, "t": "Launch referral", "pa": ob["id"], "tg": 1, "cr": 0})[1]
+assert k1["tg"] == 10000.0 and k1["cr"] == 2500.0
+o = J("GET", f"/boards/{OK}/okr")[1]; assert o["i"][0]["progress"] == 0.12 and len(o["i"][0]["krs"]) == 2 and o["overall"] == 0.12, o       # (0.25 + 0) / 2
+J("PATCH", f"/tasks/{k2['id']}", {"cr": 1}); o = J("GET", f"/boards/{OK}/okr")[1]; assert o["i"][0]["progress"] == 0.62, o
+assert J("PATCH", f"/tasks/{k1['id']}", {"cr": -5})[1]["e"] == "bad" and J("PATCH", f"/tasks/{k1['id']}", {"tg": "abc"})[1]["e"] == "bad"
+st, lq = J("POST", "/tasks", {"b": OK, "t": "loose KR", "tg": 4, "cr": 4}); assert J("GET", f"/boards/{OK}/okr")[1]["loose"][0]["pct"] == 1.0
+# ---- support desk SLA
+st, sd = J("POST", "/boards", {"n": "Support", "method": "support", "cf": {"sla_hours": {"1": 2}}}); SD = sd["id"]
+sp1 = J("POST", "/tasks", {"b": SD, "t": "customer down", "pr": 1, "as": "Support Pat"})[1]
+sp2 = J("POST", "/tasks", {"b": SD, "t": "question", "pr": 3, "as": "Support Pat"})[1]
+sl = J("GET", f"/boards/{SD}/sla")[1]; assert sl["sla_h"]["1"] == 2 and sl["sla_h"]["3"] == 72 and sl["breached"] == [] and sl["ok"] == 2, sl
+server.db.execute("UPDATE tasks SET created=? WHERE id=?", (past(3 * 60), sp1["id"])); server.db.execute("UPDATE tasks SET created=? WHERE id=?", (past(60 * 60), sp2["id"]))
+sl = J("GET", f"/boards/{SD}/sla")[1]; assert [x["id"] for x in sl["breached"]] == [sp1["id"]] and [x["id"] for x in sl["at_risk"]] == [sp2["id"]], sl
+J("POST", "/nudge")
+assert any(n["ty"] == "sla.breach" for n in J("GET", "/inbox?as=Support%20Pat")[1]["i"]) and any(n["ty"] == "esc.sla-breach" for n in J("GET", "/inbox", tok="stok")[1]["i"])
+assert any(x["k"] == "sla-breach" and sp1["id"] in x["ids"] for x in J("GET", "/attention")[1]["i"])
+J("POST", "/nudge"); assert sum(1 for n in J("GET", "/inbox?as=Support%20Pat&all=1")[1]["i"] if n["ty"] == "sla.breach") == 1       # once per request
+J("PATCH", f"/tasks/{sp1['id']}", {"st": "done"}); assert J("GET", f"/boards/{SD}/sla")[1]["breached"] == []
+assert J("POST", "/boards", {"n": "bad sla", "cf": {"sla_hours": {"1": "x"}}})[1]["e"] == "bad"
+# ---- presets that are label/layout only
+for mth in ("gtd", "lean", "eisenhower"):
+    st, b_ = J("POST", "/boards", {"n": mth, "method": mth}); assert b_["mt"] == mth
+    t_ = J("POST", "/tasks", {"b": b_["id"], "t": "x", "pr": 2})[1]; assert J("PATCH", f"/tasks/{t_['id']}", {"pr": 1})[1]["pr"] == 1
+print("v10 selftest OK")

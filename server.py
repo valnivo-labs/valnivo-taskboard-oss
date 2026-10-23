@@ -113,7 +113,7 @@ for _t, _c, _d in (("tasks", "blocker", "TEXT DEFAULT ''"), ("tasks", "blocked_b
                    ("tasks", "claimed_by", "TEXT DEFAULT ''"), ("tasks", "claim_until", "TEXT DEFAULT ''"), ("tasks", "version", "INTEGER DEFAULT 1"), ("tasks", "dod_done", "TEXT DEFAULT ''"),
                    ("boards", "dod", "TEXT DEFAULT ''"), ("agents", "last_seen", "TEXT DEFAULT ''"), ("agents", "status_text", "TEXT DEFAULT ''"), ("agents", "status_task", "INTEGER"), ("agents", "skills", "TEXT DEFAULT ''"),
                    ("boards", "method", "TEXT DEFAULT 'scrum'"), ("boards", "cfg", "TEXT DEFAULT ''"), ("tasks", "type", "TEXT DEFAULT 'task'"), ("tasks", "parent", "INTEGER"),
-                   ("sprints", "committed", "INTEGER DEFAULT 0"),
+                   ("sprints", "committed", "INTEGER DEFAULT 0"), ("tasks", "target", "REAL"), ("tasks", "current", "REAL"),
                    ("boards", "team", "TEXT DEFAULT ''")):
     if _c not in [r[1] for r in db.execute(f"PRAGMA table_info({_t})")]:
         db.execute(f"ALTER TABLE {_t} ADD COLUMN {_c} {_d}")
@@ -122,7 +122,7 @@ FIELDS = {
     "boards": ["name", "description", "team", "dod", "method", "cfg"],
     "docs": ["scope", "ref_id", "title", "body", "url"],
     "sprints": ["board_id", "name", "goal", "start", "end", "state"],
-    "tasks": ["board_id", "sprint_id", "title", "description", "status", "priority", "assignee", "kind", "blocker", "blocked_by", "labels", "channel", "watch", "short_url", "video_id", "publish_at", "pr_url", "sha", "commits", "decline_reason", "nudge", "depends", "points", "dod_done", "type", "parent"],
+    "tasks": ["board_id", "sprint_id", "title", "description", "status", "priority", "assignee", "kind", "blocker", "blocked_by", "labels", "channel", "watch", "short_url", "video_id", "publish_at", "pr_url", "sha", "commits", "decline_reason", "nudge", "depends", "points", "dod_done", "type", "parent", "target", "current"],
 }
 REQUIRED = {"docs": ["scope", "ref_id", "title"], "boards": ["name"], "sprints": ["board_id"], "tasks": ["board_id", "title"]}
 # db column -> short key (compact mode). Input accepts short or long keys.
@@ -132,7 +132,7 @@ CK = {
     "sprints": {"id": "id", "board_id": "b", "name": "n", "goal": "g", "start": "from", "end": "to", "state": "st", "committed": "cmt"},
     "tasks": {"id": "id", "board_id": "b", "sprint_id": "s", "title": "t", "description": "d", "status": "st",
               "priority": "pr", "assignee": "as", "kind": "k", "updated": "u", "blocker": "bl", "blocked_by": "bb", "labels": "lb", "channel": "ch",
-              "watch": "w", "short_url": "sh", "video_id": "vid", "publish_at": "at", "pr_url": "pu", "sha": "sha", "commits": "cm", "decline_reason": "dr", "nudge": "nu", "depends": "dp", "points": "pt", "dod_done": "dn", "claimed_by": "cb", "claim_until": "cu", "version": "v", "type": "ty", "parent": "pa"},
+              "watch": "w", "short_url": "sh", "video_id": "vid", "publish_at": "at", "pr_url": "pu", "sha": "sha", "commits": "cm", "decline_reason": "dr", "nudge": "nu", "depends": "dp", "points": "pt", "dod_done": "dn", "claimed_by": "cb", "claim_until": "cu", "version": "v", "type": "ty", "parent": "pa", "target": "tg", "current": "cr"},
 }
 IN = {t: {**{v: k for k, v in m.items()}, **{k: k for k in m}} for t, m in CK.items()}
 
@@ -362,7 +362,7 @@ def cdict(table, r, full, skip=()):
     if full:
         return r
     m = CK[table]
-    return {m[k]: v for k, v in r.items() if k in m and k not in skip and v is not None and v != "" and v != [] and not (k == "points" and not v)}
+    return {m[k]: v for k, v in r.items() if k in m and k not in skip and v is not None and v != "" and v != [] and not (k in ("points", "target", "current") and not v)}
 
 
 def validate(table, body, partial):
@@ -438,6 +438,13 @@ def validate(table, body, partial):
         out["cfg"] = norm_cfg(out["cfg"])
     if "type" in out and out["type"] not in TASK_TYPES:
         raise ApiError("bad", 400, "ty")
+    for _k in ("target", "current"):
+        if _k in out:
+            try:
+                out[_k] = None if out[_k] in (None, "") else float(out[_k])
+                assert out[_k] is None or out[_k] >= 0
+            except (TypeError, ValueError, AssertionError):
+                raise ApiError("bad", 400, "tg" if _k == "target" else "cr")
     if "parent" in out:
         try:
             out["parent"] = int(out["parent"]) if out["parent"] not in (None, "", 0, "0") else None
@@ -729,6 +736,8 @@ def crud(actor, method, table, rid, body, q, full):
             r = rows(f"SELECT * FROM {table} WHERE id=?", (cur.lastrowid,))[0]
             bid = r["id"] if table == "boards" else r["board_id"]
             emit(actor, f"{sing}.created", r["id"], bid, cdict(table, r, False))
+            if table == "boards":
+                ensure_phases(r["id"])
             if table == "tasks":
                 notify_task(actor, None, r)
             if table == "sprints" and r["state"] == "active":
@@ -801,6 +810,8 @@ def crud(actor, method, table, rid, body, q, full):
             db.execute(f"UPDATE {table} SET {sets} WHERE id=?", list(d.values()) + [rid])
             m = CK[table]
             emit(actor, f"{sing}.updated", rid, bid, {m[k]: (json.loads(v) if k == "commits" else v) for k, v in d.items() if old.get(k) != v})
+            if table == "boards" and ("method" in d or "cfg" in d):
+                ensure_phases(rid)
             if table == "tasks":
                 notify_task(actor, old, rows("SELECT * FROM tasks WHERE id=?", (rid,))[0])
                 if d.get("status") in ("done", "declined") and old["status"] not in ("done", "declined"):
@@ -1413,6 +1424,10 @@ def attention(bid=None):
                 items.append({"k": "wip-exceeded", "sev": "med", "m": "'%s' is over its WIP limit in: %s" % (fb["name"], ", ".join(fl["over"])), "ids": []})
             if fl["stuck"]:
                 items.append({"k": "aging-wip", "sev": "med", "m": "%d task(s) on '%s' have been in flight unusually long" % (len(fl["stuck"]), fb["name"]), "ids": fl["stuck"][:30]})
+        if fb["method"] == "support":
+            br = board_sla(fb["id"])["breached"]
+            if br:
+                items.append({"k": "sla-breach", "sev": "high", "m": "%d request(s) on '%s' are past their SLA" % (len(br), fb["name"]), "ids": [x["id"] for x in br][:30]})
     sil = silent_agents()
     add("silent-agent", "high", "%d in-progress task(s) belong to silent agents", [t for t in op if t["status"] == "in_progress" and (t["assignee"] or "").lower() in sil])
     od_asks = rows("SELECT id, task_id FROM asks WHERE status='open' AND due<?" + wb.replace("board_id", "board_id"), [now_s()] + a)
@@ -2098,6 +2113,7 @@ def housekeeping(actor="system"):
     nowt = now_s()
     rollover_tick(actor)
     replenish_tick(actor)
+    sla_tick(actor)
     for t in rows("SELECT * FROM tasks WHERE claimed_by!='' AND claim_until<?", (nowt,)):
         db.execute("UPDATE tasks SET claimed_by='', claim_until='', version=COALESCE(version,1)+1 WHERE id=?", (t["id"],))
         emit(actor, "task.updated", t["id"], t["board_id"], {"cb": ""})
@@ -2134,6 +2150,24 @@ METHODS = {
     "simple": {"name": "Simple list", "about": "Just to do, doing and done. No sprints, no limits.",
                "sprints": False, "wip": False, "term": "", "sprint_days": 14, "columns": ["todo", "in_progress", "done"],
                "labels": {"in_progress": "Doing"}},
+    "waterfall": {"name": "Waterfall (stage-gate)", "about": "Sequential phases with gates: a phase only closes when all its work is done, then the next one starts.",
+                  "sprints": True, "wip": False, "term": "Phase", "sprint_days": 30, "columns": ALL_STATUSES, "labels": {}, "gate": True,
+                  "phases": ["Requirements", "Design", "Build", "Test", "Release"]},
+    "gtd": {"name": "Personal (GTD)", "about": "Capture everything in an inbox, decide the next action, and track what you are waiting for.",
+            "sprints": False, "wip": False, "term": "", "sprint_days": 14, "columns": ["backlog", "todo", "in_progress", "blocked", "done"],
+            "labels": {"backlog": "Inbox", "todo": "Next actions", "in_progress": "Doing", "blocked": "Waiting for"}},
+    "lean": {"name": "Lean startup", "about": "Build, measure, learn: turn ideas into hypotheses, build the smallest test, measure it, record what you learned.",
+             "sprints": False, "wip": True, "term": "", "sprint_days": 14, "columns": ALL_STATUSES,
+             "labels": {"backlog": "Ideas", "todo": "Hypotheses", "in_progress": "Building", "review": "Measuring", "blocked": "Pivot or stop", "done": "Learned"}},
+    "eisenhower": {"name": "Priority matrix", "about": "Four quadrants by urgency and importance: do first, schedule, delegate, eliminate. Drag a card between quadrants to re-prioritise.",
+                   "sprints": False, "wip": False, "term": "", "sprint_days": 14, "columns": ["todo", "in_progress", "done"], "labels": {}, "group": "priority",
+                   "groups": {"1": "Do first", "2": "Schedule", "3": "Delegate", "4": "Eliminate"},
+                   "group_hints": {"1": "Urgent and important", "2": "Important, not urgent", "3": "Urgent, not important", "4": "Neither"}},
+    "okr": {"name": "OKRs", "about": "Objectives with measurable key results: set a target, update the current value, and watch progress roll up per objective and quarter.",
+            "sprints": True, "wip": False, "term": "Quarter", "sprint_days": 91, "columns": ALL_STATUSES, "labels": {}, "group": "okr"},
+    "support": {"name": "Support desk (SLA)", "about": "Incoming requests with a response-time target per priority; breaches are flagged and escalated.",
+                "sprints": False, "wip": False, "term": "", "sprint_days": 14, "columns": ALL_STATUSES, "sla": True,
+                "labels": {"backlog": "New", "todo": "Triaged", "in_progress": "Investigating", "review": "Resolved - verify", "blocked": "Waiting on customer", "done": "Closed"}},
 }
 TASK_TYPES = ("task", "story", "bug", "epic", "spike", "chore")
 
@@ -2162,6 +2196,16 @@ def norm_cfg(v):
             out["auto_rollover"] = True
         if v.get("replenish_below") not in (None, "", 0, "0"):
             out["replenish_below"] = max(1, min(int(v["replenish_below"]), 999))
+        if v.get("phases"):
+            ph = v["phases"] if isinstance(v["phases"], list) else str(v["phases"]).splitlines()
+            ph = [" ".join(str(x).split())[:40] for x in ph if str(x).strip()][:12]
+            if ph:
+                out["phases"] = ph
+        sl = {str(k): int(n) for k, n in (v.get("sla_hours") or {}).items() if str(k) in ("1", "2", "3", "4") and n not in (None, "", 0, "0")}
+        if sl:
+            if any(n < 1 or n > 24 * 365 for n in sl.values()):
+                raise ValueError
+            out["sla_hours"] = sl
     except (TypeError, ValueError):
         raise ApiError("bad", 400, "cf")
     return json.dumps(out, separators=(",", ":"))
@@ -2351,6 +2395,85 @@ def retro_save(actor, sid, body):
     return retro_get(sid)
 
 
+# ---- stage-gate (waterfall), OKR progress, support SLAs
+def ensure_phases(bid):
+    """A waterfall board without phases gets its default ones (the first is started)."""
+    m, cfg = board_cfg(bid)
+    if m != "waterfall" or db.execute("SELECT 1 FROM sprints WHERE board_id=? LIMIT 1", (bid,)).fetchone():
+        return
+    names = cfg.get("phases") or METHODS["waterfall"]["phases"]
+    ids = []
+    for n in names:
+        sid = db.execute("INSERT INTO sprints(board_id,name,goal,state) VALUES(?,?,?,'planned')", (bid, n, "")).lastrowid
+        emit("system", "sprint.created", sid, bid, {"n": n})
+        ids.append(sid)
+    sprint_start("system", ids[0])
+
+
+def close_phase_aware(actor, sid, to=None, force=False):
+    """Close a sprint. On waterfall boards the gate must be open (all work done) unless forced, and the next phase starts automatically."""
+    r = sprint_close(actor, sid, move_to=to, force=force)
+    sp = rows("SELECT board_id FROM sprints WHERE id=?", (sid,))[0]
+    if board_cfg(sp["board_id"])[0] == "waterfall" and not rows("SELECT id FROM sprints WHERE board_id=? AND state='active'", (sp["board_id"],)):
+        nx = rows("SELECT id, name FROM sprints WHERE board_id=? AND state='planned' ORDER BY id LIMIT 1", (sp["board_id"],))
+        if nx:
+            sprint_start(actor, nx[0]["id"])
+            r["next"] = {"id": nx[0]["id"], "n": nx[0]["name"]}
+    return r
+
+
+def board_okr(bid):
+    ts = rows("SELECT id, title, status, assignee, parent, type, target, current FROM tasks WHERE board_id=? AND status!='declined' ORDER BY id", (bid,))
+
+    def kr(t):
+        tg, cur = t["target"] or 0, t["current"] or 0
+        pct = min(1.0, cur / tg) if tg > 0 else (1.0 if t["status"] == "done" else 0.0)
+        return {k: v for k, v in {"id": t["id"], "t": t["title"], "as": t["assignee"], "st": t["status"], "target": t["target"], "current": cur, "pct": round(pct, 2)}.items() if v not in (None, "")}
+    out = []
+    for o in (t for t in ts if t["type"] == "epic"):
+        krs = [kr(t) for t in ts if t["parent"] == o["id"]]
+        out.append({"id": o["id"], "t": o["title"], "as": o["assignee"], "st": o["status"], "progress": round(sum(k["pct"] for k in krs) / len(krs), 2) if krs else 0.0, "krs": krs})
+    return {"b": bid, "i": out, "loose": [kr(t) for t in ts if t["type"] != "epic" and not t["parent"]],
+            "overall": round(sum(o["progress"] for o in out) / len(out), 2) if out else 0.0}
+
+
+def sla_hours(cfg):
+    base = {"1": 4, "2": 24, "3": 72, "4": 168}
+    base.update({str(k): int(v) for k, v in (cfg.get("sla_hours") or {}).items()})
+    return base
+
+
+def board_sla(bid):
+    m, cfg = board_cfg(bid)
+    sl = sla_hours(cfg)
+    now = _datetime.datetime.now(_datetime.timezone.utc).replace(tzinfo=None)
+    out = {"breached": [], "at_risk": [], "ok": 0}
+    for t in rows("SELECT id, title, priority, created, assignee FROM tasks WHERE board_id=? AND status NOT IN ('done','declined')", (bid,)):
+        age = (now - _tsd(t["created"])).total_seconds() / 3600
+        lim = sl.get(str(t["priority"]), 72)
+        it = {"id": t["id"], "t": t["title"], "pr": t["priority"], "as": t["assignee"], "age_h": round(age, 1), "sla_h": lim}
+        if age > lim:
+            out["breached"].append(it)
+        elif age > 0.75 * lim:
+            out["at_risk"].append(it)
+        else:
+            out["ok"] += 1
+    out["breached"].sort(key=lambda x: -(x["age_h"] - x["sla_h"]))
+    return {"b": bid, "mt": m, "sla_h": sl, **out}
+
+
+def sla_tick(actor="system"):
+    """Support boards: tell the assignee and the supervisors once when a request passes its response-time target."""
+    for b in rows("SELECT id, name FROM boards WHERE method='support'"):
+        for it in board_sla(b["id"])["breached"]:
+            key = "sla:%d" % it["id"]
+            if get_setting(key):
+                continue
+            set_setting(key, "1")
+            notify(it["as"], "sla.breach", actor, it["id"], b["id"], "#%d '%s' has passed its %dh response target (open %gh)" % (it["id"], it["t"][:60], it["sla_h"], it["age_h"]), {"sla": it["sla_h"]})
+            escalate("sla-breach", actor, it["id"], b["id"], "#%d '%s' on '%s' breached its %dh SLA (p%d)" % (it["id"], it["t"][:60], b["name"], it["sla_h"], it["pr"]), skip=(it["as"],))
+
+
 # ---- cadence helpers used by the periodic tick (caller holds `lock`)
 def rollover_tick(actor="system"):
     """auto_rollover boards: when the active sprint has ended, close it (unfinished work carries over) and start the next one."""
@@ -2360,7 +2483,7 @@ def rollover_tick(actor="system"):
             cfg = json.loads(sp["cfg"] or "{}")
         except ValueError:
             continue
-        if not cfg.get("auto_rollover") or not board_has_sprints(sp["board_id"]):
+        if not cfg.get("auto_rollover") or not board_has_sprints(sp["board_id"]) or board_cfg(sp["board_id"])[0] == "waterfall":
             continue
         nxt = rows("SELECT id FROM sprints WHERE board_id=? AND state='planned' ORDER BY id LIMIT 1", (sp["board_id"],))
         if nxt:
@@ -2392,12 +2515,16 @@ def replenish_tick(actor="system"):
 
 
 # ---------------------------------------------------------------- sprint lifecycle
-def sprint_close(actor, sid, move_to=None):
+def sprint_close(actor, sid, move_to=None, force=False):
     """Close a sprint; unfinished tasks go to `move_to` (sprint id | 'backlog'); default = next planned sprint, else backlog."""
     s = rows("SELECT * FROM sprints WHERE id=?", (sid,))
     if not s:
         raise ApiError("nf", 404)
     s = s[0]
+    if board_cfg(s["board_id"])[0] == "waterfall" and not force:
+        open_n = db.execute("SELECT COUNT(*) FROM tasks WHERE sprint_id=? AND status NOT IN ('done','declined')", (sid,)).fetchone()[0]
+        if open_n:
+            raise ApiError("gate", 409, "open")
     if move_to in (None, ""):
         nx = rows("SELECT id FROM sprints WHERE board_id=? AND state='planned' AND id!=? ORDER BY id LIMIT 1", (s["board_id"], sid))
         target = nx[0]["id"] if nx else None
@@ -3132,7 +3259,7 @@ class H(BaseHTTPRequestHandler):
             if ms and method == "POST":
                 body = self.read_body()
                 with lock:
-                    res = sprint_start(actor, int(ms.group(1))) if ms.group(2) == "start" else sprint_close(actor, int(ms.group(1)), body.get("to"))
+                    res = sprint_start(actor, int(ms.group(1))) if ms.group(2) == "start" else close_phase_aware(actor, int(ms.group(1)), body.get("to"), bool(body.get("force")) and _priv(self.role))
                 return self.send_json(200, res)
             if path == "/api/specs":
                 if method == "GET":
@@ -3242,9 +3369,10 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, att_del(int(mat.group(1))))
             if path == "/api/methods" and method == "GET":
                 return self.send_json(200, {"i": [{"id": k, **v} for k, v in METHODS.items()], "types": list(TASK_TYPES)})
-            mbf = re.fullmatch(r"/api/boards/(\d+)/(flow|velocity)", path)
+            mbf = re.fullmatch(r"/api/boards/(\d+)/(flow|velocity|okr|sla)", path)
             if mbf and method == "GET":
-                return self.send_json(200, board_flow(int(mbf.group(1)), max(7, min(qint(q, "days", 30), 180))) if mbf.group(2) == "flow" else board_velocity(int(mbf.group(1)), max(1, min(qint(q, "n", 8), 30))))
+                bb, kind = int(mbf.group(1)), mbf.group(2)
+                return self.send_json(200, board_flow(bb, max(7, min(qint(q, "days", 30), 180))) if kind == "flow" else board_velocity(bb, max(1, min(qint(q, "n", 8), 30))) if kind == "velocity" else board_okr(bb) if kind == "okr" else board_sla(bb))
             mrt = re.fullmatch(r"/api/sprints/(\d+)/retro", path)
             if mrt and method == "GET":
                 return self.send_json(200, retro_get(int(mrt.group(1))))
