@@ -120,6 +120,8 @@ Measured on a demo board, one typical cycle (start, take a task, finish it with 
 
 **Chat channels for humans.** Admin → Chat notifications (or the `chats` MCP tool, `GET/POST/DELETE /chats`, `POST /chats/{id}/test`) posts to Slack, Discord, Teams, Telegram or any JSON endpoint. Per channel: events (`blocked`, `done`, `review`, `declined`, `assigned`, `escalation`, `sprint`, `budget`, `git`), a minimum priority and an optional board. Addresses are write-only secrets. Set `base_url` to add task links (`#t/42` opens the task).
 
+**Admin without the screen.** Opt-in tool group `TASKBOARD_TOOLS=core,admin` (or `all`): `tokens` (list, create, revoke), `settings`, `backups` (run, list, send digest), `export_data`, `import_data`, `del_board`, `del_sprint`, `chats`, `git_secret`, `wake_agent`, `usage`. They need an admin token (`del_sprint`: supervisor too); export is admin-only. `e2e/agent_day.py` plays a whole day of an agent team over the real MCP server, webhooks and chat to prove the loop end to end (also against a copy of a real database: `AGENT_DAY_DB=copy.db`).
+
 ## Supervisor
 Give a token the `supervisor` role (or list names in Admin → Settings → `supervisors`). Supervisors receive `esc.declined`, `esc.blocked` (p1/p2), `esc.stale`, `esc.silent`, `esc.ask-overdue`, `esc.sprint-red`, `esc.human-card`, and can call `attention` for what needs a lead right now.
 

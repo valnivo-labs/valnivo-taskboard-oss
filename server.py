@@ -2607,7 +2607,9 @@ def check_done_gate(tid, bid, dod_done):
         done = {int(x) for x in re.findall(r"\d+", str(dod_done or ""))}
         if not set(range(len(items))) <= done:
             raise ApiError("dod", 400, "dn")
-    if rows("SELECT id FROM reviews WHERE task_id=? AND status IN ('pending','changes')", (tid,)):
+    # a review blocks while it is pending, or asked for changes and nobody has looked again since (a newer review by the same person supersedes it)
+    if rows("SELECT id FROM reviews r WHERE task_id=? AND (status='pending' OR (status='changes' AND NOT EXISTS "
+            "(SELECT 1 FROM reviews n WHERE n.task_id=r.task_id AND n.reviewer=r.reviewer COLLATE NOCASE AND n.id>r.id)))", (tid,)):
         raise ApiError("review", 400, "st")
 
 
@@ -4271,7 +4273,7 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, {"ok": True, **res, "h": NUDGE_HOURS})
             if self.role == "viewer" and method != "GET":
                 return self.err("forbidden", 403)
-            if self.role != "admin" and (path.startswith(("/api/admin", "/api/tokens", "/api/settings", "/api/import", "/api/chats")) or
+            if self.role != "admin" and (path.startswith(("/api/admin", "/api/tokens", "/api/settings", "/api/import", "/api/chats", "/api/export")) or
                                          (method == "DELETE" and (re.match(r"/api/boards/", path) or (re.match(r"/api/sprints/", path) and self.role != "supervisor")))):
                 return self.err("forbidden", 403)
             if path == "/api/tokens":

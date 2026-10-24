@@ -808,3 +808,37 @@ assert [a["done"] for a in r["agents"]["i"] if a["as"] == "Roller"] == [3]
 assert J("GET", f"/overview?b={o1['id']}")[1]["boards"] == 1 and len(J("GET", f"/overview?b={o1['id']}")[1]["flow"]["cfd"]) == 31
 assert J("GET", "/overview?bs=999999")[1]["boards"] == 0 and J("GET", f"/overview?{scope}", tok="vtok")[0] == 200
 print("v15 selftest OK")
+
+# ================= v16: the admin tool group - everything the Admin screen does, without the screen =================
+def mcp_as(tok, tools, name, args):
+    pr = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")],
+                        input=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}) + "\n", capture_output=True, text=True,
+                        env={**os.environ, "TASKBOARD_URL": "http://127.0.0.1:8791", "TASKBOARD_TOKEN": tok, "TASKBOARD_TOOLS": tools}, timeout=60)
+    return json.loads(json.loads(pr.stdout.splitlines()[0])["result"]["content"][0]["text"])
+names_ = lambda t: {x["name"] for x in mcp(t, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})[0]["result"]["tools"]}
+ADM = {"tokens", "settings", "backups", "export_data", "import_data", "del_board", "del_sprint", "chats", "git_secret", "wake_agent", "usage"}
+assert not ADM & names_("core") and not ADM & names_("core,coord,plan") and ADM <= names_("core,admin") and ADM <= names_("all")          # opt-in group, not in the daily profile
+tk = mcp_as("tok", "all", "tokens", {"action": "create", "n": "Temp Agent", "role": "agent"}); assert len(tk["token"]) > 20 and tk["role"] == "agent", tk
+assert J("GET", "/boards", tok=tk["token"])[0] == 200
+lst = mcp_as("tok", "all", "tokens", {})["i"]; tid_ = [x["id"] for x in lst if x["n"] == "Temp Agent"][0]
+assert mcp_as("tok", "all", "tokens", {"action": "revoke", "id": tid_})["x"] == 1 and J("GET", "/boards", tok=tk["token"])[0] == 401
+assert mcp_as("wtok", "all", "tokens", {})["e"] == "forbidden" and mcp_as("wtok", "all", "tokens", {"action": "create", "n": "x"})["e"] == "forbidden"
+assert mcp_as("tok", "all", "settings", {"wake_after_min": "7", "base_url": "https://b.example.com"})["wake_after_min"] == "7"
+assert mcp_as("tok", "all", "settings", {})["base_url"] == "https://b.example.com" and mcp_as("wtok", "all", "settings", {})["e"] == "forbidden" and mcp_as("tok", "all", "settings", {"prices": "nope"})["e"] == "bad"
+bk_ = mcp_as("tok", "all", "backups", {"action": "run"}); assert bk_["ok"] is True and mcp_as("tok", "all", "backups", {})["n"] >= 1 and mcp_as("wtok", "all", "backups", {"action": "run"})["e"] == "forbidden"
+ex_ = mcp_as("tok", "all", "export_data", {"b": BID}); assert ex_["boards"] and mcp_as("wtok", "all", "export_data", {})["e"] == "forbidden" and mcp_as("stok", "all", "export_data", {})["e"] == "forbidden"
+im_ = mcp_as("tok", "all", "import_data", {"data": ex_}); assert im_["n"]["tasks"] >= 1 and mcp_as("wtok", "all", "import_data", {"data": ex_})["e"] == "forbidden"
+st, bt_ = J("POST", "/boards", {"n": "To delete"}); st, spt_ = J("POST", "/sprints", {"b": bt_["id"]})
+assert mcp_as("wtok", "all", "del_sprint", {"id": spt_["id"]})["e"] == "forbidden" and mcp_as("stok", "all", "del_sprint", {"id": spt_["id"]}).get("e") is None
+assert mcp_as("stok", "all", "del_board", {"id": bt_["id"]})["e"] == "forbidden" and mcp_as("tok", "all", "del_board", {"id": bt_["id"]}).get("e") is None and J("GET", f"/boards/{bt_['id']}")[0] == 404
+print("v16 selftest OK")
+
+# ---- a review that asked for changes no longer blocks once the same reviewer approved a newer one
+st, rg = J("POST", "/tasks", {"b": GD, "t": "review loop", "as": "Looper", "st": "in_progress"})
+r1 = J("POST", f"/tasks/{rg['id']}/review", {"reviewer": "Reviewer X", "note": "first"})[1]; J("POST", f"/reviews/{r1['id']}/decide", {"decision": "changes", "note": "fix it"}, tok="tok")
+assert J("PATCH", f"/tasks/{rg['id']}", {"st": "done", "dn": [0]})[1]["e"] == "review"                                  # still blocked while the changes are outstanding
+r2 = J("POST", f"/tasks/{rg['id']}/review", {"reviewer": "Reviewer X", "note": "second"})[1]
+assert J("PATCH", f"/tasks/{rg['id']}", {"st": "done", "dn": [0]})[1]["e"] == "review"                                  # and while the new request is pending
+J("POST", f"/reviews/{r2['id']}/decide", {"decision": "approve"}, tok="tok")
+assert J("PATCH", f"/tasks/{rg['id']}", {"st": "done", "dn": [0]})[1].get("st") == "done"
+print("v16 review loop OK")

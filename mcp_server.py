@@ -71,6 +71,28 @@ def S(req=(), **p):
     return {"type": "object", "properties": p, "required": list(req)}
 
 
+def _tokens(a):
+    act = a.pop("action", "list")
+    if act == "list":
+        return api("GET", "/tokens")
+    if act == "create":
+        return api("POST", "/tokens", a)
+    if act == "revoke" and "id" in a:
+        return api("DELETE", "/tokens?id=%s" % a["id"])
+    return {"e": "bad", "f": "action"}
+
+
+def _backups(a):
+    act = a.get("action", "list")
+    if act == "list":
+        return api("GET", "/admin/backups")
+    if act == "run":
+        return api("POST", "/admin/backup", {})
+    if act == "digest":
+        return api("POST", "/admin/digest", {})
+    return {"e": "bad", "f": "action"}
+
+
 def _chats(a):
     act = a.pop("action", "list")
     if act == "list":
@@ -242,6 +264,16 @@ TOOLS = {
               S(action=s, id=i, n=s, kind=s, url=s, token=s, target=s, events={"type": "array", "items": s}, minpr=i, b=i, on={"type": "boolean"}), lambda a: _chats(dict(a))),
     "git_secret": ("Admin: create a new secret for the git webhook (POST /api/hooks/git from GitHub, GitLab or Gitea). Returns the secret once to paste into the forge.",
                    S(), lambda a: api("POST", "/admin/git-secret", {})),
+    "tokens": ("Admin: access tokens. action list | create (n=name, role agent|supervisor|viewer|admin; the token is returned once) | revoke (id).",
+               S(action=s, n=s, role=s, id=i), lambda a: _tokens(dict(a))),
+    "settings": ("Admin: with no arguments reads the settings; with keys changes them: digest_url, digest_hour, alert_url, backup_keep, supervisors (csv names), base_url, wake_after_min, budget_usd, prices (JSON string), git_autodone (1|0).",
+                 S(digest_url=s, digest_hour=s, alert_url=s, backup_keep=s, supervisors=s, base_url=s, wake_after_min=s, budget_usd=s, prices=s, git_autodone=s),
+                 lambda a: api("POST", "/settings", a) if a else api("GET", "/settings")),
+    "backups": ("Admin: action list (default) | run (verified backup now) | digest (send the daily digest now).", S(action=s), lambda a: _backups(dict(a))),
+    "export_data": ("Admin: export everything, or one board (b), as JSON: tasks, sprints, docs, specs, comments. Can be large.", S(b=i), lambda a: api("GET", "/export" + qs(a, ["b"]))),
+    "import_data": ("Admin: import an export (data = the object export_data returned). Always creates new copies; nothing is overwritten.", S(["data"], data={"type": "object"}), lambda a: api("POST", "/import", a["data"])),
+    "del_board": ("Admin: delete a board and everything on it. Irreversible - export_data first.", S(["id"], id=i), lambda a: api("DELETE", f"/boards/{a['id']}")),
+    "del_sprint": ("Supervisor/admin: delete a sprint (its tasks stay, without a sprint).", S(["id"], id=i), lambda a: api("DELETE", f"/sprints/{a['id']}")),
     "batch": ("Run up to 20 calls in one round trip: ops=[{m:'GET'|'POST'|'PATCH'|'DELETE', p:'/tasks/7', b:{...}}]. Stops at the first error unless cont=true. Returns [{s:status, r:result}].",
               S(["ops"], ops={"type": "array", "items": {"type": "object", "properties": {"m": s, "p": s, "b": {"type": "object"}}}}, cont={"type": "boolean"}), lambda a: api("POST", "/batch", a)),
     "guide": ("A short playbook for your role (~100-250 tokens): agent, coder, reviewer, supervisor or planner.", S(role=s), lambda a: api("GET", "/guide" + qs(a, ["role"]))),
@@ -258,8 +290,9 @@ TOOLS = {
 CORE = ["briefing", "next", "finish", "inbox", "claim", "set_task", "add_task", "tasks", "task", "comment", "handoff", "heartbeat", "answer", "decide_review", "lock", "unlock"]
 COORD = ["claim_next", "release", "locks", "ask", "asks", "cancel_ask", "request_review", "reviews", "watch", "unwatch", "watches", "attach", "attachments", "del_attachment",
          "cost", "links", "route", "envs", "deploy_env", "freeze_env", "unfreeze_env", "decline_task", "reopen_task", "add_commit", "task_activity", "comments"]
-GROUPS = {"core": CORE, "coord": COORD, "plan": [n for n in TOOLS if n not in CORE + COORD]}
-PROFILE = os.environ.get("TASKBOARD_TOOLS", "core")      # core (default) | core,coord | core,coord,plan | all | tool names
+ADMIN = ["tokens", "settings", "backups", "export_data", "import_data", "del_board", "del_sprint", "chats", "git_secret", "wake_agent", "usage"]
+GROUPS = {"core": CORE, "coord": COORD, "admin": ADMIN, "plan": [n for n in TOOLS if n not in CORE + COORD + ADMIN]}
+PROFILE = os.environ.get("TASKBOARD_TOOLS", "core")      # core (default) | core,coord | core,coord,plan | core,admin | all | tool names
 if PROFILE == "all":
     VISIBLE = list(TOOLS)
 else:
