@@ -340,3 +340,11 @@ button.link.lk small{color:var(--mut)}button.link.lk.done{opacity:.6;text-decora
 .sprintmini header{display:flex;justify-content:space-between;align-items:center;gap:8px}
 
 .msg{padding:8px 0;border-bottom:1px solid var(--bd2);overflow-wrap:anywhere}.msg:last-of-type{border-bottom:0}
+
+/* admin: panels with tables never spill out, wide panels span the grid */
+.panel{overflow-x:auto}
+.grid2.admingrid{grid-template-columns:repeat(auto-fit,minmax(min(100%,460px),1fr))}
+.grid2.admingrid>.panel.wide{grid-column:1/-1}
+table.tb td.num{white-space:nowrap}
+.rowacts{display:inline-flex;gap:6px;justify-content:flex-end}
+table.tb td:first-child{overflow-wrap:anywhere}
