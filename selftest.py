@@ -1049,6 +1049,20 @@ if hasattr(server, "SEC_HEADERS"):                                              
     J("POST", "/settings", {"media_hosts": ""})
 print("v20 selftest OK")
 
+# v23 auto-read: reading your own inbox / conversation marks it read; someone reading as= you does not
+_ar = J("POST", "/tokens", {"n": "Reader A", "role": "agent"})[1]["token"]
+J("POST", "/messages", {"to": "Reader A", "c": "ping 1"}); J("POST", "/messages", {"to": "Reader A", "c": "ping 2"})
+assert J("GET", "/inbox?as=Reader%20A")[1]["n"] >= 1                     # admin peek via as= leaves it unread
+assert J("GET", "/inbox?ack=0", tok=_ar)[1]["unread"] >= 1                 # ack=0 peek leaves it unread
+assert J("GET", "/messages?with=" + "Owner", tok=_ar)[1]["n"] >= 0
+_ib = J("GET", "/inbox", tok=_ar)[1]
+assert _ib["unread"] == 0, _ib                                             # own read marks read
+J("POST", "/messages", {"to": "Reader A", "c": "ping 3"})
+_ms = J("GET", "/messages", tok=_ar)[1]
+assert any(m["c"] == "ping 3" for m in _ms["i"]), _ms
+assert J("GET", "/inbox?ack=0", tok=_ar)[1]["unread"] == 0                 # reading the conversation marked the DM read
+print("v23 auto-read OK")
+
 # ---- deleting a task or a board takes its runs with it; the money already spent stays counted
 st, dtk = J("POST", "/tasks", {"b": RB, "t": "to be deleted", "as": "Runner One", "st": "todo"}); rr = J("POST", "/runs", {"as": "Runner One", "task": dtk["id"], "runtime": "agent-cli"})[1]
 J("POST", f"/runs/{rr['id']}/end", {"as": "Runner One", "st": "ok", "usd": 0.25}); assert J("GET", f"/runs?task={dtk['id']}")[1]["n"] == 1

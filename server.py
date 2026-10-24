@@ -1121,7 +1121,9 @@ def inbox_get(q, actor=""):
             with inbox_cv:
                 inbox_cv.wait(min(end - time.time(), 5))
             items = fetch()
-    if q.get("ack", ["0"])[0] not in ("0", "") and items:
+    own = bool(actor) and actor.lower() == agent.lower()
+    ack = q.get("ack", [None])[0]
+    if items and (ack not in (None, "0", "") or (ack is None and own)):
         with lock:
             db.execute("UPDATE notifications SET read=1 WHERE id IN (%s)" % ",".join("?" * len(items)), [i["id"] for i in items])
     left = db.execute("SELECT COUNT(*) FROM notifications WHERE agent=? AND read=0", (agent,)).fetchone()[0]
@@ -2492,6 +2494,12 @@ def messages_get(actor, role, q):
         wh.append("(sender=? OR recipient=?)")
         ar += [other, other]
     rs = rows("SELECT * FROM (SELECT * FROM messages WHERE " + " AND ".join(wh) + " ORDER BY id DESC LIMIT ?) ORDER BY id", ar + [lim])
+    reader = actor if actor and actor.lower() not in GENERIC_ACTORS else ""
+    mine = [m["id"] for m in rs if reader and m["recipient"].lower() == reader.lower()]
+    if mine and q.get("ack", ["1"])[0] not in ("0", ""):
+        with lock:
+            senders = sorted({m["sender"] for m in rs if m["id"] in mine})
+            db.execute("UPDATE notifications SET read=1 WHERE agent=? AND read=0 AND type='msg.direct' AND actor IN (%s) AND CAST(json_extract(payload, '$.msg') AS INTEGER)<=?" % ",".join("?" * len(senders)), [reader] + senders + [max(mine)])
     return {"n": len(rs), "i": [{"id": m["id"], "ts": m["ts"], "from": m["sender"], "to": m["recipient"], "tk": m["task_id"], "c": m["body"], **({"re": m["reply_to"]} if m["reply_to"] else {})} for m in rs]}
 
 
