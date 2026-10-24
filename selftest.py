@@ -787,3 +787,24 @@ r = mcp("all", {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"n
         {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "links", "arguments": {"id": dn_}}})
 assert json.loads(r[0]["result"]["content"][0]["text"])["kinds"] and "tot" in json.loads(r[1]["result"]["content"][0]["text"]) and json.loads(r[2]["result"]["content"][0]["text"])["cross"] == 1
 print("v14 mcp OK")
+
+# ================= v15: the all-boards overview carries the single-board analytics =================
+st, o1 = J("POST", "/boards", {"n": "Roll scrum"}); st, o2 = J("POST", "/boards", {"n": "Roll kanban", "method": "kanban"}); st, o3 = J("POST", "/boards", {"n": "Roll okr", "method": "okr"}); st, o4 = J("POST", "/boards", {"n": "Roll support", "method": "support"})
+J("POST", "/sprints", {"b": o1["id"], "st": "active"})
+for b_, n_ in ((o1["id"], 2), (o2["id"], 1)):
+    for i in range(n_):
+        st, t_ = J("POST", "/tasks", {"b": b_, "t": "rolled %d" % i, "as": "Roller", "st": "in_progress"}); J("PATCH", f"/tasks/{t_['id']}", {"st": "done"})
+J("POST", "/tasks", {"b": o2["id"], "t": "still going", "as": "Roller", "st": "in_progress"})
+st, ob = J("POST", "/tasks", {"b": o3["id"], "t": "Objective", "ty": "epic"}); J("POST", "/tasks", {"b": o3["id"], "t": "KR", "pa": ob["id"], "tg": 10, "cr": 5})
+J("POST", "/tasks", {"b": o4["id"], "t": "customer request", "pr": 1})
+scope = f"bs={o1['id']},{o2['id']},{o3['id']},{o4['id']}"
+r = J("GET", f"/overview?{scope}")[1]
+assert r["boards"] == 4 and r["flow"]["done_n"] == 3 and r["flow"]["wip"]["in_progress"] == 1 and len(r["flow"]["cfd"]) == 31 and r["flow"]["cycle_h"]["avg"] is not None, r["flow"]
+assert sum(w["n"] for w in r["flow"]["per_week"]) == 3
+assert [x["bn"] for x in r["sprints"]] == ["Roll scrum"] and r["sprints"][0]["burn"] and r["sprints"][0]["health"] in ("green", "amber", "red")
+assert r["okr"][0]["bn"] == "Roll okr" and r["okr"][0]["overall"] == 0.5 and r["okr"][0]["n"] == 1
+assert r["sla"][0]["bn"] == "Roll support" and r["sla"][0]["breached"] + r["sla"][0]["at_risk"] + r["sla"][0]["ok"] == 1
+assert [a["done"] for a in r["agents"]["i"] if a["as"] == "Roller"] == [3]
+assert J("GET", f"/overview?b={o1['id']}")[1]["boards"] == 1 and len(J("GET", f"/overview?b={o1['id']}")[1]["flow"]["cfd"]) == 31
+assert J("GET", "/overview?bs=999999")[1]["boards"] == 0 and J("GET", f"/overview?{scope}", tok="vtok")[0] == 200
+print("v15 selftest OK")

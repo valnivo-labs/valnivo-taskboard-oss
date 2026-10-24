@@ -631,23 +631,52 @@ function sprintPanel(sp, ss) {
     <div><h3>Risks</h3><ul class="risks">${risks}</ul></div></div></div>`;
 }
 
+function sprintsPanel(sp) {
+  if (!sp || !sp.length) return "";
+  return `<div class="panel"><h2>Active sprints <span class="muted">${sp.length}</span></h2><div class="sprintgrid">${sp.map(s => `<article class="sprintmini"><header><b>${esc(s.bn)}</b><span class="hl ${s.health}">${HL[s.health]}</span></header>
+    <div class="muted">${esc(s.n)} · ${s.days.left >= 0 ? s.days.left + " day(s) left" : -s.days.left + " day(s) overdue"} · ${s.w.done}/${s.w.scope} done</div>${burnSvg(s.burn)}
+    <div class="bars"><label>Time used ${pc(s.pct.time)}<progress max="100" value="${s.pct.time * 100}"></progress></label><label>Work done ${pc(s.pct.done)}<progress class="${s.pct.done + 0.01 < s.pct.time ? "late" : ""}" max="100" value="${s.pct.done * 100}"></progress></label></div>
+    ${s.risks.length ? `<div class="muted">${esc(s.risks[0].m)}${s.risks.length > 1 ? " +" + (s.risks.length - 1) + " more" : ""}</div>` : ""}<div><button type="button" class="mini" data-board="${s.b}">Open board</button></div></article>`).join("")}</div></div>`;
+}
+function okrRollup(l) {
+  if (!l || !l.length) return "";
+  return `<div class="panel"><h2>Objectives by board</h2><div class="budgets">${l.map(o => `<div class="bud"><span><b>${esc(o.bn)}</b> <span class="muted">${o.n} objective(s)</span></span><div class="bar"><i class="${o.overall < 0.4 ? "bad" : o.overall < 0.7 ? "warn" : ""}" style="width:${Math.round(o.overall * 100)}%"></i></div><b>${pc(o.overall)}</b></div>`).join("")}</div></div>`;
+}
+function slaRollup(l) {
+  if (!l || !l.length) return "";
+  const items = l.flatMap(x => x.items).slice(0, 6), br = l.reduce((a, x) => a + x.breached, 0), ar = l.reduce((a, x) => a + x.at_risk, 0);
+  return `<div class="panel"><h2>Response targets <span class="hl ${br ? "red" : ar ? "amber" : "green"}">${br} breached · ${ar} at risk</span></h2><table class="tb"><tr><th>Board</th><th>Breached</th><th>At risk</th><th>On track</th></tr>${l.map(x => `<tr><td>${esc(x.bn)}</td><td class="num">${x.breached ? `<b style="color:var(--bad)">${x.breached}</b>` : 0}</td><td class="num">${x.at_risk}</td><td class="num">${x.ok}</td></tr>`).join("")}</table>
+    ${items.map(it => `<div class="coord"><div><button type="button" class="link" data-open="${it.id}"><span class="mono">#${it.id}</span></button> ${esc(it.t)}<div class="muted">${esc(it.bn)} · P${it.pr} · open ${hrs(it.age_h)} of ${it.sla_h}h target${it.as ? " · " + esc(it.as) : ""}</div></div><span class="badge red">late</span></div>`).join("")}</div>`;
+}
+function envPanel(envs) {
+  if (!envs || !envs.length) return "";
+  return `<div class="panel"><h2>Environments</h2><table class="tb"><tr><th>Env</th><th>Deployed</th><th>By</th><th>When</th></tr>${envs.map(e => `<tr><td><b>${esc(e.n)}</b>${e.frozen ? ` <span class="badge red">Frozen until ${esc(e.frozen.slice(5, 16))} UTC</span>` : ""}</td><td class="num">${esc((e.sha || "").slice(0, 8) || "—")}</td><td>${esc(e.by || "")}</td><td>${e.at ? esc(ago(e.at)) + " ago" : ""}</td></tr>`).join("")}</table></div>`;
+}
 async function renderOverviewMulti(d) {
   const el = $("v-overview"), t = d.totals || {}, bs = d.boards || [];
-  let cost = null; try { cost = await api("GET", "/cost" + (B.scopeTeam ? "?tm=" + encodeURIComponent(B.scopeTeam) : "")); } catch (_) {}
+  const qs0 = B.scopeTeam ? "?tm=" + encodeURIComponent(B.scopeTeam) : "", soft = p => p.catch(() => null);
+  const [cost, an, envr] = await Promise.all([soft(api("GET", "/cost" + qs0)), soft(api("GET", "/overview" + qs0)), soft(api("GET", "/envs"))]);
+  const astat = {}; ((an && an.agents && an.agents.i) || []).forEach(x => { astat[x.as] = x; });
+  const fl = an && an.flow, flowOn = fl && (fl.done_n || fl.wip.in_progress || fl.wip.review);
   if (view !== "overview") return;
   const nudged = bs.reduce((a, b) => a + (b.nu || []).length, 0);
   const rows = bs.map(b => { const by = b.by || {}, open = sum(by) - (by.done || 0) - (by.declined || 0), sp = b.sp, m = MET[b.mt] || {};
     return `<tr><td><b>${esc(b.n)}</b>${b.tm ? ` <span class="muted">${esc(b.tm)}</span>` : ""}</td><td>${esc(m.name || b.mt)}</td><td class="num">${open}</td><td class="num">${by.in_progress || 0}</td><td class="num">${by.blocked ? `<b style="color:var(--bad)">${by.blocked}</b>` : 0}</td>
       <td>${sp ? `<span class="hl ${sp.hl}">${esc(HL[sp.hl] || sp.hl)}</span> <span class="muted">${esc(sp.n)} · ${sp.p[0]}/${sp.p[1]}</span>` : (b.fl ? `<span class="muted">${b.fl.over.length ? "over WIP: " + esc(b.fl.over.join(", ")) : "flow ok"} · ${b.fl.done14} done in 14d</span>` : '<span class="muted">—</span>')}</td>
       <td class="num"><button type="button" class="mini" data-board="${b.id}">Open</button></td></tr>`; }).join("");
-  const agents = (d.agents || []).map(a => `<tr><td>${esc(a.as)}</td><td class="num">${a.by.in_progress || 0}</td><td class="num">${a.by.todo || 0}</td><td class="num">${a.by.review || 0}</td><td class="num">${a.by.blocked || 0}</td><td class="num">${a.inbox ? `<b>${a.inbox}</b>` : 0}</td></tr>`).join("");
+  const agents = (d.agents || []).map(a => `<tr><td>${esc(a.as)}</td><td class="num">${a.by.in_progress || 0}</td><td class="num">${a.by.todo || 0}</td><td class="num">${a.by.review || 0}</td><td class="num">${a.by.blocked || 0}</td><td class="num">${a.inbox ? `<b>${a.inbox}</b>` : 0}</td><td class="num">${(astat[a.as] || {}).done ?? 0}</td><td class="num">${(astat[a.as] || {}).cycle_h != null ? astat[a.as].cycle_h + "h" : "—"}</td><td class="num">${(astat[a.as] || {}).decline_rate != null ? Math.round(astat[a.as].decline_rate * 100) + "%" : "—"}</td></tr>`).join("");
   const att = (d.attention || []).length ? `<div class="panel"><h2>Needs attention</h2><ul class="risks">${d.attention.map(r => `<li class="rk ${r.sev}"><span class="sev">${r.sev}</span><span>${esc(r.m)}${r.ids.length ? ` <span class="muted">${r.ids.slice(0, 8).map(i => "#" + i).join(" ")}</span>` : ""}</span></li>`).join("")}</ul></div>` : "";
   el.innerHTML = `<div class="pad"><p class="muted lead">${esc(B.name)} — ${t.boards || 0} board(s) combined. Pick a single board in the menu to work on it.</p>
     <div class="tiles"><div class="tile"><div class="n">${t.open || 0}</div><div class="l">Open tasks</div></div><div class="tile"><div class="n">${t.in_progress || 0}</div><div class="l">In progress</div></div><div class="tile"><div class="n">${t.review || 0}</div><div class="l">In review</div></div><div class="tile ${t.blocked ? "bad" : ""}"><div class="n">${t.blocked || 0}</div><div class="l">Blocked</div></div><div class="tile ${nudged ? "warn" : ""}"><div class="n">${nudged}</div><div class="l">Stale</div></div><div class="tile ${t.red_sprints ? "bad" : "ok"}"><div class="n">${t.red_sprints || 0}</div><div class="l">Sprints at risk</div></div></div>
     ${att}
     <div class="panel"><h2>Boards</h2><table class="tb"><tr><th>Board</th><th>Method</th><th>Open</th><th>Doing</th><th>Blocked</th><th>Sprint / flow</th><th></th></tr>${rows}</table></div>
+    ${an ? sprintsPanel(an.sprints) : ""}
+    ${flowOn ? flowPanel(fl) : ""}
+    ${an ? okrRollup(an.okr) : ""}
+    ${an ? slaRollup(an.sla) : ""}
     ${costPanel(cost)}
-    <div class="panel"><h2>Agent workload across these boards</h2>${agents ? `<table class="tb"><tr><th>Agent</th><th>Doing</th><th>To do</th><th>Review</th><th>Blocked</th><th>Inbox</th></tr>${agents}</table>` : '<span class="muted">No assigned work.</span>'}</div></div>`;
+    ${envPanel(envr && envr.i)}
+    <div class="panel"><h2>Agent workload across these boards</h2>${agents ? `<table class="tb"><tr><th>Agent</th><th>Doing</th><th>To do</th><th>Review</th><th>Blocked</th><th>Inbox</th><th>Done ${an ? an.days : 30}d</th><th>Cycle</th><th>Decl.</th></tr>${agents}</table>` : '<span class="muted">No assigned work.</span>'}</div></div>`;
 }
 
 async function renderOverview() {

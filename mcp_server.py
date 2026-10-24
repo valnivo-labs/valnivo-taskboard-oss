@@ -228,6 +228,8 @@ TOOLS = {
                lambda a: api("POST", f"/tasks/{a['id']}/finish", {k: v for k, v in idn(a).items() if k != 'id'})),
     "cost": ("Log what work cost: in/out tokens and usd (or only model: priced from the admin price table), optional task id and note. Task, board and monthly budgets warn the supervisor. finish takes the same as cost={...}.",
              S(task=i, usd={"type": "number"}, model=s, note=s, **{"in": i, "out": i, "as": s}), lambda a: api("POST", "/cost", idn(a))),
+    "overview": ("Single-board analytics rolled up over several boards: flow (throughput, cycle time, cumulative flow, aging), active sprints with burndown and risks, OKR and SLA per board, agent stats. Scope b|tm|bs, days.",
+                 S(days=i, b=i, tm=s, bs=s), lambda a: api("GET", "/overview" + qs(a, ["days", "b", "tm", "bs"]))),
     "cost_report": ("Spend per agent, task, board and day, plus monthly budget use. days (default 30), b|tm|bs scope, as=agent.",
                     S(days=i, b=i, tm=s, bs=s, **{"as": s}), lambda a: api("GET", "/cost" + qs(a, ["days", "b", "tm", "bs", "as"]))),
     "links": ("A task's dependencies (dp) and the open tasks waiting on it (bl), across boards: each has board name bn and x=true when it is on another board.",

@@ -177,6 +177,21 @@ def test_admin_chat_channel_and_git_secret(page):
     assert len(page.input_value("#gsec")) >= 20
 
 
+def test_all_boards_overview_has_the_analytics(page):
+    a, _ = mkboard("Roll A %d" % time.time())
+    b, _ = mkboard("Roll B %d" % time.time())
+    for bid in (a, b):
+        t = mktask(bid, "finished work", st="in_progress")
+        api("PATCH", "/tasks/%d" % t, {"st": "done"})
+    mktask(a, "open and assigned", st="in_progress", **{"as": "Roller"})              # the agent table lists agents with open work
+    goto(page, view="overview", scope="all")
+    page.wait_for_selector("#v-overview h2:has-text('Active sprints')")
+    assert page.locator(".sprintmini").count() >= 2                                 # one card per active sprint, with its burndown
+    assert page.locator(".sprintmini svg.burn").count() >= 2
+    assert page.locator("#v-overview h2:has-text('Flow')").count() == 1             # flow rolled up across the boards
+    page.wait_for_selector("#v-overview th:has-text('Done 30d')")
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

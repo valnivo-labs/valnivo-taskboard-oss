@@ -334,3 +334,7 @@ button.link.lk small{color:var(--mut)}button.link.lk.done{opacity:.6;text-decora
 .bar i.warn{background:var(--warn)}
 .spark{display:flex;align-items:flex-end;gap:3px;height:54px;margin-top:12px}.spark i{flex:1;min-width:4px;background:var(--pri);opacity:.75;border-radius:3px 3px 0 0}
 @media (max-width:640px){.evgrid{grid-template-columns:1fr}.bud{grid-template-columns:1fr}}
+
+.sprintgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
+.sprintmini{border:1px solid var(--bd2);border-radius:12px;padding:12px;display:grid;gap:8px;background:var(--surface)}
+.sprintmini header{display:flex;justify-content:space-between;align-items:center;gap:8px}

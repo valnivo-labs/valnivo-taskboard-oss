@@ -7,6 +7,7 @@
 - Chat channels for humans: Slack, Discord, Teams, Telegram or generic JSON for blocked, done, escalations, sprints, budgets and git events.
 - Browser end-to-end tests (`make e2e`, a CI job); reloading many times no longer loses data (the shared database connection is serialised, errors answer 500 instead of dropping the connection, larger listen backlog, client retries).
 ## Unreleased
+- The all-boards overview now carries the single-board analytics: flow (throughput, cycle time, cumulative flow, aging), active sprints with burndown and risks, OKR and SLA per board, environments and agent stats. `GET /overview` and the `overview` MCP tool.
 - Move a task (and an epic with its children) to another board: task dialog Board field, `POST /tasks/{id}/move`, MCP `move_task`. Raw `board_id` changes via PATCH are refused.
 - Token savings for agents: MCP tool profiles (default ~1.4k tokens instead of ~7.2k) with `help` and `tb`; one-call `briefing` (delta cursor), `next`, `finish` and `batch`; actionable, coalesced and mutable notifications; `fields`/table/`brief` reads and spec outline/section; role guides; a per-agent token usage meter.
 - Six more ways of working: waterfall stage-gates (phases with gates), lean startup, OKRs (objectives, key results, progress roll-up), a priority matrix (Eisenhower), a support desk with SLAs and escalation, and a personal GTD list.

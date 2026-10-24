@@ -2961,7 +2961,7 @@ def _pct(vals, p):
     return round(v[min(len(v) - 1, int(round(p * (len(v) - 1))))], 1)
 
 
-def board_flow(bid, days=30):
+def board_flow(bid, days=30, raw=False):
     now = _datetime.datetime.now(_datetime.timezone.utc).replace(tzinfo=None)
     cut = now - _datetime.timedelta(days=days)
     ts = rows("SELECT id, title, status, created, assignee, priority FROM tasks WHERE board_id=?", (bid,))
@@ -3006,7 +3006,43 @@ def board_flow(bid, days=30):
     return {"b": bid, "mt": m, "days": days, "wip": wip, "limits": limits, "over": [k for k, n in limits.items() if wip.get(k, 0) > n],
             "done_n": len(comp), "per_week": weeks, "cycle_h": {"avg": round(sum(cyc) / len(cyc), 1) if cyc else None, "p50": _pct(cyc, 0.5), "p85": _pct(cyc, 0.85)},
             "lead_h": {"avg": round(sum(lead) / len(lead), 1) if lead else None, "p50": _pct(lead, 0.5), "p85": _pct(lead, 0.85)},
-            "aging": aging[:10], "stuck": [a["id"] for a in aging if a["stuck"]], "cfd": cfd}
+            "aging": aging[:10], "stuck": [a["id"] for a in aging if a["stuck"]], "cfd": cfd, **({"_cyc": cyc, "_lead": lead} if raw else {})}
+
+
+def scope_analytics(q):
+    """The single-board analytics, rolled up over the boards in scope (bs=, tm=, none = all): flow, active sprints, OKR, SLA, agent stats."""
+    days = max(1, min(qint(q, "days", 30) or 30, 365))
+    scope = scope_of(q)
+    fr, fp = _in("id", scope)
+    bs = rows("SELECT id, name, method FROM boards WHERE 1=1" + fr + " ORDER BY id", fp)
+    out = {"days": days, "boards": len(bs)}
+    fl = [board_flow(b["id"], days, raw=True) for b in bs]
+    if fl:
+        cyc, lead = [x for f in fl for x in f["_cyc"]], [x for f in fl for x in f["_lead"]]
+        avg = lambda l: round(sum(l) / len(l), 1) if l else None
+        names = {b["id"]: b["name"] for b in bs}
+        aging = sorted(({**a, "b": f["b"], "bn": names[f["b"]]} for f in fl for a in f["aging"]), key=lambda x: -x["age_h"])[:8]
+        out["flow"] = {"days": days, "wip": {k: sum(f["wip"].get(k, 0) for f in fl) for k in ALL_STATUSES}, "done_n": sum(f["done_n"] for f in fl),
+                       "over": ["%s: %s" % (names[f["b"]], ", ".join(f["over"])) for f in fl if f["over"]],
+                       "per_week": [{"from": fl[0]["per_week"][i]["from"], "n": sum(f["per_week"][i]["n"] for f in fl)} for i in range(len(fl[0]["per_week"]))],
+                       "cycle_h": {"avg": avg(cyc), "p50": _pct(cyc, 0.5), "p85": _pct(cyc, 0.85)}, "lead_h": {"avg": avg(lead), "p50": _pct(lead, 0.5), "p85": _pct(lead, 0.85)},
+                       "aging": aging, "stuck": [i for f in fl for i in f["stuck"]],
+                       "cfd": [{"d": fl[0]["cfd"][i]["d"], **{k: sum(f["cfd"][i][k] for f in fl) for k in ALL_STATUSES}} for i in range(len(fl[0]["cfd"]))]}
+    sps, okr, sla = [], [], []
+    for b in bs:
+        sp = rows("SELECT id FROM sprints WHERE board_id=? AND state='active' ORDER BY id DESC LIMIT 1", (b["id"],))
+        if sp:
+            st = sprint_stats(sp[0]["id"])
+            sps.append({"b": b["id"], "bn": b["name"], **{k: st[k] for k in ("id", "n", "from", "to", "health", "pct", "w", "days", "proj", "burn", "risks")}})
+        mt = METHODS.get(b["method"] or "scrum", {})
+        if mt.get("group") == "okr":
+            o = board_okr(b["id"])
+            okr.append({"b": b["id"], "bn": b["name"], "overall": o["overall"], "n": len(o["i"]), "objectives": [{"id": x["id"], "t": x["t"], "progress": x["progress"]} for x in o["i"][:4]]})
+        if mt.get("sla"):
+            s = board_sla(b["id"])
+            sla.append({"b": b["id"], "bn": b["name"], "breached": len(s["breached"]), "at_risk": len(s["at_risk"]), "ok": s["ok"], "items": [{**x, "bn": b["name"]} for x in s["breached"][:3]]})
+    out.update({"sprints": sps, "okr": okr, "sla": sla, "agents": agent_stats(scope, days)})
+    return out
 
 
 # ---- velocity and retrospectives (scrum, shape up, scrumban)
@@ -4427,6 +4463,8 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, bulk_move(actor, self.read_body()))
             if path == "/api/agents/wake" and method == "POST":
                 return self.send_json(200, wake_now(actor, self.role, self.read_body()))
+            if path == "/api/overview" and method == "GET":
+                return self.send_json(200, scope_analytics(q))
             if path == "/api/briefing" and method == "GET":
                 return self.send_json(200, briefing(actor, q))
             if path == "/api/next" and method == "POST":
