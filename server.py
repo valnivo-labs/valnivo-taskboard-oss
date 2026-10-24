@@ -921,6 +921,9 @@ def crud(actor, method, table, rid, body, q, full):
                 db.execute("DELETE FROM docs WHERE scope=? AND ref_id=?", (sing, rid))
                 if table == "boards":
                     db.execute("DELETE FROM docs WHERE board_id=?", (rid,))
+                    db.execute("DELETE FROM runs WHERE board_id=?", (rid,))
+                if table == "tasks":
+                    db.execute("DELETE FROM runs WHERE task_id=?", (rid,))      # a deleted task leaves no job history behind (spend stays in the cost log)
             emit(actor, f"{sing}.deleted", rid, bid, None)
             return {"deleted": rid} if full else {"id": rid, "x": 1}
     raise ApiError("method", 405)

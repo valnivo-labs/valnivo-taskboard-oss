@@ -1048,3 +1048,10 @@ if hasattr(server, "SEC_HEADERS"):                                              
     assert "img-src 'self' data: https://media.example.com https://cdn.example.org:8443" in csp and "media-src 'self' https://media.example.com" in csp and "script-src 'self';" in csp, csp
     J("POST", "/settings", {"media_hosts": ""})
 print("v20 selftest OK")
+
+# ---- deleting a task or a board takes its runs with it; the money already spent stays counted
+st, dtk = J("POST", "/tasks", {"b": RB, "t": "to be deleted", "as": "Runner One", "st": "todo"}); rr = J("POST", "/runs", {"as": "Runner One", "task": dtk["id"], "runtime": "agent-cli"})[1]
+J("POST", f"/runs/{rr['id']}/end", {"as": "Runner One", "st": "ok", "usd": 0.25}); assert J("GET", f"/runs?task={dtk['id']}")[1]["n"] == 1
+J("DELETE", f"/tasks/{dtk['id']}"); assert J("GET", f"/runs?task={dtk['id']}")[1]["n"] == 0 and J("GET", f"/runs/{rr['id']}")[0] == 404
+assert any(a["n"] == "Runner One" and a["usd"] >= 0.25 for a in J("GET", "/cost")[1]["ag"])
+print("v20 delete cleanup OK")
