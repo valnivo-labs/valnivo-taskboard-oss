@@ -3,12 +3,12 @@
 import json, os, sys, threading, urllib.request, urllib.error
 os.environ.update(TASKBOARD_DB=os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "test.db"),
                   TASKBOARD_TOKENS="a:tok:admin,v:vtok:viewer,Sup Bot:stok:supervisor,Worker:wtok:agent",
-                  TASKBOARD_ALLOW_PRIVATE_WEBHOOKS="1", TASKBOARD_HUMAN_NAMES="Owner", TASKBOARD_HUMAN_RULE="1", TASKBOARD_RATE_PER_MIN="0", TASKBOARD_AUTH_FAILS_PER_MIN="0", PORT="8791")
+                  TASKBOARD_ALLOW_PRIVATE_WEBHOOKS="1", TASKBOARD_HUMAN_NAMES="Owner", TASKBOARD_HUMAN_RULE="1", TASKBOARD_RATE_PER_MIN="0", TASKBOARD_AUTH_FAILS_PER_MIN="0", PORT="8781")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import server
-srv = server.S(("127.0.0.1", 8791), server.H)
+srv = server.S(("127.0.0.1", 8781), server.H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
-U = "http://127.0.0.1:8791/api"
+U = "http://127.0.0.1:8781/api"
 
 
 def call(m, p, b=None, h=None, tok="tok"):
@@ -70,7 +70,7 @@ class Hook(http.server.BaseHTTPRequestHandler):
         got.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
         self.send_response(200); self.end_headers()
     def log_message(self, *a): pass
-hs = http.server.ThreadingHTTPServer(("127.0.0.1", 8792), Hook)
+hs = http.server.ThreadingHTTPServer(("127.0.0.1", 8782), Hook)
 threading.Thread(target=hs.serve_forever, daemon=True).start()
 
 st, sp = J("POST", "/sprints", {"b": BID, "st": "active"})            # name/dates default
@@ -79,7 +79,7 @@ st, t = J("POST", "/tasks", {"b": BID, "t": "notify me", "ch": "Valnivo", "as": 
 assert t["s"] == sp["id"], t                                          # joined active sprint
 st, ib = J("GET", "/inbox?as=agent%20x")
 assert ib["n"] == 1 and ib["i"][0]["ty"] == "task.assigned", ib
-call("POST", "/agents", {"n": "Agent X", "hook": "http://127.0.0.1:8792/h", "secret": "s"})
+call("POST", "/agents", {"n": "Agent X", "hook": "http://127.0.0.1:8782/h", "secret": "s"})
 J("PATCH", f"/tasks/{t['id']}", {"st": "in_progress"})
 J("POST", f"/tasks/{t['id']}/comments", {"c": "please hurry", "to": ["Agent Y"]})
 st, ib = J("GET", "/inbox?as=Agent%20X&ack=1")
@@ -615,7 +615,7 @@ class Sink(http.server.BaseHTTPRequestHandler):
         sink.append({"path": self.path, "h": dict(self.headers), "b": json.loads(raw), "raw": raw})
         self.send_response(200); self.end_headers()
     def log_message(self, *a): pass
-sk = http.server.ThreadingHTTPServer(("127.0.0.1", 8793), Sink); threading.Thread(target=sk.serve_forever, daemon=True).start()
+sk = http.server.ThreadingHTTPServer(("127.0.0.1", 8783), Sink); threading.Thread(target=sk.serve_forever, daemon=True).start()
 def waitfor(fn, n=60):
     for _ in range(n):
         r = fn()
@@ -690,16 +690,20 @@ assert J("GET", f"/tasks/{ct2['id']}")[1]["cs"] == 0.01
 print("v14 cost OK")
 
 # ---- wake-ups and heartbeat renewal
-J("POST", "/agents", {"n": "Sleeper", "hook": "http://127.0.0.1:8793/wake", "secret": "ws"})
+J("POST", "/agents", {"n": "Sleeper", "hook": "http://127.0.0.1:8783/wake", "secret": "ws"})
 st, wt = J("POST", "/tasks", {"b": GB, "t": "wake me", "as": "Sleeper", "st": "todo"})
 server.db.execute("UPDATE agents SET last_seen=? WHERE name='Sleeper'", ("2000-01-01 00:00:00",)); sink.clear()
 J("POST", "/settings", {"wake_after_min": "5"})
+_time.sleep(0.5); assert server.wake_tick() == 0                                                                             # its item was already pushed to the hook: no wake ping on top
+server.db.execute("UPDATE notifications SET hook='failed' WHERE agent='Sleeper'")                                            # push never arrived: now there is something to wake it for
 assert server.wake_tick() >= 1
 w = waitfor(lambda: [x for x in sink if x["path"] == "/wake" and "wake" in x["b"]]); assert w and w[0]["b"]["wake"]["ready"] >= 1 and w[0]["b"]["agent"] == "Sleeper", sink
 assert w[0]["h"].get("X-Taskboard-Signature", "").startswith("sha256=") and _hmac.new(b"ws", w[0]["raw"], hashlib.sha256).hexdigest() in w[0]["h"]["X-Taskboard-Signature"]
 assert server.wake_tick() == 0                                                                                               # cooldown: no repeat right away
+server.db.execute("UPDATE agents SET wake_at=? WHERE name='Sleeper'", ("2000-01-01 00:00:00",)); assert server.wake_tick() == 0   # same unread item: never woken twice
 J("GET", "/inbox?as=Sup%20Bot&ack=1")
-for _ in range(2):                                                                                                           # unanswered pings back off, the third tells the supervisor
+for _ in range(2):                                                                                                           # unanswered pings back off, the third tells the supervisor (each needs a new unread item)
+    J("POST", "/tasks", {"b": GB, "t": "wake again", "as": "Sleeper", "st": "todo"}); _time.sleep(0.5); server.db.execute("UPDATE notifications SET hook='failed' WHERE agent='Sleeper' AND woken=0")
     server.db.execute("UPDATE agents SET wake_at=? WHERE name='Sleeper'", ("2000-01-01 00:00:00",)); server.wake_tick()
 assert any(n["ty"] == "esc.unreachable" for n in J("GET", "/inbox?as=Sup%20Bot&ack=1")[1]["i"])
 J("POST", "/presence", {"as": "Sleeper", "status": "back"}); assert server.db.execute("SELECT wake_n FROM agents WHERE name='Sleeper'").fetchone()[0] == 0   # answering resets it
@@ -727,15 +731,15 @@ print("v14 bulk + links OK")
 
 # ---- chat channels
 assert J("GET", "/chats", tok="wtok")[0] == 403 and J("POST", "/chats", {"n": "x"}, tok="stok")[0] == 403
-assert J("POST", "/chats", {"n": "bad kind", "kind": "irc", "url": "http://127.0.0.1:8793/c"})[1]["e"] == "bad" and J("POST", "/chats", {"n": "tg", "kind": "telegram", "url": "http://127.0.0.1:8793/c"})[1]["e"] == "missing"
-assert J("POST", "/chats", {"n": "bad ev", "url": "http://127.0.0.1:8793/c", "events": ["nope"]})[1]["e"] == "bad"
+assert J("POST", "/chats", {"n": "bad kind", "kind": "irc", "url": "http://127.0.0.1:8783/c"})[1]["e"] == "bad" and J("POST", "/chats", {"n": "tg", "kind": "telegram", "url": "http://127.0.0.1:8783/c"})[1]["e"] == "missing"
+assert J("POST", "/chats", {"n": "bad ev", "url": "http://127.0.0.1:8783/c", "events": ["nope"]})[1]["e"] == "bad"
 sink.clear()
-ch1 = J("POST", "/chats", {"n": "Ops", "kind": "slack", "url": "http://127.0.0.1:8793/slack", "events": ["blocked", "done"], "minpr": 2})[1]
+ch1 = J("POST", "/chats", {"n": "Ops", "kind": "slack", "url": "http://127.0.0.1:8783/slack", "events": ["blocked", "done"], "minpr": 2})[1]
 assert ch1["n"] == "Ops" and "url" not in ch1 and ch1["host"] == "127.0.0.1" and ch1["ev"] == ["blocked", "done"], ch1                   # the URL is a secret: never echoed back
-ch2 = J("POST", "/chats", {"n": "Discord", "kind": "discord", "url": "http://127.0.0.1:8793/discord", "events": ["blocked"]})[1]
+ch2 = J("POST", "/chats", {"n": "Discord", "kind": "discord", "url": "http://127.0.0.1:8783/discord", "events": ["blocked"]})[1]
 ch3 = J("POST", "/chats", {"n": "Telegram", "kind": "telegram", "token": "123:ABC", "target": "-100"})[1]
 assert server.rows("SELECT url FROM chats WHERE id=?", (ch3["id"],))[0]["url"] == "https://api.telegram.org/bot123:ABC/sendMessage"          # built from the bot token
-server.db.execute("UPDATE chats SET url=? WHERE id=?", ("http://127.0.0.1:8793/tg", ch3["id"]))                                              # never call the real service from a test
+server.db.execute("UPDATE chats SET url=? WHERE id=?", ("http://127.0.0.1:8783/tg", ch3["id"]))                                              # never call the real service from a test
 assert J("POST", f"/chats/{ch2['id']}/test", {})[1]["ok"] is True and waitfor(lambda: [x for x in sink if x["path"] == "/discord"])
 st, ctk = J("POST", "/tasks", {"b": GB, "t": "chat me", "pr": 1, "as": "Coder", "st": "in_progress"}); sink.clear()
 J("PATCH", f"/tasks/{ctk['id']}", {"st": "blocked", "bl": "waiting on legal"})
@@ -755,7 +759,7 @@ print("v14 selftest OK")
 
 # ---- runner: claims a task, runs the command, reports
 import runner
-cfgr = dict(url="http://127.0.0.1:8791", token="wtok", agent="Worker", labels="runner-test", ttl=30, beat=0.3, timeout=30)
+cfgr = dict(url="http://127.0.0.1:8781", token="wtok", agent="Worker", labels="runner-test", ttl=30, beat=0.3, timeout=30)
 out_f = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "runner.out")
 st, rt1 = J("POST", "/tasks", {"b": GB, "t": "run me", "pr": 1, "st": "todo", "lb": "runner-test"})
 os.environ["OUT"] = out_f
@@ -776,7 +780,7 @@ print("v14 runner OK")
 import subprocess
 def mcp(env_tools, *msgs):
     pr = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True,
-                        env={**os.environ, "TASKBOARD_URL": "http://127.0.0.1:8791", "TASKBOARD_TOKEN": "tok", "TASKBOARD_TOOLS": env_tools}, timeout=60)
+                        env={**os.environ, "TASKBOARD_URL": "http://127.0.0.1:8781", "TASKBOARD_TOKEN": "tok", "TASKBOARD_TOOLS": env_tools}, timeout=60)
     return [json.loads(x) for x in pr.stdout.splitlines() if x.strip()]
 core = mcp("core", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})[0]["result"]["tools"]
 allt = mcp("all", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})[0]["result"]["tools"]
@@ -813,7 +817,7 @@ print("v15 selftest OK")
 def mcp_as(tok, tools, name, args):
     pr = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")],
                         input=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": args}}) + "\n", capture_output=True, text=True,
-                        env={**os.environ, "TASKBOARD_URL": "http://127.0.0.1:8791", "TASKBOARD_TOKEN": tok, "TASKBOARD_TOOLS": tools}, timeout=60)
+                        env={**os.environ, "TASKBOARD_URL": "http://127.0.0.1:8781", "TASKBOARD_TOKEN": tok, "TASKBOARD_TOOLS": tools}, timeout=60)
     return json.loads(json.loads(pr.stdout.splitlines()[0])["result"]["content"][0]["text"])
 names_ = lambda t: {x["name"] for x in mcp(t, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})[0]["result"]["tools"]}
 ADM = {"tokens", "settings", "backups", "export_data", "import_data", "del_board", "del_sprint", "chats", "git_secret", "wake_agent", "usage"}
@@ -906,7 +910,7 @@ assert mcp_as("wtok", "core", "say", {"to": "Sup Bot", "c": "via mcp"})["n"] == 
 assert [m["c"] for m in mcp_as("wtok", "core,coord", "messages", {"with": "Sup Bot", "limit": 5})["i"]][-1] == "via mcp"
 def mcp_session(tok, name, extra_env, msgs, listen=4):
     pr = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
-                          env={**os.environ, "TASKBOARD_URL": "http://127.0.0.1:8791", "TASKBOARD_TOKEN": tok, "TASKBOARD_AGENT": name, "TASKBOARD_TOOLS": "core", **extra_env})
+                          env={**os.environ, "TASKBOARD_URL": "http://127.0.0.1:8781", "TASKBOARD_TOKEN": tok, "TASKBOARD_AGENT": name, "TASKBOARD_TOOLS": "core", **extra_env})
     out = []
     threading.Thread(target=lambda: [out.append(json.loads(l)) for l in pr.stdout if l.strip()], daemon=True).start()
     for m in msgs:
@@ -948,5 +952,35 @@ assert mcp_as("wtok", "all", "export_csv", {})["e"] == "forbidden" and mcp_as("w
 J("POST", "/cost", {"task": ct_["id"], "usd": 0.5, "as": "Csvman"}); assert mcp_as("wtok", "all", "task_cost", {"id": ct_["id"]})["cs"] == 0.5
 assert "set" in mcp_as("wtok", "all", "nudge", {})
 assert "csv_round" not in ""  # noqa
+
+# ---- every action on an agent's work lands in its inbox AND is pushed to its hook at once
+got.clear(); J("POST", "/agents", {"n": "Hooky", "hook": "http://127.0.0.1:8782/h", "secret": "s"}); J("POST", "/agents", {"n": "Peer"})
+st, ht = J("POST", "/tasks", {"b": BID, "t": "wake me", "as": "Hooky", "k": "agent", "st": "todo"}); HT = ht["id"]
+J("PATCH", f"/tasks/{HT}", {"pr": 1}); J("PATCH", f"/tasks/{HT}", {"pr": 2})                     # coalesced into one item, pushed twice
+J("POST", f"/tasks/{HT}/comments", {"c": "ping @Peer please"})
+J("POST", "/messages", {"to": "Hooky", "c": "direct hello"})
+rq = J("POST", f"/tasks/{HT}/review", {"reviewer": "Peer"})[1]
+J("POST", f"/reviews/{rq['id']}/decide", {"decision": "changes", "note": "fix it", "as": "Peer"})
+time.sleep(1.5)
+ty = [g["n"]["ty"] for g in got if g["agent"] == "Hooky"]
+for need in ("task.assigned", "task.updated", "task.comment", "msg.direct", "task.status", "review.changes"):
+    assert need in ty, (need, ty)
+assert ty.count("task.updated") == 2, ty
+assert any(n["ty"] == "task.mention" for n in J("GET", "/inbox?as=Peer")[1]["i"])
+J("POST", "/agents", {"n": "Hooky", "mute": "task.comment"}); got.clear(); J("POST", f"/tasks/{HT}/comments", {"c": "muted"}); time.sleep(0.5)
+assert not [g for g in got if g["agent"] == "Hooky"], got
+print("v19 wake-on-every-action OK")
+# ---- hook pushes only for genuinely new events: the same alert twice -> one push, a new DM -> a push
+got.clear(); J("POST", "/agents", {"n": "Hooky", "mute": ""})
+def _alert(msg):
+    with server.lock: server.notify("Hooky", "sprint.risk", "system", None, BID, msg, {"health": "red"})
+_alert("Sprint 'S' is AT RISK: 2 overdue"); _alert("Sprint 'S' is AT RISK: 2 overdue"); time.sleep(0.8)
+assert len([g for g in got if g["agent"] == "Hooky" and g["n"]["ty"] == "sprint.risk"]) == 1, got           # repeat of an already-pushed alert is not pushed again
+assert len([n for n in J("GET", "/inbox?as=Hooky&all=1&limit=200")[1]["i"] if n["ty"] == "sprint.risk" and "2 overdue" in n["m"]]) == 2   # ...but the inbox still holds both
+_alert("Sprint 'S' is AT RISK: 3 overdue"); time.sleep(0.5)
+assert len([g for g in got if g["agent"] == "Hooky" and g["n"]["ty"] == "sprint.risk"]) == 2, got           # changed alert content is new
+got.clear(); J("POST", "/messages", {"to": "Hooky", "c": "a brand new DM"}); J("POST", "/messages", {"to": "Hooky", "c": "a brand new DM"}); time.sleep(0.8)
+assert len([g for g in got if g["agent"] == "Hooky" and g["n"]["ty"] == "msg.direct"]) == 2, got            # real events always push
+print("hook dedupe OK")
 import runpy; runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_parity.py"))
 print("v18 selftest OK")

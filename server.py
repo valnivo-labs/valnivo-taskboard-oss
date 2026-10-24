@@ -18,7 +18,7 @@ NUDGE_INTERVAL_SEC = int(os.environ.get("TASKBOARD_NUDGE_INTERVAL", "1200"))  # 
 # Agent notifications: who triggers them ("*" = any actor; else comma list of token names, e.g. "human")
 NOTIFY_ACTORS = {x.strip().lower() for x in os.environ.get("TASKBOARD_NOTIFY_ACTORS", "*").split(",") if x.strip()} or {"*"}
 SYSTEM_ACTORS = frozenset({"system", "nudge-cron", "recurring", "git", "cost", "wake"})
-NOTIFY_KEYS = ("status", "assignee", "priority", "title", "description", "blocker", "blocked_by", "sprint_id", "decline_reason")
+NOTIFY_KEYS = ("status", "assignee", "priority", "title", "description", "blocker", "blocked_by", "sprint_id", "decline_reason", "depends", "publish_at")
 inbox_cv = threading.Condition()
 hook_q = queue.Queue()
 MAX_BODY = int(os.environ.get("TASKBOARD_MAX_BODY", str(2 * 1024 * 1024)))          # JSON request bodies
@@ -160,6 +160,10 @@ for _t, _c, _d in (("tasks", "blocker", "TEXT DEFAULT ''"), ("tasks", "blocked_b
                    ("agents", "wake_at", "TEXT DEFAULT ''"), ("agents", "wake_n", "INTEGER DEFAULT 0")):
     if _c not in [r[1] for r in db.execute(f"PRAGMA table_info({_t})")]:
         db.execute(f"ALTER TABLE {_t} ADD COLUMN {_c} {_d}")
+if "woken" not in [r[1] for r in db.execute("PRAGMA table_info(notifications)")]:
+    db.execute("ALTER TABLE notifications ADD COLUMN woken INTEGER DEFAULT 0")
+    db.execute("UPDATE notifications SET woken=1")      # items that predate the marker never trigger a wake ping
+db.execute("CREATE TABLE IF NOT EXISTS hook_sent(agent TEXT COLLATE NOCASE, h TEXT, ts TEXT, PRIMARY KEY(agent, h))")
 
 db.executescript("""
 CREATE TABLE IF NOT EXISTS costs(id INTEGER PRIMARY KEY, ts TEXT DEFAULT CURRENT_TIMESTAMP, agent TEXT NOT NULL COLLATE NOCASE, task_id INTEGER, board_id INTEGER,
@@ -916,7 +920,7 @@ def comment_out(c):
     return {"id": c["id"], "by": c["actor"], "c": c["body"], "ts": c["ts"]}
 
 
-NOTIF_DO = {"msg.direct": "say", "task.assigned": "claim", "task.handoff": "claim", "task.ready": "claim", "task.unblocked": "claim", "claim.expired": "claim", "task.comment": "comment",
+NOTIF_DO = {"msg.direct": "say", "task.assigned": "claim", "task.handoff": "claim", "task.ready": "claim", "task.unblocked": "claim", "claim.expired": "claim", "task.comment": "comment", "task.mention": "comment",
             "ask.new": "answer", "ask.overdue": "answer", "review.requested": "decide_review", "task.nudged": "set_task", "sla.breach": "set_task",
             "review.changes": "set_task", "review.approved": "finish", "ask.answered": "task", "sprint.risk": "risks", "env.frozen": "envs"}
 COALESCE_TYPES = frozenset({"task.updated", "task.status", "task.comment", "watch.task", "task.attachment"})
@@ -955,16 +959,54 @@ def notify(agent, typ, actor, task_id, board_id, summary, delta=None):
         if prev:
             db.execute("UPDATE notifications SET cnt=COALESCE(cnt,1)+1, summary=?, actor=?, payload=? WHERE id=?",
                        (summary[:300], actor, json.dumps(delta, separators=(",", ":")) if delta else "", prev["id"]))
+            with inbox_cv:
+                inbox_cv.notify_all()
+            _push_hook(agent, prev["id"])       # grouped in the inbox, but the agent is still woken now
             return
     cur = db.execute("INSERT INTO notifications(agent,task_id,board_id,type,actor,summary,payload) VALUES(?,?,?,?,?,?,?)",
                      (agent, task_id, board_id, typ, actor, summary[:300], json.dumps(delta, separators=(",", ":")) if delta else ""))
     with inbox_cv:
         inbox_cv.notify_all()
+    _push_hook(agent, cur.lastrowid)
+
+
+# Unchanged alerts (re-raised by the briefing / sweeps) must not wake the agent again: they are pushed once per content hash.
+HOOK_ALERT_TYPES = frozenset({"sprint.risk", "ask.overdue", "claim.expired", "sla.breach", "env.frozen", "task.nudged"})
+HOOK_DEDUP_HOURS = 24
+
+
+def _push_hook(agent, nid):
+    """Genuinely new events are pushed to the agent's webhook at once. An alert whose content was already pushed to this agent
+    (last-pushed marker in hook_sent) is only kept in the inbox, never pushed again."""
     h = db.execute("SELECT webhook, secret FROM agents WHERE name=?", (agent,)).fetchone()
-    if h and h["webhook"]:
-        db.execute("UPDATE notifications SET hook='pending' WHERE id=?", (cur.lastrowid,))
-        hook_q.put((cur.lastrowid, agent, h["webhook"], h["secret"]))
-        ensure_hook_thread()
+    if not (h and h["webhook"]):
+        return
+    n = db.execute("SELECT type, task_id, board_id, summary, payload FROM notifications WHERE id=?", (nid,)).fetchone()
+    if n and (n["type"] in HOOK_ALERT_TYPES or n["type"].startswith("esc.")):
+        key = hashlib.sha1("|".join(str(n[k]) for k in ("type", "task_id", "board_id", "summary", "payload")).encode()).hexdigest()
+        seen = db.execute("SELECT ts FROM hook_sent WHERE agent=? AND h=?", (agent, key)).fetchone()
+        if seen and seen["ts"] > plus_min(-HOOK_DEDUP_HOURS * 60):
+            db.execute("UPDATE notifications SET hook='dedup' WHERE id=?", (nid,))
+            return
+        db.execute("INSERT OR REPLACE INTO hook_sent(agent, h, ts) VALUES(?,?,?)", (agent, key, now_s()))
+    db.execute("UPDATE notifications SET hook='pending' WHERE id=?", (nid,))
+    hook_q.put((nid, agent, h["webhook"], h["secret"]))
+    ensure_hook_thread()
+
+
+
+
+def _mentions(text):
+    """@Name or @"Two Words" style mentions that match a known agent (case-insensitive)."""
+    names = {r["name"].lower(): r["name"] for r in rows("SELECT name FROM agents")}
+    out = []
+    for m in re.finditer(r'@"([^"]{1,60})"|@([A-Za-z0-9_.-]+(?: [A-Za-z0-9_.-]+)?)', text or ""):
+        raw = m.group(1) or m.group(2)
+        for cand in (raw, raw.split(" ")[0]):
+            if cand.lower() in names:
+                out.append(names[cand.lower()])
+                break
+    return list(dict.fromkeys(out))
 
 
 def notify_task(actor, old, new):
@@ -999,6 +1041,8 @@ def _notify_task_core(actor, old, new):
             what.append("description edited")
         elif k == "assignee":
             what.append("assignee %s->%s" % (a or "-", b or "-"))
+        else:
+            what.append("%s changed" % short.get(k, k))
     what = ", ".join(what)
     if "assignee" in ch:
         a, b = ch["assignee"]
@@ -1155,8 +1199,13 @@ def comment_add(actor, tid, body, notify_assignee=True):
         emit(actor, "task.commented", tid, t["board_id"], {"cm_id": cur.lastrowid})
         to = body.get("to") or []
         to = [to] if isinstance(to, str) else to
+        told = set()
         for a in {x.strip() for x in ([t["assignee"]] if notify_assignee else []) + list(to) if x and x.strip()}:
             notify(a, "task.comment", actor, tid, t["board_id"], "#%d '%s' comment by %s: %s" % (tid, t["title"][:60], actor, text[:140]))
+            told.add(a.lower())
+        for a in _mentions(text):
+            if a.lower() not in told:
+                notify(a, "task.mention", actor, tid, t["board_id"], "%s mentioned you on #%d '%s': %s" % (actor, tid, t["title"][:60], text[:140]))
     return {"id": cur.lastrowid, "tk": tid}
 
 
@@ -1759,7 +1808,8 @@ def wake_tick(actor="wake"):
     for a in rows("SELECT * FROM agents WHERE webhook!=''"):
         name = a["name"]
         unread, ready = _wake_stats(name)
-        if not (unread or ready):
+        fresh = db.execute("SELECT COUNT(*) FROM notifications WHERE agent=? AND read=0 AND woken=0 AND hook IN ('','failed')", (name,)).fetchone()[0]
+        if not fresh:       # only unread items that were never pushed and never woke the agent; ready tasks alone are not an event
             continue
         if a["last_seen"] and a["last_seen"] > plus_min(-mins):
             continue
@@ -1767,6 +1817,8 @@ def wake_tick(actor="wake"):
         if a["wake_at"] and a["wake_at"] > plus_min(-mins * (2 ** min(wn, 4))):
             continue
         _wake_send(a, unread, ready)
+        with lock:
+            db.execute("UPDATE notifications SET woken=1 WHERE agent=? AND read=0 AND woken=0 AND hook IN ('','failed')", (name,))
         n += 1
         if wn + 1 >= 3 and get_setting("wake:esc:" + name) != a["wake_at"]:
             with lock:
@@ -2695,6 +2747,8 @@ def review_request(actor, tid, body):
         if t["status"] in ("backlog", "todo", "in_progress", "blocked"):
             db.execute("UPDATE tasks SET status='review', updated=CURRENT_TIMESTAMP, version=COALESCE(version,1)+1 WHERE id=?", (tid,))
             emit(actor, "task.updated", tid, t["board_id"], {"st": "review"})
+        if t["assignee"] and t["assignee"].lower() not in (me.lower(), rv.lower()):
+            notify(t["assignee"], "task.status", me, tid, t["board_id"], "#%d '%s' sent to review (%s) by %s" % (tid, t["title"][:60], rv, me), {"st": "review"})
         notify(rv, "review.requested", me, tid, t["board_id"], "%s asks you to review #%d '%s'%s" % (me, tid, t["title"][:60], ": " + body["note"][:140] if body.get("note") else ""), {"review": rid})
         return review_out(rows("SELECT * FROM reviews WHERE id=?", (rid,))[0])
 
@@ -2727,6 +2781,8 @@ def review_decide(actor, role, rid, body):
         msg = ("%s approved #%d '%s'%s" % (me, t["id"], t["title"][:60], " - all reviews approved" if not pend else "")) if st == "approved" else \
               ("%s requested changes on #%d '%s': %s" % (me, t["id"], t["title"][:60], note[:160]))
         notify(r["requester"], "review." + st, me, t["id"], t["board_id"], msg, {"review": rid})
+        if t["assignee"] and t["assignee"].lower() != (r["requester"] or "").lower():
+            notify(t["assignee"], "review." + st, me, t["id"], t["board_id"], msg, {"review": rid})
     return {"id": rid, "st": st}
 
 
