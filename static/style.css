@@ -278,7 +278,7 @@ button.link{height:auto;padding:0;border:0;background:none;color:var(--pri);font
 /* methodologies */
 .methods{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px}
 .mcard{position:relative;display:flex!important;flex-direction:column;gap:3px;border:1.5px solid var(--bd);border-radius:12px;padding:10px 12px 10px 34px;cursor:pointer;color:var(--fg)!important}
-.mcard input{position:absolute;left:12px;top:13px;width:auto!important;min-height:0!important;accent-color:var(--pri)}
+.mcard input{position:absolute;left:12px;top:13px}
 .mcard b{font-weight:600}.mcard span{font-weight:400;font-size:12px;color:var(--mut)}
 .mcard:has(input:checked){border-color:var(--pri);background:var(--tint)}
 fieldset.fs{border:1px solid var(--bd2);border-radius:12px;padding:10px 14px 14px;display:flex;flex-direction:column;gap:12px;margin:0}fieldset.fs legend{font-weight:500;font-size:13px;padding:0 6px}
@@ -437,3 +437,19 @@ dialog#dlg.drawer::backdrop{background:rgba(20,40,44,.28)}
 .fapre{display:block;width:100%;margin:6px 0}
 .nowrap{white-space:nowrap}
 .admbody[data-cur=audit]>[data-sec=audit]{display:block}
+
+/* checkboxes, radios and dropdowns: one look everywhere (dialogs included) */
+input[type=checkbox],input[type=radio],dialog input[type=checkbox],dialog input[type=radio],label.chk input{-webkit-appearance:none;appearance:none;flex:none;width:18px;height:18px;min-height:0;padding:0;margin:0;border:1.5px solid var(--mut);border-radius:5px;background:var(--surface) center/12px 12px no-repeat;cursor:pointer;transition:background-color .12s,border-color .12s,box-shadow .12s;vertical-align:middle}
+input[type=radio],dialog input[type=radio]{border-radius:50%}
+input[type=checkbox]:hover,input[type=radio]:hover{border-color:var(--pri)}
+input[type=checkbox]:checked,input[type=radio]:checked{background-color:var(--pri);border-color:var(--pri)}
+input[type=checkbox]:checked{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.5l3 3 6-7' fill='none' stroke='%23fff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")}
+input[type=radio]:checked{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='3.2' fill='%23fff'/%3E%3C/svg%3E")}
+:root[data-theme=dark] input[type=checkbox]:checked{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.5l3 3 6-7' fill='none' stroke='%2305282d' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")}
+:root[data-theme=dark] input[type=radio]:checked{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='3.2' fill='%2305282d'/%3E%3C/svg%3E")}
+input[type=checkbox]:focus-visible,input[type=radio]:focus-visible{outline:none;box-shadow:0 0 0 3px color-mix(in srgb,var(--pri) 35%,transparent)}
+input[type=checkbox]:disabled,input[type=radio]:disabled{opacity:.45;cursor:not-allowed}
+label.chk{cursor:pointer;line-height:1.35}
+dialog select{background-color:var(--surface);background-image:var(--arrow);background-repeat:no-repeat;background-position:right 12px center;background-size:12px 8px;padding-right:34px}
+select:hover{border-color:var(--pri)}
+select option:checked{background:var(--tint);color:var(--fg)}
