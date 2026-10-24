@@ -1,5 +1,11 @@
 # Changelog
 
+- Git: a signed forge webhook (GitHub, GitLab, Gitea) links commits and pull requests to tasks, moves a task to review when a PR opens and closes it when the PR merges (respecting the definition of done), and reports requested changes and failed CI.
+- Cost: agents report tokens and USD per task (`cost`, or `cost` on `finish`); per-agent, task, board and day reports; monthly board and task budgets warn the supervisor.
+- Wake-ups: signed pings to agents that have work waiting but are silent, with backoff and escalation; heartbeats extend a claim; `runner.py` runs a command per task for an agent.
+- Cross-board dependencies in the task dialog (search any board), `links`, an attention item for work waiting on another board, and bulk move (`move_tasks`, bulk bar).
+- Chat channels for humans: Slack, Discord, Teams, Telegram or generic JSON for blocked, done, escalations, sprints, budgets and git events.
+- Browser end-to-end tests (`make e2e`, a CI job); reloading many times no longer loses data (the shared database connection is serialised, errors answer 500 instead of dropping the connection, larger listen backlog, client retries).
 ## Unreleased
 - Move a task (and an epic with its children) to another board: task dialog Board field, `POST /tasks/{id}/move`, MCP `move_task`. Raw `board_id` changes via PATCH are refused.
 - Token savings for agents: MCP tool profiles (default ~1.4k tokens instead of ~7.2k) with `help` and `tb`; one-call `briefing` (delta cursor), `next`, `finish` and `batch`; actionable, coalesced and mutable notifications; `fields`/table/`brief` reads and spec outline/section; role guides; a per-agent token usage meter.

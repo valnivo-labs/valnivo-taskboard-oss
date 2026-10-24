@@ -41,6 +41,15 @@ assert call("POST", "/api/agents", {"n": "A", "hook": "http://10.0.0.5/x"}, tok)
 assert json.loads(call("POST", "/api/agents", {"n": "A", "hook": "file:///etc/passwd"}, tok)[2])["e"] == "bad"
 assert json.loads(call("POST", "/api/settings", {"digest_url": "http://localhost/x"}, tok)[2])["e"] == "private_url"
 assert call("POST", "/api/agents", {"n": "A"}, tok)[0] == 200                                   # no hook is fine
+# 4b. chat channels use the same guard; the forge webhook is closed until a secret exists and rejects bad signatures
+assert call("POST", "/api/chats", {"n": "c", "kind": "slack", "url": "http://127.0.0.1:9/h"}, tok)[2].find("private_url") > 0
+assert call("POST", "/api/chats", {"n": "c", "kind": "slack", "url": "http://169.254.169.254/x"}, tok)[2].find("private_url") > 0
+assert call("POST", "/api/settings", {"base_url": "http://192.168.1.5:8790"}, tok)[0] == 200                      # a link for humans, never requested
+assert call("POST", "/api/hooks/git", {"commits": []})[0] == 404
+sec = json.loads(call("POST", "/api/admin/git-secret", {}, tok)[2])["secret"]
+assert call("POST", "/api/hooks/git", {"commits": []}, hdr={"X-Hub-Signature-256": "sha256=" + "0" * 64, "X-GitHub-Event": "push"})[0] == 401
+assert call("POST", "/api/hooks/git", {"commits": []}, hdr={"X-Gitlab-Token": "wrong", "X-Gitlab-Event": "Push Hook"})[0] == 401
+server._rl.clear()
 # 5. request size cap
 assert call("POST", "/api/boards", raw=b'{"n":"' + b"x" * 5000 + b'"}', tok=tok)[0] == 413
 server._rl.clear()

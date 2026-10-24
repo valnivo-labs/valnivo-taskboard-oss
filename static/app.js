@@ -9,7 +9,7 @@ const lbShow = l => LB_DISP[l] || l;
 const BASE = (location.pathname.match(/^(\/taskboard(?=\/|$))/) || ["", ""])[1];
 // short event keys -> full task/sprint/board fields
 const KM = {
-  task: {b: "board_id", s: "sprint_id", t: "title", d: "description", st: "status", pr: "priority", as: "assignee", k: "kind", u: "updated", bl: "blocker", bb: "blocked_by", lb: "labels", ch: "channel", w: "watch", sh: "short_url", vid: "video_id", at: "publish_at", pu: "pr_url", sha: "sha", cm: "commits", dp: "depends", pt: "points", cb: "claimed_by", cu: "claim_until", v: "version", dn: "dod_done", ty: "type", pa: "parent", tg: "target", cr: "current"},
+  task: {cs: "cost", tk: "tokens", b: "board_id", s: "sprint_id", t: "title", d: "description", st: "status", pr: "priority", as: "assignee", k: "kind", u: "updated", bl: "blocker", bb: "blocked_by", lb: "labels", ch: "channel", w: "watch", sh: "short_url", vid: "video_id", at: "publish_at", pu: "pr_url", sha: "sha", cm: "commits", dp: "depends", pt: "points", cb: "claimed_by", cu: "claim_until", v: "version", dn: "dod_done", ty: "type", pa: "parent", tg: "target", cr: "current"},
   sprint: {b: "board_id", n: "name", g: "goal", from: "start", to: "end", st: "state"},
   board: {n: "name", d: "description", tm: "team"},
 };
@@ -197,6 +197,7 @@ function card(t) {
     meta.push(`<span class="chip sla ${left < 0 ? "bad" : left < sla * 0.25 ? "warn" : "ok"}" title="Response target ${sla}h">${left < 0 ? "SLA breached " + hrs(-left) : "SLA " + hrs(left) + " left"}</span>`);
   }
   if (t.points) meta.push(`<span class="chip" title="Points">${t.points}pt</span>`);
+  if (t.cost) meta.push(`<span class="chip cost" title="Agent spend on this task">${money(t.cost)}</span>`);
   if (t.claimed_by && (t.claim_until || "") > new Date().toISOString().slice(0, 19).replace("T", " ")) meta.push(`<span class="chip claim" title="Claimed until ${esc(t.claim_until)} UTC">claimed · ${esc(t.claimed_by)}</span>`);
   if (t.nudge || csv(t.labels).map(l => l.toLowerCase()).includes("nudge"))
     meta.push(`<span class="chip nudge" title="Stale — nudged ${esc(t.nudge || "")}">Nudge</span>`);
@@ -459,8 +460,8 @@ async function rawPost(path, text) {
 }
 async function renderAdmin() {
   const el = $("v-admin");
-  let tk, se, bk, tp, us;
-  try { [tk, se, bk, tp, us] = await Promise.all([api("GET", "/tokens"), api("GET", "/settings"), api("GET", "/admin/backups"), api("GET", "/templates"), api("GET", "/admin/usage")]); }
+  let tk, se, bk, tp, us, ch;
+  try { [tk, se, bk, tp, us, ch] = await Promise.all([api("GET", "/tokens"), api("GET", "/settings"), api("GET", "/admin/backups"), api("GET", "/templates"), api("GET", "/admin/usage"), api("GET", "/chats")]); CHATS = ch.i; }
   catch (_) { el.innerHTML = '<div class="pad"><div class="empty"><b>Admin only</b><br>Your token does not have the admin role.</div></div>'; return; }
   if (view !== "admin") return;
   const last = bk.last;
@@ -474,6 +475,18 @@ async function renderAdmin() {
       <div class="row2"><label>Digest hour (UTC)<input type="number" name="digest_hour" min="0" max="23" value="${esc(se.digest_hour || 7)}"></label><label>Backups to keep<input type="number" name="backup_keep" min="1" max="365" value="${esc(se.backup_keep || 14)}"></label></div>
       <label>Instant alert webhook (sprint turns red)<input name="alert_url" value="${esc(se.alert_url)}" placeholder="https://…"></label>
       <div class="rowbtn"><button class="primary mini" type="submit">Save settings</button><button type="button" class="mini" id="digestnow">Send digest now</button></div></form></div>
+    <div class="panel"><h2>Chat notifications</h2><p class="muted hint">Post to Slack, Discord, Teams or Telegram when something needs a human: a blocked task, a finished one, an escalation, a sprint at risk, a budget warning. Web addresses are secrets and are never shown again.</p>
+      ${ch.i.length ? `<table class="tb"><tr><th>Channel</th><th>Where</th><th>Tells you when</th><th>Last</th><th></th></tr>${ch.i.map(c => `<tr><td><b>${esc(c.n)}</b>${c.on ? "" : ' <span class="muted">(paused)</span>'}${c.b ? ` <span class="muted">${esc((boards.find(x => x.id === c.b) || {}).name || "board " + c.b)}</span>` : ""}${c.minpr < 4 ? ` <span class="muted">P${c.minpr}+</span>` : ""}</td><td>${esc(c.kind)} <span class="muted">${esc(c.host)}</span></td><td class="muted">${c.ev.map(e => esc(e)).join(", ")}</td><td>${c.last ? (c.ok ? esc(ago(c.last.slice(0, 19))) + " ago" : '<span class="hl red">' + esc(c.last.slice(20) || "failed") + "</span>") : '<span class="muted">never</span>'}</td><td class="num"><button type="button" class="mini" data-chat="test:${c.id}">Test</button> <button type="button" class="mini" data-chat="toggle:${c.id}">${c.on ? "Pause" : "Resume"}</button> <button type="button" class="mini danger" data-chat="del:${c.id}">Delete</button></td></tr>`).join("")}</table>` : '<p class="muted">No channels yet.</p>'}
+      <p><button type="button" class="mini primary" id="newchat">+ Add channel</button></p></div>
+    <div class="panel"><h2>Git: pull requests and commits</h2><p class="muted hint">Point a webhook of GitHub, GitLab or Gitea at <code class="k">${esc(location.origin + BASE)}/api/hooks/git</code> (content type JSON, events: pushes, pull requests, reviews, workflow runs). Commits and PRs attach to a task when the message, title or branch names it (<code class="k">#42</code>, <code class="k">task-42-login</code>). A PR opening moves the task to review; merging closes it unless its board's definition of done or an open review says otherwise.</p>
+      <div class="kv"><span>Webhook secret</span><b>${se.git_secret ? "set" : '<span class="hl red">not set - webhook is off</span>'}</b></div>
+      <p><button type="button" class="mini primary" id="gitsecret">${se.git_secret ? "Create a new secret" : "Create secret"}</button></p></div>
+    <div class="panel"><h2>Integrations, wake-ups and budgets</h2><form id="opsf" class="stack">
+      <label>Public address of this board <span class="muted">(adds task links to chat messages)</span><input name="base_url" value="${esc(se.base_url)}" placeholder="https://board.example.com"></label>
+      <div class="row2"><label>Wake sleeping agents after (minutes, 0 = off)<input type="number" name="wake_after_min" min="0" max="1440" value="${esc(se.wake_after_min || 10)}"></label><label>Close a task when its PR merges<select name="git_autodone"><option value="1" ${se.git_autodone !== "0" ? "selected" : ""}>Yes (if the gate allows)</option><option value="0" ${se.git_autodone === "0" ? "selected" : ""}>No, only comment</option></select></label></div>
+      <label>Monthly budget for all boards (USD, blank = none)<input type="number" step="any" min="0" name="budget_usd" value="${esc(se.budget_usd)}"></label>
+      <label>Model prices <span class="muted">(JSON, USD per million tokens [input, output], used when an agent reports tokens without a cost)</span><textarea name="prices" rows="2" placeholder='{"my-model": [3, 15]}'>${esc(se.prices)}</textarea></label>
+      <div class="rowbtn"><button class="primary mini" type="submit">Save</button></div></form></div>
     <div class="panel"><h2>Backups</h2>${last ? `<p>Last: <b>${esc(last.file)}</b> · ${Math.round(last.size / 1024)} KB · ${last.ok ? '<span class="hl green">verified</span>' : '<span class="hl red">verification failed</span>'}<br><span class="muted">${last.counts.tasks} tasks, ${last.counts.boards} boards, ${last.counts.specs} specs · ${esc(last.ts)} UTC</span></p>` : '<p class="muted">No backup yet — one is made automatically every 24h.</p>'}
       <p class="muted hint">${bk.n} kept in <code class="k">${esc(bk.dir)}</code>. Each backup is integrity-checked right after it is written.</p><p><button type="button" class="mini primary" id="bknow">Back up now</button></p></div>
     <div class="panel"><h2>Import / export</h2><p class="muted hint">Exports include tasks, sprints, docs, specs and comments. Imports always create new copies — nothing is overwritten.</p>
@@ -509,6 +522,7 @@ function tplDlg(t) {
 
 $("v-admin").addEventListener("click", async e => {
   const el = $("v-admin"), id = k => e.target.id === k;
+  if (await adminExtras(e)) return;
   const dt = e.target.closest("[data-deltoken]"); if (dt) { if (confirm("Revoke this token? Anything using it stops working.")) { await api("DELETE", "/tokens?id=" + dt.dataset.deltoken); renderAdmin(); } return; }
   if (id("newtoken")) return dlg(`<h3>Create agent token</h3><label>Agent name (exactly as used in Assignee)<input name="n" required></label><label>Role<select name="role">${opt(["agent", "supervisor", "viewer", "admin"], "agent")}</select></label>`,
     async d => { const r = await api("POST", "/tokens", d); closeDlg(true); setTimeout(() => dlg(`<h3>Token for ${esc(r.n)}</h3><p class="muted hint">Shown once. Store it in the agent's secret store now.</p><label>Token<input readonly value="${esc(r.token)}" id="tkv"></label>`, async () => { await navigator.clipboard.writeText(r.token).catch(() => {}); toast("Copied"); renderAdmin(); }, "", "Copy & close"), 50); throw {e: "shown"}; }, "", "Create");
@@ -525,6 +539,7 @@ $("v-admin").addEventListener("click", async e => {
 });
 $("v-admin").addEventListener("submit", async e => {
   if (e.target.id === "dodf" && B && !B.multi) { e.preventDefault(); try { await api("PATCH", "/boards/" + B.id, {dod: new FormData(e.target).get("dod")}); await loadBoard(); toast("Board rules saved"); } catch (_) {} return; }
+  if (e.target.id === "opsf") { e.preventDefault(); try { await api("POST", "/settings", Object.fromEntries(new FormData(e.target))); toast("Saved"); } catch (_) {} return; }
   if (e.target.id !== "setf") return;
   e.preventDefault();
   try { await api("POST", "/settings", Object.fromEntries(new FormData(e.target))); toast("Settings saved"); } catch (_) {}
@@ -616,8 +631,10 @@ function sprintPanel(sp, ss) {
     <div><h3>Risks</h3><ul class="risks">${risks}</ul></div></div></div>`;
 }
 
-function renderOverviewMulti(d) {
+async function renderOverviewMulti(d) {
   const el = $("v-overview"), t = d.totals || {}, bs = d.boards || [];
+  let cost = null; try { cost = await api("GET", "/cost" + (B.scopeTeam ? "?tm=" + encodeURIComponent(B.scopeTeam) : "")); } catch (_) {}
+  if (view !== "overview") return;
   const nudged = bs.reduce((a, b) => a + (b.nu || []).length, 0);
   const rows = bs.map(b => { const by = b.by || {}, open = sum(by) - (by.done || 0) - (by.declined || 0), sp = b.sp, m = MET[b.mt] || {};
     return `<tr><td><b>${esc(b.n)}</b>${b.tm ? ` <span class="muted">${esc(b.tm)}</span>` : ""}</td><td>${esc(m.name || b.mt)}</td><td class="num">${open}</td><td class="num">${by.in_progress || 0}</td><td class="num">${by.blocked ? `<b style="color:var(--bad)">${by.blocked}</b>` : 0}</td>
@@ -629,6 +646,7 @@ function renderOverviewMulti(d) {
     <div class="tiles"><div class="tile"><div class="n">${t.open || 0}</div><div class="l">Open tasks</div></div><div class="tile"><div class="n">${t.in_progress || 0}</div><div class="l">In progress</div></div><div class="tile"><div class="n">${t.review || 0}</div><div class="l">In review</div></div><div class="tile ${t.blocked ? "bad" : ""}"><div class="n">${t.blocked || 0}</div><div class="l">Blocked</div></div><div class="tile ${nudged ? "warn" : ""}"><div class="n">${nudged}</div><div class="l">Stale</div></div><div class="tile ${t.red_sprints ? "bad" : "ok"}"><div class="n">${t.red_sprints || 0}</div><div class="l">Sprints at risk</div></div></div>
     ${att}
     <div class="panel"><h2>Boards</h2><table class="tb"><tr><th>Board</th><th>Method</th><th>Open</th><th>Doing</th><th>Blocked</th><th>Sprint / flow</th><th></th></tr>${rows}</table></div>
+    ${costPanel(cost)}
     <div class="panel"><h2>Agent workload across these boards</h2>${agents ? `<table class="tb"><tr><th>Agent</th><th>Doing</th><th>To do</th><th>Review</th><th>Blocked</th><th>Inbox</th></tr>${agents}</table>` : '<span class="muted">No assigned work.</span>'}</div></div>`;
 }
 
@@ -645,7 +663,8 @@ async function renderOverview() {
   let fl = null, vel = null;
   if (mt.wip) { try { fl = await api("GET", `/boards/${b.id}/flow?days=30`); } catch (_) {} }
   if (mt.sprints) { try { vel = await api("GET", `/boards/${b.id}/velocity`); } catch (_) {} }
-  let okr = null, sla = null;
+  let okr = null, sla = null, cost = null;
+  try { cost = await api("GET", "/cost?b=" + b.id); } catch (_) {}
   if (mt.group === "okr") { try { okr = await api("GET", `/boards/${b.id}/okr`); } catch (_) {} }
   if (mt.sla) { try { sla = await api("GET", `/boards/${b.id}/sla`); } catch (_) {} }
   if (view !== "overview") return;
@@ -671,6 +690,7 @@ async function renderOverview() {
     ${vel && vel.i.length > 1 && !mt.gate && mt.group !== "okr" ? velPanel(vel) : ""}
     ${okr ? okrPanel(okr) : ""}
     ${sla ? slaPanel(sla) : ""}
+    ${costPanel(cost)}
     <div class="panel"><h2>Environments</h2>${envs.length ? `<table class="tb"><tr><th>Env</th><th>Deployed</th><th>By</th><th>When</th><th></th></tr>${envs.map(e => `<tr><td><b>${esc(e.n)}</b>${e.frozen ? ` <span class="badge red">Frozen until ${esc(e.frozen.slice(5, 16))} UTC</span>` : ""}</td><td class="num">${esc((e.sha || "—").slice(0, 10))}</td><td>${esc(e.by || "—")}</td><td class="muted">${e.at ? esc(ago(e.at)) + " ago" : "—"}</td><td class="num"><button type="button" class="mini" ${e.frozen ? `data-unfreeze="${esc(e.n)}">Unfreeze` : `data-freeze="${esc(e.n)}">Freeze`}</button></td></tr>`).join("")}</table>` : '<span class="muted">No deploys recorded yet. Agents record them with the deploy_env tool; freezes stop deploys and notify everyone.</span>'}</div>
     <div class="grid2">
       <div class="panel"><h2>Agent workload</h2>${rows ? `<table class="tb"><tr><th>Agent</th><th>Doing</th><th>To do</th><th>Review</th><th>Blocked</th><th>Inbox</th><th>Done 30d</th><th>Cycle</th><th>Decl.</th><th>Cap</th></tr>${rows}</table>` : '<span class="muted">No assigned work yet.</span>'}</div>
@@ -695,7 +715,7 @@ async function renderAgents() {
       <div class="kv"><span>Open tasks</span><b>${open}${cap ? " of " + cap : ""}</b></div>
       ${cap ? `<div class="bar"><i class="${over ? "bad" : ""}" style="width:${Math.min(100, Math.round(100 * open / cap))}%"></i></div>` : ""}
       ${a.sk ? `<div class="skills">${a.sk.split(",").map(x => `<span class="chip">${esc(x)}</span>`).join("")}</div>` : ""}
-      <div class="btnrow"><button type="button" class="mini" data-inbox="${esc(a.n)}">Open inbox</button><button type="button" class="mini" data-hook="${esc(a.n)}" data-url="${esc(a.hook || "")}" data-cap="${a.cap || ""}" data-skills="${esc(a.sk || "")}">Settings</button></div></article>`;
+      <div class="btnrow"><button type="button" class="mini" data-inbox="${esc(a.n)}">Open inbox</button>${a.hook ? `<button type="button" class="mini" data-wake="${esc(a.n)}" title="Send a wake-up ping to its webhook">Wake</button>` : ""}<button type="button" class="mini" data-hook="${esc(a.n)}" data-url="${esc(a.hook || "")}" data-cap="${a.cap || ""}" data-skills="${esc(a.sk || "")}">Settings</button></div></article>`;
   }).join("");
   const locks = lk.i.length ? lk.i.map(l => `<div class="coord"><div><b class="mono">${esc(l.name)}</b><div class="muted">held by ${esc(l.owner)} until ${esc(l.until.slice(11, 16))} UTC${l.note ? " — " + esc(l.note) : ""}</div></div><button type="button" class="mini" data-unlock="${esc(l.name)}" data-owner="${esc(l.owner)}">Release</button></div>`).join("") : '<span class="muted">Nothing is locked.</span>';
   const asks = ak.i.length ? ak.i.map(x => `<div class="coord"><div><b>${esc(x.from)} → ${esc(x.to)}</b>${x.tk ? ` <span class="mono">#${x.tk}</span>` : ""}<div>${esc(x.q)}</div><div class="muted">answer by ${esc(x.due.slice(5, 16))} UTC${x.due < new Date().toISOString().slice(0, 19).replace("T", " ") ? ' · <b style="color:var(--bad)">overdue</b>' : ""}</div></div><button type="button" class="mini primary" data-answer="${x.id}" data-q="${esc(x.q)}" data-to="${esc(x.to)}">Answer</button></div>`).join("") : '<span class="muted">No open questions between agents.</span>';
@@ -811,11 +831,12 @@ function boardSetDlg() {
       <div class="row2"><label>Length in days<input type="number" name="sprint_days" min="1" max="120" value="${cfg.sprint_days || meth().sprint_days || 14}"></label><label>Keep ready column at least<input type="number" name="replenish_below" min="1" value="${cfg.replenish_below || ""}" placeholder="scrumban only"></label></div>
       <label class="chk"><input type="checkbox" name="auto_rollover" ${cfg.auto_rollover ? "checked" : ""}> When a ${term().toLowerCase()} ends, close it automatically and start the next</label></fieldset>
     <fieldset class="fs"><legend>Support desk <span class="muted">(response target in hours, by priority)</span></legend><div class="row4">${[1, 2, 3, 4].map(p => `<label>P${p}<input type="number" name="sla${p}" min="1" value="${(cfg.sla_hours || {})[p] || ({1: 4, 2: 24, 3: 72, 4: 168})[p]}"></label>`).join("")}</div></fieldset>
+    <fieldset class="fs"><legend>Agent spend budgets <span class="muted">(USD, blank = none; the supervisor is warned at 80% and 100%)</span></legend><div class="row2"><label>Per month, this board<input type="number" step="any" min="0" name="budget_usd" value="${cfg.budget_usd || ""}"></label><label>Per task<input type="number" step="any" min="0" name="task_budget_usd" value="${cfg.task_budget_usd || ""}"></label></div></fieldset>
     <label>Phases <span class="muted">(waterfall: one per line; used when the board has no phases yet)</span><textarea name="phases" rows="2">${esc((cfg.phases || []).join("\n"))}</textarea></label>
     <label>Definition of done <span class="muted">(one item per line)</span><textarea name="dod" rows="3">${esc(B.dod || "")}</textarea></label>`,
     async d => {
       const wip = {}; for (const k of ["todo", "in_progress", "review"]) if (d["w_" + k]) wip[k] = +d["w_" + k];
-      await api("PATCH", "/boards/" + B.id, {method: d.method, dod: d.dod, cfg: {wip, wip_mode: d.wip_mode, sprint_days: +d.sprint_days || 0, auto_rollover: d.auto_rollover === "on", replenish_below: +d.replenish_below || 0, sla_hours: {1: +d.sla1 || 0, 2: +d.sla2 || 0, 3: +d.sla3 || 0, 4: +d.sla4 || 0}, phases: d.phases}});
+      await api("PATCH", "/boards/" + B.id, {method: d.method, dod: d.dod, cfg: {wip, wip_mode: d.wip_mode, sprint_days: +d.sprint_days || 0, auto_rollover: d.auto_rollover === "on", replenish_below: +d.replenish_below || 0, sla_hours: {1: +d.sla1 || 0, 2: +d.sla2 || 0, 3: +d.sla3 || 0, 4: +d.sla4 || 0}, phases: d.phases, budget_usd: +d.budget_usd || 0, task_budget_usd: +d.task_budget_usd || 0}});
       await loadBoard(); toast("Board settings saved");
     }, "", "Save settings");
 }
@@ -924,8 +945,9 @@ function taskDlg(id, status, title, boardId, pri) {
     <label>Area / project (optional)<input name="channel" list="chl" placeholder="e.g. backend, docs" value="${esc(t.channel || lastChannel())}"><datalist id="chl">${[...new Set([...CHANNELS, ...B.tasks.map(x => x.channel).filter(Boolean)])].map(c => `<option value="${esc(c)}">`).join("")}</datalist></label></div>
     <div class="row2"><label>Type<select name="type">${TYPES.map(x => `<option value="${x}" ${x === (t.type || "task") ? "selected" : ""}>${x}</option>`).join("")}</select></label>
     <label>Epic<select name="parent"><option value="">none</option>${B.tasks.filter(x => x.type === "epic" && x.board_id == bid && x.id != id).map(x => `<option value="${x.id}" ${x.id == t.parent ? "selected" : ""}>#${x.id} ${esc(x.title)}</option>`).join("")}</select></label></div>
-    <div class="row2"><label>Depends on (task ids)<input name="depends" value="${esc(csv(t.depends).join(", "))}" placeholder="e.g. 12, 15"></label>
+    <div class="row2"><label>Depends on (task ids, any board)<input name="depends" value="${esc(csv(t.depends).join(", "))}" placeholder="e.g. 12, 15"><input id="dpq" class="dpq" list="dpl" placeholder="Search a task on any board to add it" autocomplete="off"><datalist id="dpl"></datalist></label>
     <label>Points (estimate)<input type="number" name="points" min="0" max="1000" value="${t.points || ""}"></label></div>
+    ${id ? '<div id="linksbox" class="linksbox"></div>' + codeBox(t) : ""}
     ${meth().group === "okr" ? `<div class="row2"><label>Target (key result)<input type="number" step="any" min="0" name="target" value="${t.target ?? ""}"></label><label>Current value<input type="number" step="any" min="0" name="current" value="${t.current ?? ""}"></label></div>` : ""}
     ${(bd.dod || "").trim() ? `<div class="dod"><label>Definition of done — every item before this task can be done</label>${bd.dod.split("\n").filter(x => x.trim()).map((x, i) => `<label class="chk"><input type="checkbox" name="dodi" value="${i}" ${csv(t.dod_done).includes(String(i)) ? "checked" : ""}> ${esc(x)}</label>`).join("")}</div>` : ""}
     <details class="more"><summary>More fields (labels, links, blockers, PR)</summary>
@@ -973,7 +995,36 @@ function taskDlg(id, status, title, boardId, pri) {
       else { d.board_id = bid; const nt = await api("POST", "/tasks", d); undoTask(nt); ensureVisible(nt.id); }
     },
     id ? '<button type="button" id="handoff">Hand off…</button><button type="button" class="danger sp" id="del">Delete task</button>' : "", id ? "Save" : "Create task");
+  {
+    const dq = $("dpq"), dl = $("dpl"); let dqT = null;
+    if (dq) {
+      dq.oninput = () => {
+        clearTimeout(dqT); const v = dq.value.trim(); if (v.length < 2 || v[0] === "#") return;
+        dqT = setTimeout(async () => {
+          try { const r = await api("GET", `/tasks?q=${encodeURIComponent(v)}&limit=8`); dl.innerHTML = (r.items || r.i || []).map(x => `<option value="#${x.id} ${esc(x.title)}" label="${esc(((BS[x.board_id] || boards.find(b => b.id === x.board_id)) || {}).name || "")}"></option>`).join(""); } catch (_) {}
+        }, 250);
+      };
+      dq.onchange = () => {
+        const m = /^#(\d+)/.exec(dq.value); if (!m) return;
+        const f = $("f").querySelector("[name=depends]"), ids = csv(f.value);
+        if (!ids.includes(m[1]) && +m[1] !== id) ids.push(m[1]);
+        f.value = ids.join(", "); dq.value = ""; dirty = true;
+      };
+    }
+  }
   if (id) {
+    api("GET", `/tasks/${id}/links`).then(l => {
+      const chip = x => `<button type="button" class="link lk${x.open ? "" : " done"}" data-open="${x.id}" title="${esc(x.t)}">#${x.id} ${esc(x.t.slice(0, 36))}<small>${x.x ? esc(x.bn) + " · " : ""}${esc(x.st)}</small></button>`;
+      const box = $("linksbox"); if (!box) return;
+      box.innerHTML = (l.dp.length ? `<div class="lkrow"><b>Depends on</b>${l.dp.map(chip).join("")}</div>` : "") + (l.bl.length ? `<div class="lkrow"><b>Blocks</b>${l.bl.map(chip).join("")}</div>` : "");
+      box.onclick = e => { const b = e.target.closest("[data-open]"); if (b) { closeDlg(true); setTimeout(() => openTask(+b.dataset.open), 60); } };
+    }).catch(() => {});
+    const cl = $("costlog");
+    if (cl) cl.onclick = async () => {
+      const r = await api("GET", `/tasks/${id}/cost`);
+      $("costbox").innerHTML = r.i.map(c => `<div class="cbrow"><span class="chip cost">${money(c.usd)}</span><span>${esc(c.by)} · ${kfmt(c.in + c.out)} tokens${c.model ? " · " + esc(c.model) : ""} · ${esc(ago(c.ts))} ago${c.note ? " — " + esc(c.note) : ""}</span></div>`).join("") || '<span class="muted">No entries.</span>';
+      cl.remove();
+    };
     $("f").querySelector("[name=move_board]").onchange = e => {
       const to = +e.target.value, mv = to !== bid, h = $("movehint");
       h.hidden = !mv; h.textContent = mv ? "On save the task moves to that board's active sprint (no sprint if it has none) and its epic link is cleared" + (t.type === "epic" ? "; its child tasks move with it" : "") + "." : "";
@@ -1044,6 +1095,69 @@ async function openTask(id, boardId) {
   setView("board"); $("sprint").value = ""; autoSprint = false; render(); taskDlg(+id);
 }
 
+// ---- cost, links, chat channels ----
+const money = v => "$" + (v >= 100 ? Math.round(v) : v >= 1 ? v.toFixed(2) : (+v.toFixed(3)).toString());
+const kfmt = n => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? Math.round(n / 1e3) + "k" : String(n || 0);
+const CHAT_EV = [["blocked", "A task is blocked"], ["done", "A task is done"], ["review", "A task goes to review"], ["declined", "A task is declined"], ["assigned", "A task waits on a human"],
+  ["escalation", "Escalations to the supervisor"], ["sprint", "Sprint started, closed or at risk"], ["budget", "Budget warnings"], ["git", "Pull requests merged, CI failures"]];
+let CHATS = [];
+
+function codeBox(t) {
+  const cm = t.commits || [], pr = /^https:\/\//.test(t.pr_url || "");
+  if (!pr && !cm.length && !t.cost) return "";
+  return `<div class="codebox"><b>Code &amp; cost</b>
+    ${pr ? `<div class="cbrow"><span class="chip link2">PR</span><a href="${esc(t.pr_url)}" target="_blank" rel="noopener">${esc(t.pr_url.replace("https://", ""))}</a></div>` : ""}
+    ${cm.slice(-6).reverse().map(c => `<div class="cbrow"><span class="chip mono">${esc((c.h || "").slice(0, 7) || "commit")}</span>${/^https:\/\//.test(c.u || "") ? `<a href="${esc(c.u)}" target="_blank" rel="noopener">${esc(c.m || c.u)}</a>` : `<span>${esc(c.m || "")}</span>`}</div>`).join("")}
+    ${t.cost ? `<div class="cbrow"><span class="chip cost">${money(t.cost)}</span><span>${kfmt(t.tokens)} tokens spent by agents</span><button type="button" class="link" id="costlog">Show log</button></div><div id="costbox"></div>` : ""}</div>`;
+}
+
+function costPanel(c) {
+  if (!c || !c.tot || !c.tot.n) return "";
+  const mx = Math.max(0.0001, ...c.day.map(d => d.usd));
+  return `<div class="panel"><h2>Agent spend <span class="muted">last ${c.days} days</span></h2>
+    <div class="tiles"><div class="tile"><div class="n">${money(c.tot.usd)}</div><div class="l">Spent</div></div><div class="tile"><div class="n">${kfmt(c.tot.in + c.tot.out)}</div><div class="l">Tokens</div></div><div class="tile"><div class="n">${c.tot.n}</div><div class="l">Reports</div></div></div>
+    ${c.bud.length ? `<div class="budgets">${c.bud.map(b => `<div class="bud"><span>${esc(b.n)}</span><div class="bar"><i class="${b.pct >= 100 ? "bad" : b.pct >= 80 ? "warn" : ""}" style="width:${Math.min(100, b.pct)}%"></i></div><b>${money(b.spent)} / ${money(b.limit)}</b></div>`).join("")}</div>` : ""}
+    <div class="grid2"><div><table class="tb"><tr><th>Agent</th><th>Spent</th><th>Tokens</th><th>Tasks</th></tr>${c.ag.slice(0, 8).map(a => `<tr><td>${esc(a.n)}</td><td class="num">${money(a.usd)}</td><td class="num">${kfmt(a.in + a.out)}</td><td class="num">${a.tasks}</td></tr>`).join("")}</table></div>
+    <div><table class="tb"><tr><th>Costliest tasks</th><th>Spent</th></tr>${c.tk.slice(0, 6).map(x => `<tr><td><button type="button" class="link" data-open="${x.id}" data-b="${x.b || ""}"><span class="mono">#${x.id}</span> ${esc((x.t || "").slice(0, 40))}</button></td><td class="num">${money(x.usd)}</td></tr>`).join("")}</table></div></div>
+    ${c.day.length > 1 ? `<div class="spark" title="Spend per day">${c.day.map(d => `<i style="height:${Math.max(6, Math.round(d.usd / mx * 100))}%" title="${esc(d.d)} ${money(d.usd)}"></i>`).join("")}</div>` : ""}</div>`;
+}
+
+function chatDlg() {
+  dlg(`<h3>New chat channel</h3><p class="muted hint">The board posts a short message here when something needs a human. The webhook address is a secret: it is stored on the server and never shown again.</p>
+    <div class="row2"><label>Name<input name="n" required placeholder="e.g. Ops team"></label><label>Service<select name="kind">${["slack", "discord", "teams", "telegram", "generic"].map(k => `<option value="${k}">${k[0].toUpperCase() + k.slice(1)}</option>`).join("")}</select></label></div>
+    <label>Webhook URL <span class="muted">(Slack, Discord, Teams incoming webhook; generic = any address that accepts JSON)</span><input name="url" placeholder="https://hooks.slack.com/services/…"></label>
+    <div class="row2"><label>Telegram bot token<input name="token" placeholder="only for Telegram"></label><label>Telegram chat id, or generic signing secret<input name="target"></label></div>
+    <fieldset class="fs"><legend>Tell this channel when</legend><div class="evgrid">${CHAT_EV.map(([k, l]) => `<label class="chk"><input type="checkbox" name="ev_${k}" ${["blocked", "escalation", "sprint", "budget"].includes(k) ? "checked" : ""}> ${esc(l)}</label>`).join("")}</div></fieldset>
+    <div class="row2"><label>Only tasks up to priority<select name="minpr"><option value="4">Any priority</option><option value="3">P3 and higher</option><option value="2">P2 and higher</option><option value="1">P1 only</option></select></label>
+    <label>Only this board<select name="b"><option value="">All boards</option>${boards.map(b => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}</select></label></div>`,
+    async d => {
+      const events = CHAT_EV.map(x => x[0]).filter(k => d["ev_" + k]);
+      if (!events.length) { toast("Pick at least one event"); throw {e: "missing"}; }
+      await api("POST", "/chats", {n: d.n, kind: d.kind, url: d.url, token: d.token, target: d.target, events, minpr: +d.minpr, b: d.b ? +d.b : null});
+      renderAdmin();
+    }, "", "Add channel");
+}
+
+async function adminExtras(e) {
+  const t = e.target, b = t.closest("[data-chat]");
+  if (t.id === "newchat") { chatDlg(); return true; }
+  if (b) {
+    const [act, cid] = b.dataset.chat.split(":");
+    try {
+      if (act === "test") { const r = await api("POST", `/chats/${cid}/test`, {}); toast(r.ok ? "Test message sent" : "Could not send: " + (r.err || "failed")); renderAdmin(); }
+      else if (act === "toggle") { const c = CHATS.find(x => x.id == cid); await api("POST", "/chats", {id: +cid, on: !c.on}); renderAdmin(); }
+      else if (act === "del" && confirm("Delete this channel?")) { await api("DELETE", "/chats?id=" + cid); renderAdmin(); }
+    } catch (_) {}
+    return true;
+  }
+  if (t.id === "gitsecret") {
+    if (!confirm("Create a new secret? The forge webhook must be updated with it.")) return true;
+    try { const r = await api("POST", "/admin/git-secret"); dlg(`<h3>Git webhook secret</h3><p class="muted hint">Paste it into the webhook settings of GitHub, GitLab or Gitea. It is also kept in Settings.</p><label>Secret<input readonly value="${esc(r.secret)}" id="gsec"></label>`, async () => {}, "", "Done"); renderAdmin(); } catch (_) {}
+    return true;
+  }
+  return false;
+}
+
 // ---- bulk actions ----
 function bulkBar() {
   const el = $("bulkbar");
@@ -1055,6 +1169,7 @@ function bulkBar() {
     <input id="bas" list="bpl" placeholder="Assign to…" aria-label="Assignee"><datalist id="bpl">${people.map(p => `<option value="${esc(p)}">`).join("")}</datalist>
     <select id="bsp" aria-label="Sprint"><option value="">Sprint…</option><option value="none">No sprint</option>${B.sprints.map(x => `<option value="${x.id}">${esc(x.name)}</option>`).join("")}</select>
     <select id="bpr" aria-label="Priority"><option value="">Priority…</option>${[1, 2, 3, 4].map(x => `<option>${x}</option>`).join("")}</select>
+    <select id="bmv" aria-label="Move to board"><option value="">Move to board…</option>${boards.map(b => `<option value="${b.id}">${esc(b.name)}</option>`).join("")}</select>
     <button type="button" class="primary mini" id="bapply">Apply</button><button type="button" class="mini" id="bclear">Clear</button>`;
 }
 $("bulkbar").addEventListener("click", async e => {
@@ -1065,8 +1180,14 @@ $("bulkbar").addEventListener("click", async e => {
   if ($("bas").value.trim()) body.as = $("bas").value.trim();
   if ($("bsp").value) body.s = $("bsp").value === "none" ? null : +$("bsp").value;
   if ($("bpr").value) body.pr = +$("bpr").value;
-  if (Object.keys(body).length < 2) return toast("Pick at least one change to apply");
-  try { const r = await api("POST", "/tasks/bulk", body); toast(`Updated ${r.total ?? r.n ?? picked.size} task(s)`); picked.clear(); await loadBoard(); } catch (_) {}
+  const mv = $("bmv").value, edits = Object.keys(body).length > 1;
+  if (!edits && !mv) return toast("Pick at least one change to apply");
+  try {
+    const msg = [];
+    if (edits) { const r = await api("POST", "/tasks/bulk", body); msg.push(`Updated ${r.total ?? r.n ?? picked.size} task(s)`); }
+    if (mv) { const r = await api("POST", "/tasks/move", {ids: [...picked], b: +mv}); msg.push(`Moved ${r.n}${r.skipped.length ? `, ${r.skipped.length} already there` : ""}${r.failed.length ? `, ${r.failed.length} failed (${r.failed[0].e})` : ""}`); }
+    toast(msg.join(" · ")); picked.clear(); await loadBoard();
+  } catch (_) {}
 });
 
 // ---- saved views (per browser) ----
@@ -1182,6 +1303,7 @@ ovEl.addEventListener("click", async e => {
 agEl.addEventListener("click", async e => {
   const i = e.target.closest("[data-inbox]"); if (i) return showInbox(i.dataset.inbox);
   const h = e.target.closest("[data-hook]"); if (h) return hookDlg(h.dataset.hook, h.dataset.url, h.dataset.cap, h.dataset.skills);
+  const wk = e.target.closest("[data-wake]"); if (wk) { try { const r = await api("POST", "/agents/wake", {n: wk.dataset.wake}); toast(`Wake-up sent: ${r.unread} unread, ${r.ready} ready task(s)`); } catch (_) {} return; }
   const a = e.target.closest("[data-ackall]"); if (a) { await api("POST", "/inbox/ack", {as: a.dataset.ackall}); showInbox(a.dataset.ackall); refreshDash(); return; }
   const ul = e.target.closest("[data-unlock]"); if (ul) { await api("DELETE", "/locks?name=" + encodeURIComponent(ul.dataset.unlock) + "&as=" + encodeURIComponent(ul.dataset.owner)); return renderAgents(); }
   const an = e.target.closest("[data-answer]");
@@ -1228,7 +1350,7 @@ $("presets").onclick = e => {
 document.querySelectorAll("#presets .preset").forEach(b => b.classList.toggle("on", b.dataset.preset === preset));
 setView(view);
 function startLoad() {
-  loadBoards().catch(() => {
+  loadBoards().then(() => { const m = /^#t\/(\d+)/.exec(location.hash); if (m && B) openTask(+m[1]); }).catch(() => {
     if (B) return;
     $("main").insertAdjacentHTML("afterbegin", '<div class="pad" id="loadfail"><div class="empty"><b>Could not load the boards</b><br>Retrying…<br><button type="button" class="mini primary" id="loadretry">Try again now</button></div></div>');
     const go = () => { const e = $("loadfail"); if (e) e.remove(); startLoad(); };
@@ -1236,6 +1358,7 @@ function startLoad() {
   });
 }
 startLoad();
+addEventListener("hashchange", () => { const m = /^#t\/(\d+)/.exec(location.hash); if (m && B) openTask(+m[1]); });
 
 // ---- collapsible menu (remembered per browser) ----
 const shellEl = document.querySelector(".shell");

@@ -17,7 +17,7 @@ NUDGE_OPEN = frozenset({"backlog", "todo", "in_progress", "review", "blocked"})
 NUDGE_INTERVAL_SEC = int(os.environ.get("TASKBOARD_NUDGE_INTERVAL", "1200"))  # 20 min
 # Agent notifications: who triggers them ("*" = any actor; else comma list of token names, e.g. "human")
 NOTIFY_ACTORS = {x.strip().lower() for x in os.environ.get("TASKBOARD_NOTIFY_ACTORS", "*").split(",") if x.strip()} or {"*"}
-SYSTEM_ACTORS = frozenset({"system", "nudge-cron", "recurring"})
+SYSTEM_ACTORS = frozenset({"system", "nudge-cron", "recurring", "git", "cost", "wake"})
 NOTIFY_KEYS = ("status", "assignee", "priority", "title", "description", "blocker", "blocked_by", "sprint_id", "decline_reason")
 inbox_cv = threading.Condition()
 hook_q = queue.Queue()
@@ -156,9 +156,18 @@ for _t, _c, _d in (("tasks", "blocker", "TEXT DEFAULT ''"), ("tasks", "blocked_b
                    ("boards", "method", "TEXT DEFAULT 'scrum'"), ("boards", "cfg", "TEXT DEFAULT ''"), ("tasks", "type", "TEXT DEFAULT 'task'"), ("tasks", "parent", "INTEGER"),
                    ("sprints", "committed", "INTEGER DEFAULT 0"), ("tasks", "target", "REAL"), ("tasks", "current", "REAL"),
                    ("notifications", "cnt", "INTEGER DEFAULT 1"), ("agents", "mute", "TEXT DEFAULT ''"),
-                   ("boards", "team", "TEXT DEFAULT ''")):
+                   ("boards", "team", "TEXT DEFAULT ''"), ("tasks", "cost", "REAL DEFAULT 0"), ("tasks", "tokens", "INTEGER DEFAULT 0"),
+                   ("agents", "wake_at", "TEXT DEFAULT ''"), ("agents", "wake_n", "INTEGER DEFAULT 0")):
     if _c not in [r[1] for r in db.execute(f"PRAGMA table_info({_t})")]:
         db.execute(f"ALTER TABLE {_t} ADD COLUMN {_c} {_d}")
+
+db.executescript("""
+CREATE TABLE IF NOT EXISTS costs(id INTEGER PRIMARY KEY, ts TEXT DEFAULT CURRENT_TIMESTAMP, agent TEXT NOT NULL COLLATE NOCASE, task_id INTEGER, board_id INTEGER,
+  model TEXT DEFAULT '', tin INTEGER DEFAULT 0, tout INTEGER DEFAULT 0, usd REAL DEFAULT 0, note TEXT DEFAULT '');
+CREATE INDEX IF NOT EXISTS ix_cost_task ON costs(task_id); CREATE INDEX IF NOT EXISTS ix_cost_ts ON costs(ts);
+CREATE TABLE IF NOT EXISTS chats(id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT DEFAULT 'slack', url TEXT NOT NULL, target TEXT DEFAULT '', events TEXT DEFAULT '',
+  board_id INTEGER, minpr INTEGER DEFAULT 4, active INTEGER DEFAULT 1, last TEXT DEFAULT '', last_ok INTEGER DEFAULT 1, created TEXT DEFAULT CURRENT_TIMESTAMP);
+""")
 
 FIELDS = {
     "boards": ["name", "description", "team", "dod", "method", "cfg"],
@@ -174,7 +183,7 @@ CK = {
     "sprints": {"id": "id", "board_id": "b", "name": "n", "goal": "g", "start": "from", "end": "to", "state": "st", "committed": "cmt"},
     "tasks": {"id": "id", "board_id": "b", "sprint_id": "s", "title": "t", "description": "d", "status": "st",
               "priority": "pr", "assignee": "as", "kind": "k", "updated": "u", "blocker": "bl", "blocked_by": "bb", "labels": "lb", "channel": "ch",
-              "watch": "w", "short_url": "sh", "video_id": "vid", "publish_at": "at", "pr_url": "pu", "sha": "sha", "commits": "cm", "decline_reason": "dr", "nudge": "nu", "depends": "dp", "points": "pt", "dod_done": "dn", "claimed_by": "cb", "claim_until": "cu", "version": "v", "type": "ty", "parent": "pa", "target": "tg", "current": "cr"},
+              "watch": "w", "short_url": "sh", "video_id": "vid", "publish_at": "at", "pr_url": "pu", "sha": "sha", "commits": "cm", "decline_reason": "dr", "nudge": "nu", "depends": "dp", "points": "pt", "dod_done": "dn", "claimed_by": "cb", "claim_until": "cu", "version": "v", "type": "ty", "parent": "pa", "target": "tg", "current": "cr", "cost": "cs", "tokens": "tk"},
 }
 IN = {t: {**{v: k for k, v in m.items()}, **{k: k for k in m}} for t, m in CK.items()}
 
@@ -404,7 +413,7 @@ def cdict(table, r, full, skip=()):
     if full:
         return r
     m = CK[table]
-    return {m[k]: v for k, v in r.items() if k in m and k not in skip and v is not None and v != "" and v != [] and not (k in ("points", "target", "current") and not v)}
+    return {m[k]: v for k, v in r.items() if k in m and k not in skip and v is not None and v != "" and v != [] and not (k in ("points", "target", "current", "cost", "tokens") and not v)}
 
 
 def validate(table, body, partial):
@@ -951,6 +960,7 @@ def notify(agent, typ, actor, task_id, board_id, summary, delta=None):
 def notify_task(actor, old, new):
     _notify_task_core(actor, old, new)
     _notify_watchers(actor, old, new)
+    _chat_task(actor, old, new)
 
 
 def _notify_task_core(actor, old, new):
@@ -1467,6 +1477,7 @@ def supervisor_names():
 def escalate(typ, actor, tid, bid, msg, delta=None, skip=()):
     """Tell the supervisor agent(s) about things a human/lead should see. Skips people who already got the direct notification."""
     sk = {str(x).lower() for x in skip}
+    chat_event("escalation", msg, tid, bid)
     for n in supervisor_names():
         if n.lower() not in sk:
             notify(n, "esc." + typ, actor, tid, bid, "[escalation] " + msg, delta)
@@ -1494,6 +1505,13 @@ def attention(bid=None):
     add("blocked-p12", "high", "%d high-priority task(s) blocked", [t for t in op if t["status"] == "blocked" and t["priority"] <= 2])
     add("human-wait", "med", "%d task(s) waiting on a human", [t for t in op if is_owner_assignee(t["assignee"])])
     add("stale", "med", "%d important/owner task(s) stale", [t for t in op if t["nudge"] and (t["priority"] <= 2 or is_owner_assignee(t["assignee"]))])
+    xs = []
+    for t in op:
+        if t["depends"]:
+            od = open_dep_ids(t["depends"])
+            if od and rows("SELECT id FROM tasks WHERE id IN (%s) AND board_id!=?" % ",".join("?" * len(od)), od + [t["board_id"]]):
+                xs.append(t)
+    add("dep-cross", "low", "%d task(s) wait on open work in another board", xs)
     add("unassigned-p12", "med", "%d high-priority task(s) without assignee", [t for t in op if not t["assignee"] and t["priority"] <= 2])
     fr, fp = _in("id", bid)
     for fb in rows("SELECT id, name, method FROM boards WHERE 1=1" + fr, fp):
@@ -1507,6 +1525,9 @@ def attention(bid=None):
             br = board_sla(fb["id"])["breached"]
             if br:
                 items.append({"k": "sla-breach", "sev": "high", "m": "%d request(s) on '%s' are past their SLA" % (len(br), fb["name"]), "ids": [x["id"] for x in br][:30]})
+    for bb_ in cost_report({"days": ["31"], **({"bs": [",".join(str(x) for x in bid)]} if bid else {})})["bud"]:
+        if bb_["pct"] >= 80:
+            items.append({"k": "budget", "sev": "high" if bb_["pct"] >= 100 else "med", "m": "'%s' has used %d%% of its monthly budget" % (bb_["n"], bb_["pct"]), "ids": []})
     sil = silent_agents()
     add("silent-agent", "high", "%d in-progress task(s) belong to silent agents", [t for t in op if t["status"] == "in_progress" and (t["assignee"] or "").lower() in sil])
     od_asks = rows("SELECT id, task_id FROM asks WHERE status='open' AND due<?" + wb.replace("board_id", "board_id"), [now_s()] + a)
@@ -1518,6 +1539,559 @@ def attention(bid=None):
     add("declined", "low", "%d task(s) declined in the last 7 days", rows("SELECT id FROM tasks WHERE status='declined' AND updated >= datetime('now','-7 day')" + wb, a))
     items.sort(key=lambda x: -SEV[x["sev"]])
     return items
+
+
+
+# ---------------------------------------------------------------- outbound helper (shares the public-URL guard of the hardened edition when it exists)
+def _http_post(url, data, headers, timeout=8):
+    guard = globals().get("check_public_url")
+    if guard:
+        guard(url)
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    op = globals().get("_opener")
+    with (op.open(req, timeout=timeout) if op else urllib.request.urlopen(req, timeout=timeout)) as x:
+        return 200 <= x.status < 300
+
+
+def push_json(url, secret, obj, tries=(0, 2)):
+    body = json.dumps(obj, separators=(",", ":")).encode()
+    hd = {"Content-Type": "application/json", "User-Agent": "ValnivoTaskboard"}
+    if secret:
+        hd["X-Taskboard-Signature"] = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    for wait in tries:
+        time.sleep(wait)
+        try:
+            if _http_post(url, body, hd, 6):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+# ---------------------------------------------------------------- chat channels for humans (Slack, Discord, Teams, Telegram, generic JSON)
+CHAT_KINDS = ("slack", "discord", "teams", "telegram", "generic")
+CHAT_EVENTS = ("blocked", "done", "review", "declined", "assigned", "escalation", "sprint", "budget", "git")
+CHAT_DEFAULT = ("blocked", "escalation", "sprint", "budget")
+chat_q = queue.Queue()
+_chat_thread = []
+CHAT_ICON = {"blocked": "[blocked]", "done": "[done]", "review": "[review]", "declined": "[declined]", "assigned": "[needs you]", "escalation": "[escalation]", "sprint": "[sprint]", "budget": "[budget]", "git": "[git]"}
+
+
+def chat_link(tid):
+    base = get_setting("base_url").rstrip("/")
+    return (" " + base + "/#t/%d" % tid) if base and tid else ""
+
+
+def chat_send(c, text, ev="", tid=None):
+    """One message to one channel -> (ok, error)."""
+    msg = ((CHAT_ICON.get(ev, "") + " ") if ev else "") + text + chat_link(tid)
+    k = c["kind"]
+    if k == "discord":
+        obj = {"content": msg[:1900]}
+    elif k == "telegram":
+        obj = {"chat_id": c["target"], "text": msg[:3900], "disable_web_page_preview": True}
+    elif k == "generic":
+        obj = {"text": msg, "event": ev, "task": tid}
+    else:
+        obj = {"text": msg}
+    body = json.dumps(obj).encode()
+    hd = {"Content-Type": "application/json", "User-Agent": "ValnivoTaskboard"}
+    if k == "generic" and c["target"]:
+        hd["X-Taskboard-Signature"] = "sha256=" + hmac.new(c["target"].encode(), body, hashlib.sha256).hexdigest()
+    err = "failed"
+    for wait in (0, 2):
+        time.sleep(wait)
+        try:
+            if _http_post(c["url"], body, hd, 8):
+                return True, ""
+        except ApiError as e:
+            return False, e.code
+        except Exception as e:
+            err = str(e)[:80]
+    return False, err
+
+
+def _chat_deliver(c, text, ev, tid):
+    ok, why = chat_send(c, text, ev, tid)
+    with lock:
+        db.execute("UPDATE chats SET last=?, last_ok=? WHERE id=?", (now_s() + ("" if ok else " " + why), 1 if ok else 0, c["id"]))
+
+
+def _chat_loop():
+    while True:
+        ev, text, tid, bid, pr = chat_q.get()
+        try:
+            for c in rows("SELECT * FROM chats WHERE active=1"):
+                evs = [x for x in (c["events"] or "").split(",") if x] or list(CHAT_DEFAULT)
+                if ev not in evs or (c["board_id"] and c["board_id"] != bid) or (pr is not None and pr > (c["minpr"] or 4)):
+                    continue
+                threading.Thread(target=_chat_deliver, args=(c, text, ev, tid), daemon=True).start()     # a slow channel never holds up the others
+        except Exception:
+            pass
+
+
+def chat_event(ev, text, tid=None, bid=None, pr=None):
+    """Queue a message for every active channel that subscribed to `ev` (cheap no-op when none exist)."""
+    if not db.execute("SELECT 1 FROM chats WHERE active=1 LIMIT 1").fetchone():
+        return
+    chat_q.put((ev, str(text)[:600], tid, bid, pr))
+    if not _chat_thread:
+        t = threading.Thread(target=_chat_loop, name="chat", daemon=True)
+        _chat_thread.append(t)
+        t.start()
+
+
+def _board_name(bid):
+    r = rows("SELECT name FROM boards WHERE id=?", (bid,))
+    return r[0]["name"] if r else ""
+
+
+def _chat_task(actor, old, new):
+    st, was = new["status"], (old["status"] if old else None)
+    ev = st if (st != was and st in ("blocked", "done", "review", "declined")) else None
+    if not ev and old and old["assignee"] != new["assignee"] and is_owner_assignee(new["assignee"]):
+        ev = "assigned"
+    if not ev and old is None and is_owner_assignee(new["assignee"]):
+        ev = "assigned"
+    if not ev:
+        return
+    extra = {"blocked": ": " + (new["blocker"] or "no note"), "declined": ": " + (new["decline_reason"] or "no reason")}.get(ev, "")
+    word = {"assigned": "now waits on %s" % new["assignee"]}.get(ev, ev)
+    chat_event(ev, "#%d '%s' %s%s (%s, p%s, by %s)" % (new["id"], new["title"][:70], word, extra[:120], _board_name(new["board_id"]), new["priority"], actor), new["id"], new["board_id"], new["priority"])
+
+
+def chat_out(r):
+    from urllib.parse import urlparse
+    return {"id": r["id"], "n": r["name"], "kind": r["kind"], "host": urlparse(r["url"]).hostname or "", "ev": [x for x in (r["events"] or "").split(",") if x] or list(CHAT_DEFAULT),
+            "minpr": r["minpr"] or 4, "b": r["board_id"], "on": bool(r["active"]), "last": r["last"] or None, "ok": bool(r["last_ok"])}
+
+
+def chats_list():
+    return {"kinds": list(CHAT_KINDS), "events": list(CHAT_EVENTS), "default": list(CHAT_DEFAULT), "i": [chat_out(r) for r in rows("SELECT * FROM chats ORDER BY id")]}
+
+
+def chat_save(body, cid=None):
+    old = rows("SELECT * FROM chats WHERE id=?", (cid,))[0] if cid else None
+    if cid and not old:
+        raise ApiError("nf", 404)
+    name = " ".join(str(body.get("n") if "n" in body else body.get("name", old["name"] if old else "")).split())[:60]
+    kind = body.get("kind") or (old["kind"] if old else "slack")
+    if kind not in CHAT_KINDS:
+        raise ApiError("bad", 400, "kind")
+    url = str(body.get("url") or "").strip()
+    token = str(body.get("token") or "").strip()
+    if kind == "telegram" and token:
+        url = "https://api.telegram.org/bot%s/sendMessage" % token
+    url = url or (old["url"] if old else "")
+    if not name:
+        raise ApiError("missing", 400, "n")
+    if not re.match(r"https?://", url):
+        raise ApiError("missing" if not url else "bad", 400, "url")
+    guard = globals().get("check_public_url")
+    if guard:
+        guard(url)
+    target = str(body.get("target") if "target" in body else (old["target"] if old else "")).strip()[:120]
+    if kind == "telegram" and not target:
+        raise ApiError("missing", 400, "target")
+    ev = body.get("events", body.get("ev", [x for x in (old["events"] if old else "").split(",") if x]))
+    ev = [x.strip() for x in (ev if isinstance(ev, list) else str(ev or "").split(",")) if x.strip()]
+    if any(x not in CHAT_EVENTS for x in ev):
+        raise ApiError("bad", 400, "events")
+    try:
+        minpr = int(body.get("minpr", old["minpr"] if old else 4) or 4)
+        assert 1 <= minpr <= 4
+    except Exception:
+        raise ApiError("bad", 400, "minpr")
+    bd = body.get("b", body.get("board_id", old["board_id"] if old else None))
+    bd = int(bd) if bd not in (None, "", 0, "0") else None
+    if bd and not rows("SELECT id FROM boards WHERE id=?", (bd,)):
+        raise ApiError("nf", 404, "b")
+    on = 1 if body.get("on", body.get("active", old["active"] if old else 1)) else 0
+    with lock:
+        if cid:
+            db.execute("UPDATE chats SET name=?, kind=?, url=?, target=?, events=?, board_id=?, minpr=?, active=? WHERE id=?", (name, kind, url, target, ",".join(ev), bd, minpr, on, cid))
+        else:
+            if db.execute("SELECT COUNT(*) FROM chats").fetchone()[0] >= 20:
+                raise ApiError("limit", 400)
+            cid = db.execute("INSERT INTO chats(name,kind,url,target,events,board_id,minpr,active) VALUES(?,?,?,?,?,?,?,?)", (name, kind, url, target, ",".join(ev), bd, minpr, on)).lastrowid
+    return chat_out(rows("SELECT * FROM chats WHERE id=?", (cid,))[0])
+
+
+def chat_del(cid):
+    with lock:
+        db.execute("DELETE FROM chats WHERE id=?", (cid,))
+    return {"id": cid, "x": 1}
+
+
+def chat_test(cid, actor):
+    r = rows("SELECT * FROM chats WHERE id=?", (cid,))
+    if not r:
+        raise ApiError("nf", 404)
+    ok, why = chat_send(r[0], "Test message from the task board (sent by %s). If you can read this, the channel works." % actor, "")
+    with lock:
+        db.execute("UPDATE chats SET last=?, last_ok=? WHERE id=?", (now_s() + ("" if ok else " " + why), 1 if ok else 0, cid))
+    return {"id": cid, "ok": ok, **({"err": why} if not ok else {})}
+
+
+# ---------------------------------------------------------------- wake-ups: reach agents that are not polling
+def _wake_stats(name):
+    unread = db.execute("SELECT COUNT(*) FROM notifications WHERE agent=? AND read=0", (name,)).fetchone()[0]
+    ready = db.execute("SELECT COUNT(*) FROM tasks WHERE status='todo' AND assignee=? COLLATE NOCASE AND (claimed_by='' OR claim_until<?) AND " + READY_SQL, (name, now_s())).fetchone()[0]
+    return unread, ready
+
+
+def wake_tick(actor="wake"):
+    """An agent with a webhook, work waiting and no activity for `wake_after_min` gets a signed wake-up ping (with backoff); after 3 unanswered pings a supervisor is told."""
+    mins = int(get_setting("wake_after_min", "10") or 0)
+    if mins <= 0:
+        return 0
+    n = 0
+    for a in rows("SELECT * FROM agents WHERE webhook!=''"):
+        name = a["name"]
+        unread, ready = _wake_stats(name)
+        if not (unread or ready):
+            continue
+        if a["last_seen"] and a["last_seen"] > plus_min(-mins):
+            continue
+        wn = a["wake_n"] or 0
+        if a["wake_at"] and a["wake_at"] > plus_min(-mins * (2 ** min(wn, 4))):
+            continue
+        _wake_send(a, unread, ready)
+        n += 1
+        if wn + 1 >= 3 and get_setting("wake:esc:" + name) != a["wake_at"]:
+            with lock:
+                set_setting("wake:esc:" + name, a["wake_at"] or "x")
+                escalate("unreachable", actor, None, None, "%s did not answer %d wake-ups; %d unread item(s) and %d ready task(s) are waiting" % (name, wn + 1, unread, ready), skip=(name,))
+    return n
+
+
+def _wake_send(a, unread, ready):
+    with lock:
+        db.execute("UPDATE agents SET wake_at=?, wake_n=COALESCE(wake_n,0)+1 WHERE name=?", (now_s(), a["name"]))
+    threading.Thread(target=push_json, args=(a["webhook"], a["secret"], {"agent": a["name"], "wake": {"unread": unread, "ready": ready, "since": a["last_seen"] or None, "do": "briefing"}}), daemon=True).start()
+
+
+def wake_now(actor, role, body):
+    if not _priv(role):
+        raise ApiError("forbidden", 403)
+    name = " ".join(str(body.get("n") or body.get("name") or "").split())
+    r = rows("SELECT * FROM agents WHERE name=?", (name,))
+    if not r:
+        raise ApiError("nf", 404)
+    if not r[0]["webhook"]:
+        raise ApiError("missing", 400, "hook")
+    unread, ready = _wake_stats(r[0]["name"])
+    _wake_send(r[0], unread, ready)
+    return {"n": r[0]["name"], "sent": 1, "unread": unread, "ready": ready}
+
+
+def _wake_loop():
+    while True:
+        time.sleep(60)
+        try:
+            wake_tick()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- git forge webhook (GitHub, GitLab, Gitea): link commits and PRs, move cards on PR events
+def branch_ids(ref):
+    b = re.sub(r"^refs/(?:heads|tags)/", "", str(ref or ""))
+    ids = [int(x) for x in re.findall(r"task[-_/]?(\d{1,6})", b, re.I)]
+    m = re.match(r"^(?:[A-Za-z]+/)?(\d{1,6})(?=$|[-_/])", b)
+    if m:
+        ids.append(int(m.group(1)))
+    return list(dict.fromkeys(ids))
+
+
+def _existing(ids):
+    ids = [int(i) for i in ids]
+    if not ids:
+        return []
+    have = {r["id"] for r in rows("SELECT id FROM tasks WHERE id IN (%s)" % ",".join("?" * len(ids)), ids)}
+    return [i for i in ids if i in have]
+
+
+def git_verify(h, raw):
+    sec = get_setting("git_secret")
+    if not sec:
+        raise ApiError("off", 404)
+    hexd = hmac.new(sec.encode(), raw, hashlib.sha256).hexdigest()
+    sig = h.get("X-Hub-Signature-256") or ""
+    s2 = h.get("X-Gitea-Signature") or h.get("X-Gogs-Signature") or ""
+    tk = h.get("X-Gitlab-Token") or ""
+    ok = (sig.startswith("sha256=") and hmac.compare_digest(sig[7:], hexd)) or (bool(s2) and hmac.compare_digest(s2, hexd)) or (bool(tk) and hmac.compare_digest(tk, sec))
+    if not ok:
+        raise ApiError("auth", 401)
+
+
+def git_normalize(h, p):
+    ev = h.get("X-GitHub-Event") or h.get("X-Gitea-Event") or h.get("X-Gogs-Event") or ""
+    gl = h.get("X-Gitlab-Event") or ""
+    repo = (p.get("repository") or {}).get("full_name") or (p.get("project") or {}).get("path_with_namespace") or ""
+    if ev == "push" or gl == "Push Hook":
+        return {"k": "push", "repo": repo, "branch": p.get("ref") or "",
+                "commits": [{"h": c.get("id") or c.get("sha") or "", "u": c.get("url") or "", "m": c.get("message") or "", "r": repo} for c in (p.get("commits") or [])[:50] if isinstance(c, dict)]}
+    pr = p.get("pull_request") if isinstance(p.get("pull_request"), dict) else None
+    if ev in ("pull_request", "pull_request_review") and pr:
+        head = pr.get("head") or {}
+        base = {"repo": repo, "url": pr.get("html_url") or "", "title": pr.get("title") or "", "text": pr.get("body") or "", "branch": head.get("ref") or "",
+                "sha": pr.get("merge_commit_sha") or "", "author": (pr.get("user") or {}).get("login") or "", "draft": bool(pr.get("draft"))}
+        if ev == "pull_request_review":
+            rv = p.get("review") or {}
+            return {"k": "review", **base, "state": str(rv.get("state") or "").lower(), "by": (rv.get("user") or {}).get("login") or "", "note": rv.get("body") or ""} if p.get("action") == "submitted" else None
+        a = p.get("action") or ""
+        act = "open" if a in ("opened", "reopened", "ready_for_review") else ("merge" if pr.get("merged") else "close") if a == "closed" else ""
+        return {"k": "pr", **base, "action": act} if act else None
+    oa = p.get("object_attributes") if isinstance(p.get("object_attributes"), dict) else None
+    if gl == "Merge Request Hook" and oa:
+        a = oa.get("action") or ""
+        base = {"repo": repo, "url": oa.get("url") or "", "title": oa.get("title") or "", "text": oa.get("description") or "", "branch": oa.get("source_branch") or "",
+                "sha": oa.get("merge_commit_sha") or "", "author": (p.get("user") or {}).get("username") or "", "draft": bool(oa.get("draft") or oa.get("work_in_progress"))}
+        if a in ("approved", "unapproved"):
+            return {"k": "review", **base, "state": "approved" if a == "approved" else "commented", "by": base["author"], "note": ""}
+        act = "open" if a in ("open", "reopen") else "merge" if a == "merge" else "close" if a == "close" else ""
+        return {"k": "pr", **base, "action": act} if act else None
+    if ev == "workflow_run" and isinstance(p.get("workflow_run"), dict) and p.get("action") == "completed":
+        w = p["workflow_run"]
+        prs = w.get("pull_requests") or []
+        return {"k": "ci", "repo": repo, "branch": w.get("head_branch") or "", "state": w.get("conclusion") or "", "name": w.get("name") or "workflow", "url": w.get("html_url") or "",
+                "text": (prs[0].get("html_url") if prs and isinstance(prs[0], dict) else "") or ""}
+    if gl == "Pipeline Hook" and oa:
+        return {"k": "ci", "repo": repo, "branch": oa.get("ref") or "", "state": "failure" if oa.get("status") == "failed" else oa.get("status") or "", "name": "pipeline",
+                "url": (p.get("project") or {}).get("web_url") or "", "text": ""}
+    return None
+
+
+def _git_say(tid, text, notify_type=None, summary=""):
+    comment_add("git", tid, {"c": text}, notify_assignee=False)
+    t = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+    if notify_type and t:
+        with lock:
+            notify(t[0]["assignee"], notify_type, "git", tid, t[0]["board_id"], summary or text[:200])
+
+
+def git_event(h, p):
+    n = git_normalize(h, p)
+    if not n:
+        return {"ok": 1, "ignored": 1}
+    done = []
+    if n["k"] == "push":
+        for c in n["commits"]:
+            ids = _existing(parse_task_ids(c["m"]) or branch_ids(n["branch"]))
+            for i in ids:
+                append_commit("git", i, c)
+                done.append(i)
+        return {"ok": 1, "ev": "push", "tasks": sorted(set(done))}
+    ids = _existing(parse_task_ids(n.get("title", "") + " " + n.get("text", "")) + branch_ids(n.get("branch")))
+    for tid in ids:
+        t = rows("SELECT * FROM tasks WHERE id=?", (tid,))[0]
+        who = n.get("author") or n.get("by") or "someone"
+        if n["k"] == "pr":
+            if n["url"] and t["pr_url"] != n["url"]:
+                crud("git", "PATCH", "tasks", tid, {"pu": n["url"]}, {}, False)
+            if n["action"] == "open":
+                _git_say(tid, "PR opened by %s: %s %s" % (who, n["title"][:120], n["url"]), "git.pr", "PR opened for #%d: %s" % (tid, n["title"][:100]))
+                if not n["draft"] and t["status"] in ("backlog", "todo", "in_progress"):
+                    try:
+                        crud("git", "PATCH", "tasks", tid, {"st": "review"}, {}, False)
+                    except ApiError:
+                        pass
+            elif n["action"] == "merge":
+                if n["sha"]:
+                    append_commit("git", tid, {"h": n["sha"], "m": "merged: " + n["title"], "r": n["repo"]})
+                msg = "PR merged: %s %s" % (n["title"][:120], n["url"])
+                closed = False
+                if get_setting("git_autodone", "1") != "0" and t["status"] not in ("done", "declined"):
+                    try:
+                        crud("git", "PATCH", "tasks", tid, {"st": "done"}, {}, False)
+                        closed = True
+                    except ApiError as e:
+                        msg += " - not closed automatically (%s): finish the task when ready" % e.code
+                _git_say(tid, msg + (" - task done" if closed else ""), "git.merged", "PR merged for #%d%s" % (tid, " - task done" if closed else ", still open"))
+                chat_event("git", "PR merged for #%d '%s': %s" % (tid, t["title"][:60], n["title"][:80]), tid, t["board_id"], t["priority"])
+            else:
+                _git_say(tid, "PR closed without merging: %s %s" % (n["title"][:120], n["url"]), "git.pr", "PR for #%d was closed without merging" % tid)
+                if t["status"] == "review":
+                    try:
+                        crud("git", "PATCH", "tasks", tid, {"st": "in_progress"}, {}, False)
+                    except ApiError:
+                        pass
+        elif n["k"] == "review":
+            if n["state"] in ("approved", "changes_requested"):
+                word = "approved" if n["state"] == "approved" else "requested changes on"
+                _git_say(tid, "%s %s the PR %s %s" % (who, word, n["url"], (n["note"] or "")[:200]), "git.review", "%s %s the PR for #%d" % (who, word, tid))
+                if n["state"] == "changes_requested":
+                    chat_event("git", "Changes requested on the PR for #%d '%s'" % (tid, t["title"][:60]), tid, t["board_id"], t["priority"])
+        done.append(tid)
+    if n["k"] == "ci":
+        for tid in _existing(parse_task_ids(n.get("text", "")) + branch_ids(n.get("branch"))):
+            if n["state"] in ("failure", "timed_out", "cancelled", "failed"):
+                t = rows("SELECT * FROM tasks WHERE id=?", (tid,))[0]
+                _git_say(tid, "CI %s: %s %s" % (n["state"], n["name"], n["url"]), "git.ci", "CI %s on #%d (%s)" % (n["state"], tid, n["name"]))
+                chat_event("git", "CI %s on #%d '%s' (%s)" % (n["state"], tid, t["title"][:60], n["name"]), tid, t["board_id"], t["priority"])
+                done.append(tid)
+    return {"ok": 1, "ev": n["k"], "tasks": sorted(set(done))}
+
+
+# ---------------------------------------------------------------- cost: what agents spend on each task
+def _num(v, lo, hi, field):
+    try:
+        x = float(0 if v in (None, "") else v)
+        assert lo <= x <= hi
+        return x
+    except Exception:
+        raise ApiError("bad", 400, field)
+
+
+def cost_price(model, tin, tout):
+    try:
+        pr = json.loads(get_setting("prices", "{}")).get(model)
+    except ValueError:
+        pr = None
+    return round((tin * pr[0] + tout * pr[1]) / 1e6, 6) if pr else 0.0
+
+
+def cost_log(actor, body):
+    me = _me(actor, body)
+    tid = body.get("task") or body.get("t") or body.get("id")
+    tin = int(_num(body.get("in", body.get("tin")), 0, 1e10, "in"))
+    tout = int(_num(body.get("out", body.get("tout")), 0, 1e10, "out"))
+    model = " ".join(str(body.get("model") or "").split())[:60]
+    usd = round(_num(body["usd"], 0, 1e6, "usd"), 6) if body.get("usd") not in (None, "") else cost_price(model, tin, tout)
+    if not (tin or tout or usd):
+        raise ApiError("missing", 400, "usd")
+    bid = None
+    with lock:
+        if tid not in (None, ""):
+            t = rows("SELECT * FROM tasks WHERE id=?", (int(tid),))
+            if not t:
+                raise ApiError("nf", 404, "task")
+            tid, bid = int(tid), t[0]["board_id"]
+        else:
+            tid = None
+        cid = db.execute("INSERT INTO costs(agent,task_id,board_id,model,tin,tout,usd,note) VALUES(?,?,?,?,?,?,?,?)", (me, tid, bid, model, tin, tout, usd, str(body.get("note") or "")[:200])).lastrowid
+        out = {"id": cid, "usd": usd}
+        if tid:
+            db.execute("UPDATE tasks SET cost=ROUND(COALESCE(cost,0)+?,6), tokens=COALESCE(tokens,0)+? WHERE id=?", (usd, tin + tout, tid))
+            t = rows("SELECT * FROM tasks WHERE id=?", (tid,))[0]
+            out.update({"cs": t["cost"], "tk": t["tokens"]})
+            emit(actor, "task.updated", tid, bid, {"cs": t["cost"], "tk": t["tokens"]})
+            _budget_check(t)
+    return out
+
+
+def _budget_say(key, msg, tid, bid):
+    if get_setting(key):
+        return
+    set_setting(key, "1")
+    escalate("budget", "cost", tid, bid, msg)
+    chat_event("budget", msg, tid, bid)
+
+
+def _budget_check(t):
+    bid = t["board_id"]
+    cfg = board_cfg(bid)[1]
+    tb = float(cfg.get("task_budget_usd") or 0)
+    if tb and (t["cost"] or 0) >= tb * 0.8:
+        lv = 100 if t["cost"] >= tb else 80
+        _budget_say("bud:t:%d:%d" % (t["id"], lv), "#%d '%s' has used %d%% of its $%.2f budget ($%.2f)" % (t["id"], t["title"][:60], lv if lv == 100 else round(t["cost"] / tb * 100), tb, t["cost"]), t["id"], bid)
+    month = time.strftime("%Y-%m-01", time.gmtime())
+    for scope_b, lim, label in ((bid, float(cfg.get("budget_usd") or 0), "Board '%s'" % _board_name(bid)), (None, float(get_setting("budget_usd") or 0), "All boards")):
+        if not lim:
+            continue
+        spent = db.execute("SELECT COALESCE(SUM(usd),0) FROM costs WHERE ts>=?" + (" AND board_id=?" if scope_b else ""), (month,) + ((scope_b,) if scope_b else ())).fetchone()[0]
+        if spent >= lim * 0.8:
+            lv = 100 if spent >= lim else 80
+            _budget_say("bud:b:%s:%s:%d" % (scope_b or "all", month[:7], lv), "%s has spent $%.2f of its $%.2f monthly budget (%d%%)" % (label, spent, lim, round(spent / lim * 100)), t["id"], bid)
+
+
+def cost_report(q):
+    days = max(1, min(qint(q, "days", 30) or 30, 365))
+    since = plus_min(-1440 * days)
+    fr, fa = _in("board_id", scope_of(q))
+    ag = _qv(q, "as", "agent")
+    cs = rows("SELECT * FROM costs WHERE ts>=?" + fr + (" AND agent=? COLLATE NOCASE" if ag else ""), [since] + fa + ([ag] if ag else []))
+    by_a, by_t, by_b, by_d = {}, {}, {}, {}
+    for c in cs:
+        a = by_a.setdefault(c["agent"].lower(), {"n": c["agent"], "usd": 0.0, "in": 0, "out": 0, "calls": 0, "_t": set()})
+        a["usd"] += c["usd"]; a["in"] += c["tin"]; a["out"] += c["tout"]; a["calls"] += 1
+        if c["task_id"]:
+            a["_t"].add(c["task_id"])
+            x = by_t.setdefault(c["task_id"], {"id": c["task_id"], "usd": 0.0, "tk": 0, "b": c["board_id"]})
+            x["usd"] += c["usd"]; x["tk"] += c["tin"] + c["tout"]
+        if c["board_id"]:
+            by_b[c["board_id"]] = by_b.get(c["board_id"], 0.0) + c["usd"]
+        by_d[c["ts"][:10]] = by_d.get(c["ts"][:10], 0.0) + c["usd"]
+    top = sorted(by_t.values(), key=lambda z: -z["usd"])[:8]
+    names = {r["id"]: r["title"] for r in rows("SELECT id, title FROM tasks WHERE id IN (%s)" % ",".join("?" * len(top)), [x["id"] for x in top])} if top else {}
+    bn = {r["id"]: r["name"] for r in rows("SELECT id, name FROM boards")}
+    month = time.strftime("%Y-%m-01", time.gmtime())
+    bud = []
+    for bid_, in [(r["id"],) for r in rows("SELECT id FROM boards")]:
+        lim = float(board_cfg(bid_)[1].get("budget_usd") or 0)
+        if lim and (not fa or bid_ in fa):
+            sp = db.execute("SELECT COALESCE(SUM(usd),0) FROM costs WHERE ts>=? AND board_id=?", (month, bid_)).fetchone()[0]
+            bud.append({"b": bid_, "n": bn.get(bid_, ""), "spent": round(sp, 2), "limit": lim, "pct": round(sp / lim * 100)})
+    return {"days": days, "since": since[:10], "tot": {"usd": round(sum(c["usd"] for c in cs), 4), "in": sum(c["tin"] for c in cs), "out": sum(c["tout"] for c in cs), "n": len(cs)},
+            "ag": sorted(({**{k: v for k, v in a.items() if k != "_t"}, "usd": round(a["usd"], 4), "tasks": len(a["_t"])} for a in by_a.values()), key=lambda z: -z["usd"]),
+            "tk": [{**x, "usd": round(x["usd"], 4), "t": names.get(x["id"], "")} for x in top],
+            "bd": sorted(({"b": b, "n": bn.get(b, ""), "usd": round(v, 4)} for b, v in by_b.items()), key=lambda z: -z["usd"]),
+            "day": [{"d": d, "usd": round(v, 4)} for d, v in sorted(by_d.items())], "bud": bud}
+
+
+def task_cost(tid):
+    t = rows("SELECT cost, tokens FROM tasks WHERE id=?", (tid,))
+    if not t:
+        raise ApiError("nf", 404)
+    return {"id": tid, "cs": t[0]["cost"] or 0, "tk": t[0]["tokens"] or 0,
+            "i": [{"id": c["id"], "ts": c["ts"], "by": c["agent"], "model": c["model"] or None, "in": c["tin"], "out": c["tout"], "usd": c["usd"], "note": c["note"] or None}
+                  for c in rows("SELECT * FROM costs WHERE task_id=? ORDER BY id DESC LIMIT 50", (tid,))]}
+
+
+# ---------------------------------------------------------------- links across boards and bulk move
+def task_links(tid):
+    r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+    if not r:
+        raise ApiError("nf", 404)
+    t = r[0]
+    bn = {b["id"]: b["name"] for b in rows("SELECT id, name FROM boards")}
+    ids = [int(x) for x in re.findall(r"\d+", t["depends"] or "")]
+
+    def row(x):
+        return {"id": x["id"], "t": x["title"], "st": x["status"], "b": x["board_id"], "bn": bn.get(x["board_id"], ""), "as": x["assignee"] or None,
+                "open": x["status"] not in ("done", "declined"), "x": x["board_id"] != t["board_id"]}
+    dp = [row(x) for x in rows("SELECT * FROM tasks WHERE id IN (%s)" % ",".join("?" * len(ids)), ids)] if ids else []
+    bl = [row(x) for x in rows("SELECT * FROM tasks WHERE (',' || depends || ',') LIKE ? AND status NOT IN ('done','declined') ORDER BY id", ("%," + str(tid) + ",%",))]
+    return {"id": tid, "dp": dp, "bl": bl, "cross": sum(1 for x in dp + bl if x["x"])}
+
+
+def bulk_move(actor, body):
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not ids or len(ids) > 100:
+        raise ApiError("bad", 400, "ids")
+    try:
+        ids = [int(i) for i in ids]
+        dest = int(body.get("board") or body.get("b") or body.get("board_id") or 0)
+    except (TypeError, ValueError):
+        raise ApiError("bad", 400, "b")
+    if not dest:
+        raise ApiError("missing", 400, "b")
+    opts = {k: body[k] for k in ("s", "sprint", "children", "force") if k in body}
+    ok, skipped, failed = [], [], []
+    for i in ids:
+        r = rows("SELECT board_id FROM tasks WHERE id=?", (i,))
+        if not r:
+            failed.append({"id": i, "e": "nf"})
+        elif r[0]["board_id"] == dest:
+            skipped.append(i)
+        else:
+            try:
+                res = move_task(actor, i, {"b": dest, **opts})
+                ok += [i] + list(res.get("moved") or [])
+            except ApiError as e:
+                failed.append({"id": i, "e": e.code, **({"f": e.field} if e.field else {})})
+    return {"n": len(ok), "moved": ok, "skipped": skipped, "failed": failed}
 
 
 # ---------------------------------------------------------------- templates + recurring tasks
@@ -1748,7 +2322,7 @@ def touch_presence(name):
     _seen[name] = time.time()
     with lock:
         db.execute("INSERT OR IGNORE INTO agents(name) VALUES(?)", (name,))
-        db.execute("UPDATE agents SET last_seen=? WHERE name=?", (now_s(), name))
+        db.execute("UPDATE agents SET last_seen=?, wake_n=0 WHERE name=?", (now_s(), name))
 
 
 def silent_agents():
@@ -1762,8 +2336,15 @@ def presence_set(actor, body):
     tk = body.get("task")
     with lock:
         db.execute("INSERT OR IGNORE INTO agents(name) VALUES(?)", (me,))
-        db.execute("UPDATE agents SET last_seen=?, status_text=?, status_task=? WHERE name=?", (now_s(), st, int(tk) if tk not in (None, "") else None, me))
-    return {"n": me, "ok": 1}
+        db.execute("UPDATE agents SET last_seen=?, status_text=?, status_task=?, wake_n=0 WHERE name=?", (now_s(), st, int(tk) if tk not in (None, "") else None, me))
+        renewed = []
+        if tk not in (None, ""):          # a heartbeat on a task you hold extends your claim, so long jobs never lose it
+            until = plus_min(max(15, min(int(body.get("ttl") or 30), 1440)))
+            for r in rows("SELECT id, board_id FROM tasks WHERE id=? AND claimed_by=? COLLATE NOCASE AND claim_until!='' AND claim_until<?", (int(tk), me, until)):
+                db.execute("UPDATE tasks SET claim_until=? WHERE id=?", (until, r["id"]))
+                emit(me, "task.updated", r["id"], r["board_id"], {"cu": until})
+                renewed.append(r["id"])
+    return {"n": me, "ok": 1, **({"renewed": renewed} if renewed else {})}
 
 
 # ---- claims
@@ -2280,6 +2861,12 @@ def norm_cfg(v):
             ph = [" ".join(str(x).split())[:40] for x in ph if str(x).strip()][:12]
             if ph:
                 out["phases"] = ph
+        for bk in ("budget_usd", "task_budget_usd"):
+            if v.get(bk) not in (None, "", 0, "0"):
+                x = float(v[bk])
+                if x <= 0 or x > 1e9:
+                    raise ValueError
+                out[bk] = round(x, 2)
         sl = {str(k): int(n) for k, n in (v.get("sla_hours") or {}).items() if str(k) in ("1", "2", "3", "4") and n not in (None, "", 0, "0")}
         if sl:
             if any(n < 1 or n > 24 * 365 for n in sl.values()):
@@ -2775,6 +3362,9 @@ def task_finish(actor, role, tid, body):
     if closing and st == "done" and t["status"] != "done":
         check_done_gate(tid, t["board_id"], ",".join(str(i) for i in patch["dn"]) if isinstance(patch.get("dn"), list) else patch.get("dn", t["dod_done"]))   # fail before any side effect
     did = []
+    if isinstance(body.get("cost"), dict):
+        cost_log(actor, {**body["cost"], "task": tid, "as": body.get("as")})
+        did.append("cost")
     for a in (body.get("attach") or []):
         att_add(actor, tid, a)
         did.append("attach")
@@ -2900,6 +3490,7 @@ def sprint_close(actor, sid, move_to=None, force=False):
         emit(actor, "task.updated", i, s["board_id"], {"s": target})
     db.execute("UPDATE sprints SET state='closed' WHERE id=?", (sid,))
     emit(actor, "sprint.updated", sid, s["board_id"], {"st": "closed"})
+    chat_event("sprint", "'%s' closed on %s" % (s["name"], _board_name(s["board_id"])), None, s["board_id"])
     allts = rows("SELECT assignee, status FROM tasks WHERE sprint_id=? OR id IN (%s)" % ",".join("?" * len(ids)) if ids else "SELECT assignee, status FROM tasks WHERE sprint_id=?", ([sid] + ids) if ids else [sid])
     done_n = sum(1 for t in rows("SELECT status FROM tasks WHERE sprint_id=?", (sid,)) if t["status"] == "done")
     for a in {t["assignee"] for t in allts if t["assignee"]}:
@@ -2922,6 +3513,7 @@ def sprint_start(actor, sid):
     en = s["end"] or time.strftime("%Y-%m-%d", time.gmtime(time.time() + sprint_days_for(s["board_id"]) * 86400))
     db.execute("UPDATE sprints SET state='active', start=?, \"end\"=?, committed=? WHERE id=?", (st, en, sprint_weight(sid), sid))
     emit(actor, "sprint.updated", sid, s["board_id"], {"st": "active", "from": st, "to": en})
+    chat_event("sprint", "'%s' started on %s (%s to %s)" % (s["name"], _board_name(s["board_id"]), st, en), None, s["board_id"])
     return {"id": sid, "st": "active", "from": st, "to": en}
 
 
@@ -3156,7 +3748,7 @@ def token_delete(tid):
     return {"id": tid, "x": 1}
 
 
-SETTING_KEYS = ("digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors")
+SETTING_KEYS = ("digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd")
 
 
 def get_setting(k, default=""):
@@ -3177,14 +3769,27 @@ def settings_set(body):
         for k in SETTING_KEYS:
             if k in body:
                 v = str(body[k] or "").strip()
-                if k.endswith("_url") and v:
+                if k.endswith("_url") and k != "base_url" and v:           # base_url is only ever printed in messages, never requested
                     try:
                         check_public_url(v)
                     except ApiError as e:
                         raise ApiError(e.code, 400, k)
-                if k in ("digest_hour", "backup_keep") and v:
+                if k in ("digest_hour", "backup_keep", "wake_after_min") and v:
                     try:
-                        assert 0 <= int(v) <= (23 if k == "digest_hour" else 365)
+                        assert 0 <= int(v) <= (23 if k == "digest_hour" else 1440 if k == "wake_after_min" else 365)
+                    except Exception:
+                        raise ApiError("bad", 400, k)
+                if k == "budget_usd" and v:
+                    try:
+                        assert float(v) >= 0
+                    except Exception:
+                        raise ApiError("bad", 400, k)
+                if k == "base_url" and v and not re.match(r"https?://", v):
+                    raise ApiError("bad", 400, k)
+                if k == "prices" and v:
+                    try:
+                        pj = json.loads(v)
+                        assert isinstance(pj, dict) and all(isinstance(x, list) and len(x) == 2 and all(isinstance(n, (int, float)) for n in x) for x in pj.values())
                     except Exception:
                         raise ApiError("bad", 400, k)
                 set_setting(k, v)
@@ -3556,6 +4161,25 @@ class H(BaseHTTPRequestHandler):
                 break
         return {"n": len(out), "i": out}
 
+    def git_hook(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 5 * 1024 * 1024:
+            self.close_connection = True
+            return self.err("too_big", 413)
+        raw = self.rfile.read(n) if n else b""
+        try:
+            git_verify(self.headers, raw)
+            try:
+                p = json.loads(raw or b"{}")
+            except ValueError:
+                raise ApiError("json", 400)
+            if not isinstance(p, dict):
+                raise ApiError("json", 400)
+            _ctx.role = "agent"
+            return self.send_json(200, git_event(self.headers, p))
+        except ApiError as e:
+            return self.err(e.code, e.status, e.field)
+
     def read_body(self, limit=None):
         n = int(self.headers.get("Content-Length") or 0)
         if n > (limit or MAX_BODY):
@@ -3582,6 +4206,8 @@ class H(BaseHTTPRequestHandler):
             return self.static(path)
         if rate_hit("authfail:" + self.client_ip(), AUTH_FAILS_PER_MIN, count=False):
             return self.err("rate", 429)
+        if path == "/api/hooks/git" and method == "POST":
+            return self.git_hook()
         actor = self.actor(q)
         if actor is None:
             rate_hit("authfail:" + self.client_ip(), AUTH_FAILS_PER_MIN)
@@ -3609,7 +4235,7 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, {"ok": True, **res, "h": NUDGE_HOURS})
             if self.role == "viewer" and method != "GET":
                 return self.err("forbidden", 403)
-            if self.role != "admin" and (path.startswith(("/api/admin", "/api/tokens", "/api/settings", "/api/import")) or
+            if self.role != "admin" and (path.startswith(("/api/admin", "/api/tokens", "/api/settings", "/api/import", "/api/chats")) or
                                          (method == "DELETE" and (re.match(r"/api/boards/", path) or (re.match(r"/api/sprints/", path) and self.role != "supervisor")))):
                 return self.err("forbidden", 403)
             if path == "/api/tokens":
@@ -3774,6 +4400,33 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, retro_get(int(mrt.group(1))))
             if mrt and method == "POST":
                 return self.send_json(200, retro_save(actor, int(mrt.group(1)), self.read_body()))
+            if path == "/api/admin/git-secret" and method == "POST":
+                with lock:
+                    set_setting("git_secret", secrets.token_urlsafe(24))
+                return self.send_json(200, {"secret": get_setting("git_secret"), "hook": "/api/hooks/git", "events": "push, pull_request, pull_request_review, workflow_run (GitHub); Push, Merge Request, Pipeline (GitLab)"})
+            if path == "/api/chats":
+                if method == "GET":
+                    return self.send_json(200, chats_list())
+                if method == "POST":
+                    b_ = self.read_body()
+                    return self.send_json(200, chat_save(b_, int(b_["id"]) if b_.get("id") else None))
+                if method == "DELETE":
+                    return self.send_json(200, chat_del(qint(q, "id", 0)))
+            mct = re.fullmatch(r"/api/chats/(\d+)/test", path)
+            if mct and method == "POST":
+                return self.send_json(200, chat_test(int(mct.group(1)), actor))
+            if path == "/api/cost":
+                if method == "POST":
+                    return self.send_json(201, cost_log(actor, self.read_body()))
+                if method == "GET":
+                    return self.send_json(200, cost_report(q))
+            mtc = re.fullmatch(r"/api/tasks/(\d+)/(cost|links)", path)
+            if mtc and method == "GET":
+                return self.send_json(200, (task_cost if mtc.group(2) == "cost" else task_links)(int(mtc.group(1))))
+            if path == "/api/tasks/move" and method == "POST":
+                return self.send_json(200, bulk_move(actor, self.read_body()))
+            if path == "/api/agents/wake" and method == "POST":
+                return self.send_json(200, wake_now(actor, self.role, self.read_body()))
             if path == "/api/briefing" and method == "GET":
                 return self.send_json(200, briefing(actor, q))
             if path == "/api/next" and method == "POST":
@@ -3988,6 +4641,7 @@ class S(ThreadingHTTPServer):
 
 def _nudge_loop():
     import time
+    threading.Thread(target=_wake_loop, name="wake", daemon=True).start()
     while True:
         time.sleep(max(NUDGE_INTERVAL_SEC, 60))
         try:

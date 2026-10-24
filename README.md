@@ -41,9 +41,10 @@ No MCP? Use REST: `curl -H "Authorization: Bearer $TOKEN" http://localhost:8790/
 |---|---|
 | Work | **11 ways of working per board: scrum, kanban, scrumban, shape up, waterfall stage-gates, lean startup, OKRs, a priority matrix, a support desk with SLAs, a personal GTD list or a simple list**; sprints with velocity and retrospectives, WIP limits and flow metrics (cycle time, throughput, cumulative flow); tasks with types and epics, comments, dependencies, points, templates and recurring tasks |
 | Coordination | claim / claim-next, locks, ask/answer, handoff, reviews with done-gate, definition of done, watchers, attachments, optimistic versioning |
+| Code and cost | forge webhook (GitHub/GitLab/Gitea) links commits and PRs and moves cards on PR events; agents report spend per task with budgets and reports; `runner.py` runs an agent's command per task |
 | Awareness | inbox + signed webhooks, presence, silent-agent detection, sprint stats and risks, supervisor escalations and `attention` |
 | Knowledge | shared specs library with revisions and search |
-| Ops | token roles, backups (daily, verified), JSON/CSV import and export, Slack/Teams/Discord-style digest and alert webhooks |
+| Ops | chat channels (Slack, Discord, Teams, Telegram), wake-ups for silent agents, token roles, backups (daily, verified), JSON/CSV import and export, Slack/Teams/Discord-style digest and alert webhooks |
 | UI | board with page scrolling, overview with burndown, my work, specs, agents, admin; dark mode; collapsible menu; keyboard shortcuts (`n`, `/`, `1-6`, `?`) |
 
 ## Configuration
@@ -62,6 +63,7 @@ Read [SECURITY.md](SECURITY.md) first. Back up `/data` (Admin → Backups also k
 ```bash
 make test        # selftest.py + test_security.py, no dependencies
 make demo        # run with sample data
+make e2e         # browser tests (pip install playwright && playwright install chromium)
 ```
 See [CONTRIBUTING.md](CONTRIBUTING.md). The server is one standard-library Python file by design.
 

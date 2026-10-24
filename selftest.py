@@ -605,3 +605,185 @@ with _cf.ThreadPoolExecutor(32) as ex:
 assert not errs, errs[:3]
 assert server.db.execute("SELECT COUNT(*) FROM events").fetchone()[0] > 0 and server.last_event() > 0
 print("v13 selftest OK")
+
+# ================= v14: forge webhook, cost, wake-ups, bulk move + links, chat channels =================
+import hashlib, hmac as _hmac, http.server, time as _time
+sink = []
+class Sink(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers["Content-Length"]))
+        sink.append({"path": self.path, "h": dict(self.headers), "b": json.loads(raw), "raw": raw})
+        self.send_response(200); self.end_headers()
+    def log_message(self, *a): pass
+sk = http.server.ThreadingHTTPServer(("127.0.0.1", 8793), Sink); threading.Thread(target=sk.serve_forever, daemon=True).start()
+def waitfor(fn, n=60):
+    for _ in range(n):
+        r = fn()
+        if r: return r
+        _time.sleep(0.1)
+    return None
+def gh(event, payload, secret, scheme="github", bad=False):
+    raw = json.dumps(payload).encode()
+    sig = _hmac.new((secret + ("x" if bad else "")).encode(), raw, hashlib.sha256).hexdigest()
+    h = {"Content-Type": "application/json", "X-GitHub-Event": event, "X-Hub-Signature-256": "sha256=" + sig} if scheme == "github" else {"Content-Type": "application/json", "X-Gitlab-Event": event, "X-Gitlab-Token": secret + ("x" if bad else "")}
+    rq = urllib.request.Request(U + "/hooks/git", data=raw, headers=h, method="POST")
+    try:
+        with urllib.request.urlopen(rq) as x: return x.status, json.loads(x.read())
+    except urllib.error.HTTPError as e: return e.code, json.loads(e.read())
+
+# ---- git forge webhook
+st, gb = J("POST", "/boards", {"n": "Git board"}); GB = gb["id"]
+st, gdod = J("POST", "/boards", {"n": "Git gated", "dod": "tests pass"}); GD = gdod["id"]
+assert gh("push", {"commits": []}, "nope")[0] == 404                                                                        # off until a secret exists
+assert J("POST", "/admin/git-secret", {}, tok="wtok")[0] == 403
+sec = J("POST", "/admin/git-secret", {})[1]["secret"]; assert len(sec) >= 20
+assert gh("push", {"commits": []}, sec, bad=True)[0] == 401 and gh("push", {"commits": []}, sec, scheme="gitlab", bad=True)[0] == 401
+st, g1 = J("POST", "/tasks", {"b": GB, "t": "git linked", "as": "Coder", "st": "in_progress"}); J("GET", "/inbox?as=Coder&ack=1")
+r = gh("push", {"ref": "refs/heads/main", "repository": {"full_name": "o/r"}, "commits": [{"id": "abc1234", "message": "fix the thing (#%d)" % g1["id"], "url": "https://github.com/o/r/commit/abc1234"}, {"id": "ddd", "message": "unrelated"}]}, sec)[1]
+assert r["tasks"] == [g1["id"]], r
+assert J("GET", f"/tasks/{g1['id']}")[1]["cm"][0]["h"] == "abc1234"
+r = gh("push", {"ref": "refs/heads/task-%d-login" % g1["id"], "repository": {"full_name": "o/r"}, "commits": [{"id": "eee1111", "message": "wip no id"}]}, sec)[1]; assert r["tasks"] == [g1["id"]]      # id from the branch name
+pr = {"action": "opened", "repository": {"full_name": "o/r"}, "pull_request": {"html_url": "https://github.com/o/r/pull/7", "title": "Login fix", "body": "Closes #%d" % g1["id"], "head": {"ref": "feat/x"}, "user": {"login": "dev"}, "merged": False, "draft": False}}
+assert gh("pull_request", pr, sec)[1]["tasks"] == [g1["id"]]
+g = J("GET", f"/tasks/{g1['id']}?ctx=1")[1]; assert g["pu"] == "https://github.com/o/r/pull/7" and g["st"] == "review" and any("PR opened" in c["c"] for c in g["cc"]), g
+assert any(n["ty"] == "git.pr" for n in J("GET", "/inbox?as=Coder&ack=1")[1]["i"])
+rv = {"action": "submitted", "repository": {"full_name": "o/r"}, "pull_request": pr["pull_request"], "review": {"state": "changes_requested", "user": {"login": "lead"}, "body": "please add a test"}}
+assert gh("pull_request_review", rv, sec)[1]["tasks"] == [g1["id"]] and any(n["ty"] == "git.review" for n in J("GET", "/inbox?as=Coder&ack=1")[1]["i"])
+ci = {"action": "completed", "repository": {"full_name": "o/r"}, "workflow_run": {"conclusion": "failure", "head_branch": "task-%d-login" % g1["id"], "name": "CI", "html_url": "https://github.com/o/r/actions/runs/1", "pull_requests": []}}
+assert gh("workflow_run", ci, sec)[1]["tasks"] == [g1["id"]] and any(n["ty"] == "git.ci" for n in J("GET", "/inbox?as=Coder&ack=1")[1]["i"])
+pr["action"] = "closed"; pr["pull_request"] = {**pr["pull_request"], "merged": True, "merge_commit_sha": "feedbee"}
+assert gh("pull_request", pr, sec)[1]["tasks"] == [g1["id"]]
+g = J("GET", f"/tasks/{g1['id']}")[1]; assert g["st"] == "done" and any(c["h"] == "feedbee" for c in g["cm"]), g                    # merged -> done
+# a board with a definition of done is not closed behind its back
+st, g2 = J("POST", "/tasks", {"b": GD, "t": "gated merge", "as": "Coder", "st": "review"})
+m2 = {"action": "closed", "repository": {"full_name": "o/r"}, "pull_request": {"html_url": "https://github.com/o/r/pull/8", "title": "Gated #%d" % g2["id"], "body": "", "head": {"ref": "x"}, "merged": True, "merge_commit_sha": "cafe", "user": {"login": "dev"}}}
+gh("pull_request", m2, sec); g = J("GET", f"/tasks/{g2['id']}?ctx=1")[1]
+assert g["st"] == "review" and any("not closed automatically" in c["c"] for c in g["cc"]), g
+J("POST", "/settings", {"git_autodone": "0"}); st, g3 = J("POST", "/tasks", {"b": GB, "t": "no autodone", "st": "review"})
+m2["pull_request"]["title"] = "Third #%d" % g3["id"]; gh("pull_request", m2, sec); assert J("GET", f"/tasks/{g3['id']}")[1]["st"] == "review"; J("POST", "/settings", {"git_autodone": "1"})
+# GitLab merge request with a token header; unknown events are accepted and ignored
+st, g4 = J("POST", "/tasks", {"b": GB, "t": "gitlab one"})
+glp = {"project": {"path_with_namespace": "g/p"}, "user": {"username": "dev"}, "object_attributes": {"action": "open", "url": "https://gitlab.com/g/p/-/merge_requests/3", "title": "MR for #%d" % g4["id"], "description": "", "source_branch": "b", "draft": False}}
+assert gh("Merge Request Hook", glp, sec, scheme="gitlab")[1]["tasks"] == [g4["id"]] and J("GET", f"/tasks/{g4['id']}")[1]["st"] == "review"
+assert gh("star", {"x": 1}, sec)[1].get("ignored") == 1
+print("v14 git OK")
+
+# ---- cost
+st, cb = J("POST", "/boards", {"n": "Cost board", "cf": {"task_budget_usd": 1, "budget_usd": 2}}); CB = cb["id"]
+st, ct1 = J("POST", "/tasks", {"b": CB, "t": "costly", "as": "Worker"}); J("GET", "/inbox?as=Sup%20Bot&ack=1")
+r = J("POST", "/cost", {"task": ct1["id"], "in": 1000, "out": 500, "usd": 0.85, "model": "m1"}, tok="wtok")[1]
+assert r["usd"] == 0.85 and r["cs"] == 0.85 and r["tk"] == 1500, r
+assert J("GET", f"/tasks/{ct1['id']}")[1]["cs"] == 0.85 and J("GET", f"/tasks/{ct1['id']}")[1]["tk"] == 1500
+assert [n["ty"] for n in J("GET", "/inbox?as=Sup%20Bot&ack=1")[1]["i"]] == ["esc.budget"]                                     # 80% of the task budget, once
+J("POST", "/cost", {"task": ct1["id"], "usd": 0.1}, tok="wtok"); assert not [n for n in J("GET", "/inbox?as=Sup%20Bot&ack=1")[1]["i"] if n["ty"] == "esc.budget" and "100%" not in n["m"] and "80%" in n["m"]]
+J("POST", "/cost", {"task": ct1["id"], "usd": 0.2}, tok="wtok"); J("POST", "/cost", {"task": ct1["id"], "usd": 0.2}, tok="wtok")
+assert len([n for n in J("GET", "/inbox?as=Sup%20Bot&ack=1")[1]["i"] if n["ty"] == "esc.budget"]) <= 2                        # the 100% (task) and 80% (board) warnings, never repeated per call
+J("POST", "/settings", {"prices": json.dumps({"mdl": [3, 15]})}); r = J("POST", "/cost", {"task": ct1["id"], "in": 1000000, "out": 100000, "model": "mdl"}, tok="wtok")[1]
+assert r["usd"] == 4.5, r                                                                                                    # 1M in x $3 + 0.1M out x $15
+assert J("POST", "/settings", {"prices": "not json"})[1]["e"] == "bad"
+rep = J("GET", f"/cost?b={CB}")[1]; assert rep["tot"]["n"] == 5 and rep["ag"][0]["n"] == "Worker" and rep["tk"][0]["id"] == ct1["id"] and rep["bud"][0]["pct"] >= 100 and rep["day"], rep
+assert any(i["k"] == "budget" for i in J("GET", f"/attention?b={CB}")[1]["i"])
+assert J("GET", f"/tasks/{ct1['id']}/cost")[1]["i"][0]["by"] == "Worker"
+assert J("POST", "/cost", {"task": ct1["id"], "usd": 1}, tok="vtok")[0] == 403 and J("POST", "/cost", {"task": 99999, "usd": 1}, tok="wtok")[1]["e"] == "nf" and J("POST", "/cost", {}, tok="wtok")[1]["e"] == "missing"
+st, ct2 = J("POST", "/tasks", {"b": CB, "t": "finish with cost", "as": "Worker"}); J("POST", f"/tasks/{ct2['id']}/finish", {"summary": "done", "cost": {"in": 10, "out": 5, "usd": 0.01, "model": "m1"}}, tok="wtok")
+assert J("GET", f"/tasks/{ct2['id']}")[1]["cs"] == 0.01
+print("v14 cost OK")
+
+# ---- wake-ups and heartbeat renewal
+J("POST", "/agents", {"n": "Sleeper", "hook": "http://127.0.0.1:8793/wake", "secret": "ws"})
+st, wt = J("POST", "/tasks", {"b": GB, "t": "wake me", "as": "Sleeper", "st": "todo"})
+server.db.execute("UPDATE agents SET last_seen=? WHERE name='Sleeper'", ("2000-01-01 00:00:00",)); sink.clear()
+J("POST", "/settings", {"wake_after_min": "5"})
+assert server.wake_tick() >= 1
+w = waitfor(lambda: [x for x in sink if x["path"] == "/wake" and "wake" in x["b"]]); assert w and w[0]["b"]["wake"]["ready"] >= 1 and w[0]["b"]["agent"] == "Sleeper", sink
+assert w[0]["h"].get("X-Taskboard-Signature", "").startswith("sha256=") and _hmac.new(b"ws", w[0]["raw"], hashlib.sha256).hexdigest() in w[0]["h"]["X-Taskboard-Signature"]
+assert server.wake_tick() == 0                                                                                               # cooldown: no repeat right away
+J("GET", "/inbox?as=Sup%20Bot&ack=1")
+for _ in range(2):                                                                                                           # unanswered pings back off, the third tells the supervisor
+    server.db.execute("UPDATE agents SET wake_at=? WHERE name='Sleeper'", ("2000-01-01 00:00:00",)); server.wake_tick()
+assert any(n["ty"] == "esc.unreachable" for n in J("GET", "/inbox?as=Sup%20Bot&ack=1")[1]["i"])
+J("POST", "/presence", {"as": "Sleeper", "status": "back"}); assert server.db.execute("SELECT wake_n FROM agents WHERE name='Sleeper'").fetchone()[0] == 0   # answering resets it
+assert J("POST", "/agents/wake", {"n": "Sleeper"})[1]["sent"] == 1 and J("POST", "/agents/wake", {"n": "Sleeper"}, tok="wtok")[0] == 403 and J("POST", "/agents/wake", {"n": "Nobody"})[1]["e"] == "nf"
+st, hc = J("POST", "/tasks", {"b": GB, "t": "long job", "as": "Worker", "st": "todo"}); J("POST", f"/tasks/{hc['id']}/claim", {"ttl": 1}, tok="wtok")
+c0 = J("GET", f"/tasks/{hc['id']}")[1]["cu"]; r = J("POST", "/presence", {"status": "building", "task": hc["id"], "ttl": 60}, tok="wtok")[1]
+assert r["renewed"] == [hc["id"]] and J("GET", f"/tasks/{hc['id']}")[1]["cu"] > c0, r                                      # heartbeat extends the claim
+print("v14 wake OK")
+
+# ---- bulk move and cross-board links
+st, bm1 = J("POST", "/boards", {"n": "Bulk A"}); st, bm2 = J("POST", "/boards", {"n": "Bulk B"})
+ids = [J("POST", "/tasks", {"b": bm1["id"], "t": "bulk %d" % i})[1]["id"] for i in range(3)]
+st, bep = J("POST", "/tasks", {"b": bm1["id"], "t": "bulk epic", "ty": "epic"}); bkid = J("POST", "/tasks", {"b": bm1["id"], "t": "epic child", "pa": bep["id"]})[1]["id"]
+stay = J("POST", "/tasks", {"b": bm2["id"], "t": "already there"})[1]["id"]
+r = J("POST", "/tasks/move", {"ids": ids + [bep["id"], stay, 99999], "b": bm2["id"]})[1]
+assert sorted(r["moved"]) == sorted(ids + [bep["id"], bkid]) and r["skipped"] == [stay] and r["failed"] == [{"id": 99999, "e": "nf"}], r
+assert all(J("GET", f"/tasks/{i}")[1]["b"] == bm2["id"] for i in ids + [bep["id"], bkid])
+assert J("POST", "/tasks/move", {"ids": ids, "b": bm1["id"]}, tok="vtok")[0] == 403 and J("POST", "/tasks/move", {"ids": [], "b": 1})[1]["e"] == "bad" and J("POST", "/tasks/move", {"ids": ids})[1]["e"] == "missing"
+up = J("POST", "/tasks", {"b": bm1["id"], "t": "upstream"})[1]["id"]; dn_ = J("POST", "/tasks", {"b": bm2["id"], "t": "downstream", "dp": [up]})[1]["id"]
+lk = J("GET", f"/tasks/{dn_}/links")[1]; assert lk["cross"] == 1 and lk["dp"][0]["id"] == up and lk["dp"][0]["x"] is True and lk["dp"][0]["bn"] == "Bulk A", lk
+assert J("GET", f"/tasks/{up}/links")[1]["bl"][0]["id"] == dn_
+assert any(i["k"] == "dep-cross" and dn_ in i["ids"] for i in J("GET", f"/attention?b={bm2['id']}")[1]["i"])
+assert J("GET", f"/tasks/{dn_}/links", tok="vtok")[0] == 200 and J("GET", "/tasks/99999/links")[0] == 404
+print("v14 bulk + links OK")
+
+# ---- chat channels
+assert J("GET", "/chats", tok="wtok")[0] == 403 and J("POST", "/chats", {"n": "x"}, tok="stok")[0] == 403
+assert J("POST", "/chats", {"n": "bad kind", "kind": "irc", "url": "http://127.0.0.1:8793/c"})[1]["e"] == "bad" and J("POST", "/chats", {"n": "tg", "kind": "telegram", "url": "http://127.0.0.1:8793/c"})[1]["e"] == "missing"
+assert J("POST", "/chats", {"n": "bad ev", "url": "http://127.0.0.1:8793/c", "events": ["nope"]})[1]["e"] == "bad"
+sink.clear()
+ch1 = J("POST", "/chats", {"n": "Ops", "kind": "slack", "url": "http://127.0.0.1:8793/slack", "events": ["blocked", "done"], "minpr": 2})[1]
+assert ch1["n"] == "Ops" and "url" not in ch1 and ch1["host"] == "127.0.0.1" and ch1["ev"] == ["blocked", "done"], ch1                   # the URL is a secret: never echoed back
+ch2 = J("POST", "/chats", {"n": "Discord", "kind": "discord", "url": "http://127.0.0.1:8793/discord", "events": ["blocked"]})[1]
+ch3 = J("POST", "/chats", {"n": "Telegram", "kind": "telegram", "token": "123:ABC", "target": "-100"})[1]
+assert server.rows("SELECT url FROM chats WHERE id=?", (ch3["id"],))[0]["url"] == "https://api.telegram.org/bot123:ABC/sendMessage"          # built from the bot token
+server.db.execute("UPDATE chats SET url=? WHERE id=?", ("http://127.0.0.1:8793/tg", ch3["id"]))                                              # never call the real service from a test
+assert J("POST", f"/chats/{ch2['id']}/test", {})[1]["ok"] is True and waitfor(lambda: [x for x in sink if x["path"] == "/discord"])
+st, ctk = J("POST", "/tasks", {"b": GB, "t": "chat me", "pr": 1, "as": "Coder", "st": "in_progress"}); sink.clear()
+J("PATCH", f"/tasks/{ctk['id']}", {"st": "blocked", "bl": "waiting on legal"})
+m = waitfor(lambda: [x for x in sink if x["path"] == "/slack"]); assert m and "blocked" in m[0]["b"]["text"] and "waiting on legal" in m[0]["b"]["text"], sink
+d = waitfor(lambda: [x for x in sink if x["path"] == "/discord"]); assert d and "content" in d[0]["b"]
+J("PATCH", f"/tasks/{ctk['id']}", {"st": "done"}); assert waitfor(lambda: [x for x in sink if x["path"] == "/slack" and "done" in x["b"]["text"]])          # Ops listens to done, Discord does not
+_time.sleep(0.4); assert not [x for x in sink if x["path"] == "/discord" and "done" in x["b"].get("content", "")]
+st, low = J("POST", "/tasks", {"b": GB, "t": "low priority", "pr": 4, "st": "todo"}); n0 = len(sink)
+J("PATCH", f"/tasks/{low['id']}", {"st": "done"}); _time.sleep(0.5); assert not [x for x in sink[n0:] if x["path"] == "/slack"]                      # below the channel's minimum priority
+assert J("POST", "/chats", {"id": ch1["id"], "on": False})[1]["on"] is False
+n0 = len(sink); st, hi = J("POST", "/tasks", {"b": GB, "t": "paused channel", "pr": 1, "st": "todo"}); J("PATCH", f"/tasks/{hi['id']}", {"st": "done"}); _time.sleep(0.5); assert not [x for x in sink[n0:] if x["path"] == "/slack"]
+assert any(c["id"] == ch3["id"] and c["kind"] == "telegram" for c in J("GET", "/chats")[1]["i"])
+J("POST", "/settings", {"base_url": "https://board.example.com"}); sink.clear(); J("POST", f"/chats/{ch2['id']}/test", {}); _time.sleep(0.5)
+assert all(J("DELETE", f"/chats?id={c}")[0] == 200 for c in (ch1["id"], ch2["id"], ch3["id"])) and J("GET", "/chats")[1]["i"] == []
+print("v14 chat OK")
+print("v14 selftest OK")
+
+# ---- runner: claims a task, runs the command, reports
+import runner
+cfgr = dict(url="http://127.0.0.1:8791", token="wtok", agent="Worker", labels="runner-test", ttl=30, beat=0.3, timeout=30)
+out_f = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "runner.out")
+st, rt1 = J("POST", "/tasks", {"b": GB, "t": "run me", "pr": 1, "st": "todo", "lb": "runner-test"})
+os.environ["OUT"] = out_f
+assert runner.cycle(runner.Cfg(cmd="python3 -c \"import os; open(os.environ['OUT'],'w').write(os.environ['TB_TASK_ID'] + '|' + os.environ['TB_TASK_TITLE'])\"", **cfgr)) == rt1["id"]
+assert open(out_f).read() == "%d|run me" % rt1["id"]
+g = J("GET", f"/tasks/{rt1['id']}?ctx=1")[1]
+assert not g.get("cb") and any("still open" in c["c"] for c in g["cc"]), g                                                   # nothing finished it: noted and released
+assert runner.cycle(runner.Cfg(cmd="true", **cfgr)) is None                                                                  # nothing else ready for that skill
+st, rt2 = J("POST", "/tasks", {"b": GB, "t": "run and fail", "pr": 1, "st": "todo", "lb": "runner-test"})
+assert runner.cycle(runner.Cfg(cmd="echo boom >&2; exit 3", **cfgr)) == rt2["id"]
+g = J("GET", f"/tasks/{rt2['id']}?ctx=1")[1]; assert g["st"] == "blocked" and "exit 3" in g["bl"] and any("boom" in c["c"] for c in g["cc"]), g
+st, rt3 = J("POST", "/tasks", {"b": GB, "t": "run and finish", "pr": 1, "st": "todo", "lb": "runner-test"})
+fin = "python3 -c \"import os,json,urllib.request as u; r=u.Request(os.environ['TB_URL']+'/api/tasks/'+os.environ['TB_TASK_ID']+'/finish', data=json.dumps({'summary':'built it'}).encode(), headers={'Authorization':'Bearer '+os.environ['TB_TOKEN'],'Content-Type':'application/json'}, method='POST'); u.urlopen(r)\""
+assert runner.cycle(runner.Cfg(cmd=fin, **cfgr)) == rt3["id"] and J("GET", f"/tasks/{rt3['id']}")[1]["st"] == "done"          # the command finished it itself
+print("v14 runner OK")
+
+# ---- MCP surface: the new tools exist, and the default profile stays small
+import subprocess
+def mcp(env_tools, *msgs):
+    pr = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True,
+                        env={**os.environ, "TASKBOARD_URL": "http://127.0.0.1:8791", "TASKBOARD_TOKEN": "tok", "TASKBOARD_TOOLS": env_tools}, timeout=60)
+    return [json.loads(x) for x in pr.stdout.splitlines() if x.strip()]
+core = mcp("core", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})[0]["result"]["tools"]
+allt = mcp("all", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})[0]["result"]["tools"]
+assert len(json.dumps(core)) < 8000 and not {"chats", "git_secret", "move_tasks", "wake_agent", "cost_report"} & {t["name"] for t in core}, len(json.dumps(core))
+assert {"cost", "cost_report", "links", "move_tasks", "wake_agent", "chats", "git_secret"} <= {t["name"] for t in allt}
+r = mcp("all", {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "chats", "arguments": {"action": "list"}}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "cost_report", "arguments": {"days": 7}}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "links", "arguments": {"id": dn_}}})
+assert json.loads(r[0]["result"]["content"][0]["text"])["kinds"] and "tot" in json.loads(r[1]["result"]["content"][0]["text"]) and json.loads(r[2]["result"]["content"][0]["text"])["cross"] == 1
+print("v14 mcp OK")

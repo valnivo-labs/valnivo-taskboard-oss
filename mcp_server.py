@@ -71,6 +71,17 @@ def S(req=(), **p):
     return {"type": "object", "properties": p, "required": list(req)}
 
 
+def _chats(a):
+    act = a.pop("action", "list")
+    if act == "list":
+        return api("GET", "/chats")
+    if act in ("add", "set"):
+        return api("POST", "/chats", a)
+    if act in ("del", "test") and "id" in a:
+        return api("DELETE", "/chats?id=%s" % a["id"]) if act == "del" else api("POST", "/chats/%s/test" % a["id"], {})
+    return {"e": "bad", "f": "action"}
+
+
 TOOLS = {
     "boards": ("List boards", S(), lambda a: api("GET", "/boards")),
     "board": ("Board snapshot: sprints (p=[done,total]) + tasks without descriptions. Pass d=1 for descriptions.",
@@ -175,7 +186,7 @@ TOOLS = {
                       S(["id", "decision"], id=i, decision={"type": "string", "enum": ["approve", "changes"]}, note=s, **{"as": s}), lambda a: api("POST", f"/reviews/{a['id']}/decide", {k: v for k, v in idn(a).items() if k != 'id'})),
     "reviews": ("List reviews (default pending). Filter reviewer=, from=, task=, st=pending|approved|changes|all.", S(reviewer=s, **{"from": s}, task=i, st=s), lambda a: api("GET", "/reviews" + qs(a, ["reviewer", "from", "task", "st"]))),
     "heartbeat": ("Tell the board you are alive and what you are doing: status (one line), task (id). Agents silent for 60+ min with in-progress work are flagged and escalated.",
-                  S(status=s, task=i, **{"as": s}), lambda a: api("POST", "/presence", idn(a))),
+                  S(status=s, task=i, ttl=i, **{"as": s}), lambda a: api("POST", "/presence", idn(a))),
     "route": ("Which agent should take this? Candidates with the skill (or any label match), least loaded first, silent agents last. skill=, lb=. Create a task with as='auto' to assign automatically.",
               S(skill=s, lb=s), lambda a: api("GET", "/route" + qs(a, ["skill", "lb"]))),
     "envs": ("Environment registry: what is deployed where (sha, who, when) and freeze windows.", S(), lambda a: api("GET", "/envs")),
@@ -213,8 +224,22 @@ TOOLS = {
     "next": ("Claim the best ready task for you (priority, todo, no open dependencies, unclaimed) and get its context in the same response: description, open deps, latest comments, rules, attachment count. lb=labels/skills to match, b=board, ttl=minutes. {none:1} when the queue is empty.",
              S(lb=s, b=i, ttl=i, **{"as": s}), lambda a: api("POST", "/next", idn(a))),
     "finish": ("Wrap up a task in ONE call: summary (required) is posted as a comment; optional attach=[{name,url,kind}], pr, sha, dn=[ticked checklist items]; then st=done (default), or review=<reviewer> to ask for review, or to=<agent> (+next) to hand it over. The done gate (checklist, open reviews) is checked before anything is written.",
-               S(["id", "summary"], id=i, summary=s, pr=s, sha=s, dn={"type": ["array", "string"]}, attach={"type": "array", "items": {"type": "object", "properties": {"name": s, "url": s, "kind": s}}}, to=s, next=s, review=s, st=stenum, **{"as": s}),
+               S(["id", "summary"], id=i, summary=s, pr=s, sha=s, dn={"type": ["array", "string"]}, attach={"type": "array", "items": {"type": "object", "properties": {"name": s, "url": s, "kind": s}}}, to=s, next=s, review=s, st=stenum, cost={"type": "object", "properties": {"in": i, "out": i, "usd": {"type": "number"}, "model": s}}, **{"as": s}),
                lambda a: api("POST", f"/tasks/{a['id']}/finish", {k: v for k, v in idn(a).items() if k != 'id'})),
+    "cost": ("Log what work cost: in/out tokens and usd (or only model: priced from the admin price table), optional task id and note. Task, board and monthly budgets warn the supervisor. finish takes the same as cost={...}.",
+             S(task=i, usd={"type": "number"}, model=s, note=s, **{"in": i, "out": i, "as": s}), lambda a: api("POST", "/cost", idn(a))),
+    "cost_report": ("Spend per agent, task, board and day, plus monthly budget use. days (default 30), b|tm|bs scope, as=agent.",
+                    S(days=i, b=i, tm=s, bs=s, **{"as": s}), lambda a: api("GET", "/cost" + qs(a, ["days", "b", "tm", "bs", "as"]))),
+    "links": ("A task's dependencies (dp) and the open tasks waiting on it (bl), across boards: each has board name bn and x=true when it is on another board.",
+              S(["id"], id=i), lambda a: api("GET", f"/tasks/{a['id']}/links")),
+    "move_tasks": ("Move several tasks (ids, up to 100) to board b; epics bring their children. Same rules as move_task. Returns moved, skipped (already there) and failed [{id,e}].",
+                   S(["ids", "b"], ids={"type": "array", "items": i}, b=i, s=i, children={"type": "boolean"}, force={"type": "boolean"}), lambda a: api("POST", "/tasks/move", a)),
+    "wake_agent": ("Supervisor/admin: send a wake-up ping to an agent's webhook now (it also happens by itself when work waits and the agent is silent). n=agent name.",
+                   S(["n"], n=s), lambda a: api("POST", "/agents/wake", a)),
+    "chats": ("Admin: chat channels for humans (slack|discord|teams|telegram|generic). action list|add|set|del|test; add/set take n, kind, url (telegram: token + target chat id), events (blocked,done,review,declined,assigned,escalation,sprint,budget,git), minpr 1-4, b (board), on.",
+              S(action=s, id=i, n=s, kind=s, url=s, token=s, target=s, events={"type": "array", "items": s}, minpr=i, b=i, on={"type": "boolean"}), lambda a: _chats(dict(a))),
+    "git_secret": ("Admin: create a new secret for the git webhook (POST /api/hooks/git from GitHub, GitLab or Gitea). Returns the secret once to paste into the forge.",
+                   S(), lambda a: api("POST", "/admin/git-secret", {})),
     "batch": ("Run up to 20 calls in one round trip: ops=[{m:'GET'|'POST'|'PATCH'|'DELETE', p:'/tasks/7', b:{...}}]. Stops at the first error unless cont=true. Returns [{s:status, r:result}].",
               S(["ops"], ops={"type": "array", "items": {"type": "object", "properties": {"m": s, "p": s, "b": {"type": "object"}}}}, cont={"type": "boolean"}), lambda a: api("POST", "/batch", a)),
     "guide": ("A short playbook for your role (~100-250 tokens): agent, coder, reviewer, supervisor or planner.", S(role=s), lambda a: api("GET", "/guide" + qs(a, ["role"]))),
@@ -230,7 +255,7 @@ TOOLS = {
 
 CORE = ["briefing", "next", "finish", "inbox", "claim", "set_task", "add_task", "tasks", "task", "comment", "handoff", "heartbeat", "answer", "decide_review", "lock", "unlock"]
 COORD = ["claim_next", "release", "locks", "ask", "asks", "cancel_ask", "request_review", "reviews", "watch", "unwatch", "watches", "attach", "attachments", "del_attachment",
-         "route", "envs", "deploy_env", "freeze_env", "unfreeze_env", "decline_task", "reopen_task", "add_commit", "task_activity", "comments"]
+         "cost", "links", "route", "envs", "deploy_env", "freeze_env", "unfreeze_env", "decline_task", "reopen_task", "add_commit", "task_activity", "comments"]
 GROUPS = {"core": CORE, "coord": COORD, "plan": [n for n in TOOLS if n not in CORE + COORD]}
 PROFILE = os.environ.get("TASKBOARD_TOOLS", "core")      # core (default) | core,coord | core,coord,plan | all | tool names
 if PROFILE == "all":
@@ -242,7 +267,7 @@ else:
 SHORT = {
     "briefing": "Start/idle check in one call: unread items (with `do` hint), your work, attention, sprints at risk, nw=claimable tasks. Repeat calls return only changes.",
     "next": "Claim the best ready task and get its context (desc, deps, comments, rules). lb,b,ttl. {none:1} if empty.",
-    "finish": "Wrap up: summary(required)+attach[],pr,sha,dn[]; then st=done | review=<who> | to=<who>,next. Gate checked first.",
+    "finish": "Wrap up: summary(required)+attach[],pr,sha,dn[],cost{in,out,usd,model}; then st=done | review=<who> | to=<who>,next. Gate checked first.",
     "inbox": "Notifications (unread). wait<=30 long-polls, ack=1 marks read. Prefer briefing.",
     "claim": "Claim task id (ttl min): you become assignee, todo->in_progress. 409 claimed if held.",
     "set_task": "Patch task id. Keys: t d st pr(1-4) as k s bl bb lb ch pu sha dp pt ty pa dn cr tg ver. ver=v you read (409 on conflict). dn=ticked checklist idx.",
@@ -251,7 +276,7 @@ SHORT = {
     "task": "One task. brief=1 (~60 tokens) | ctx=1 (docs, comments, attachments, reviews) | default full.",
     "comment": "Comment on task id (c); notifies the assignee and to=[names].",
     "handoff": "Reassign id to `to` with summary and next; one notification to them.",
-    "heartbeat": "Say you are alive: status (one line), task id. Silent agents with open work are escalated.",
+    "heartbeat": "Say you are alive: status (one line), task id (also extends your claim on it, ttl min). Silent agents with open work are escalated.",
     "answer": "Answer question id (a) addressed to you.",
     "decide_review": "Decide review id: decision approve|changes (changes needs note).",
     "lock": "Take lock `name` (env:test, repo:x) ttl min. 409 locked if held.",

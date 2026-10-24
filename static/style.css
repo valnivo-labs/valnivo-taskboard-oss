@@ -318,3 +318,19 @@ button.link.krt{color:var(--fg);font-weight:500;text-align:left;overflow-wrap:an
 @media(max-width:900px){.kr{grid-template-columns:1fr 1fr}.krbar{grid-column:1/-1}.row4{grid-template-columns:repeat(2,1fr)}.okrrow{grid-template-columns:1fr}}
 
 .card.flash{box-shadow:0 0 0 3px var(--pri),var(--sh2);transition:box-shadow .3s}
+
+/* cost, code, links, chat */
+.chip.cost{background:var(--ok-bg);color:var(--ok);font-weight:600}
+.chip.link2{background:var(--tint);color:var(--pri);font-weight:600}
+.codebox,.linksbox:not(:empty){border:1px solid var(--bd2);border-radius:10px;padding:10px 12px;margin:10px 0;background:var(--subtle)}
+.codebox>b{display:block;font-size:12px;color:var(--mut);margin-bottom:6px;text-transform:uppercase;letter-spacing:.04em}
+.cbrow{display:flex;gap:8px;align-items:center;min-height:26px;font-size:13px;flex-wrap:wrap}.cbrow a{color:var(--pri);overflow-wrap:anywhere}
+.lkrow{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:3px 0}.lkrow>b{font-size:12px;color:var(--mut);min-width:78px}
+button.link.lk{display:inline-flex;gap:6px;align-items:center;border:1px solid var(--bd2);background:var(--surface);border-radius:8px;padding:2px 8px;font-size:12.5px;cursor:pointer;color:var(--fg)}
+button.link.lk small{color:var(--mut)}button.link.lk.done{opacity:.6;text-decoration:line-through}
+.dpq{margin-top:6px}
+.evgrid{display:grid;grid-template-columns:1fr 1fr;gap:4px 14px}
+.budgets{margin:10px 0;display:grid;gap:6px}.bud{display:grid;grid-template-columns:160px 1fr auto;gap:10px;align-items:center;font-size:13px}
+.bar i.warn{background:var(--warn)}
+.spark{display:flex;align-items:flex-end;gap:3px;height:54px;margin-top:12px}.spark i{flex:1;min-width:4px;background:var(--pri);opacity:.75;border-radius:3px 3px 0 0}
+@media (max-width:640px){.evgrid{grid-template-columns:1fr}.bud{grid-template-columns:1fr}}
