@@ -348,3 +348,84 @@ button.link.lk small{color:var(--mut)}button.link.lk.done{opacity:.6;text-decora
 table.tb td.num{white-space:nowrap}
 .rowacts{display:inline-flex;gap:6px;justify-content:flex-end}
 table.tb td:first-child{overflow-wrap:anywhere}
+
+/* ---- Today ---- */
+.today .panel h2{display:flex;align-items:center;gap:8px}
+.needrow,.agrow{display:flex;gap:14px;align-items:center;padding:14px 0;border-top:1px solid var(--bd2)}
+.needrow:first-of-type,.agrow:first-of-type{border-top:0;padding-top:0}
+.needtxt{flex:1 1 260px;min-width:0}.needtxt .muted{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.needact{display:flex;gap:8px;flex-wrap:wrap}
+.needrow .ic{width:36px;height:36px;border-radius:12px;display:flex;align-items:center;justify-content:center;flex:none}
+.ic.bad{background:var(--bad-bg);color:var(--bad)}.ic.warn{background:var(--warn-bg);color:var(--warn)}.ic.info{background:var(--info-bg);color:var(--info)}
+.needrow .ic svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.calm{padding:10px 0;color:var(--mut);line-height:24px}
+.sprow{display:grid;gap:8px;width:100%;text-align:left;background:transparent;border:0;border-top:1px solid var(--bd2);padding:12px 0;cursor:pointer;color:inherit;font:inherit}
+.sprow:first-of-type{border-top:0;padding-top:0}.sprow progress{width:100%}
+.badge.green{background:var(--ok-bg);color:var(--ok)}
+/* ---- command bar ---- */
+.cmdbtn{display:flex;align-items:center;gap:10px;height:40px;padding:0 12px;border:1px solid var(--bd);border-radius:12px;background:var(--surface);color:var(--mut);cursor:pointer;font:inherit;width:100%}
+.cmdbtn:hover{background:var(--subtle)}.cmdbtn kbd{margin-left:auto}
+.shell.collapsed .cmdbtn{width:48px;padding:0;justify-content:center}
+dialog.cmdk{width:min(680px,calc(100vw - 24px));margin:12vh auto auto;border-radius:16px;overflow:hidden}
+dialog.cmdk::backdrop{background:rgba(20,40,44,.4)}
+.cmdhead{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--bd2)}
+.cmdhead svg{width:20px;height:20px;fill:none;stroke:var(--mut);stroke-width:1.8;stroke-linecap:round}
+.cmdhead input{flex:1;border:0;outline:0;font-size:17px;background:transparent;color:var(--fg);min-height:32px;padding:0}
+.cmdlist{max-height:min(480px,60vh);overflow:auto;padding:6px 8px 10px}
+.cmdgrp{padding:12px 12px 4px;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--mut)}
+.cmditem{padding:9px 12px;border-radius:12px;cursor:pointer}.cmditem.on{background:var(--tint)}
+.cmdt{font-weight:500}.cmds{font-size:12px;color:var(--mut)}
+.cmdnone{padding:24px;text-align:center;color:var(--mut)}
+.cmdfoot{display:flex;gap:16px;padding:10px 18px;border-top:1px solid var(--bd2);font-size:12px;color:var(--mut);background:var(--subtle);flex-wrap:wrap}
+/* ---- task drawer ---- */
+dialog#dlg.drawer{margin:0 0 0 auto;height:100vh;max-height:100vh;width:min(540px,100vw);border-radius:16px 0 0 16px;animation:drawerin .18s cubic-bezier(.2,0,0,1)}
+dialog#dlg.drawer form{max-height:100vh;height:100%}
+dialog#dlg.drawer::backdrop{background:rgba(20,40,44,.28)}
+@keyframes drawerin{from{transform:translateX(28px);opacity:0}to{transform:none;opacity:1}}
+/* ---- simpler filters ---- */
+.morefil{position:relative}.morefil summary{list-style:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+.morefil summary::-webkit-details-marker{display:none}
+.morefil .morebody{position:absolute;z-index:30;top:calc(100% + 6px);left:0;display:flex;flex-direction:column;gap:10px;min-width:260px;padding:14px;background:var(--surface);border-radius:12px;box-shadow:0 0 0 1px var(--bd2),var(--sh3)}
+.morefil .chip:empty{display:none}
+/* ---- admin sections ---- */
+.adm{display:flex;flex-wrap:wrap;gap:24px;align-items:flex-start}
+.admnav{flex:0 0 220px;display:flex;flex-direction:column;gap:2px}
+.admnav button{display:flex;align-items:center;gap:10px;height:40px;padding:0 12px;border:0;border-radius:12px;background:transparent;color:var(--fg);font:500 14px var(--sans);cursor:pointer;text-align:left}
+.admnav button:hover{background:var(--subtle)}.admnav button.on{background:var(--tint);color:var(--pri)}
+.admnav .chip{margin-left:auto;background:var(--surface)}
+.admbody{flex:999 1 520px;min-width:0;display:grid;grid-template-columns:1fr;gap:16px}
+.admbody>.panel{display:none}
+.admbody[data-cur=access]>[data-sec=access]{display:block}
+.admbody[data-cur=notifications]>[data-sec=notifications]{display:block}
+.admbody[data-cur=chat]>[data-sec=chat]{display:block}
+.admbody[data-cur=git]>[data-sec=git]{display:block}
+.admbody[data-cur=budgets]>[data-sec=budgets]{display:block}
+.admbody[data-cur=backups]>[data-sec=backups]{display:block}
+.admbody[data-cur=data]>[data-sec=data]{display:block}
+.admbody[data-cur=rules]>[data-sec=rules]{display:block}
+.admbody[data-cur=usage]>[data-sec=usage]{display:block}
+.admbody[data-cur=templates]>[data-sec=templates]{display:block}
+@media(max-width:900px){.admnav{flex:1 1 100%;flex-direction:row;overflow-x:auto}.admnav button{flex:none}}
+/* ---- agents filter ---- */
+.agseg{margin:0 0 14px}
+.seg{display:inline-flex;border:1px solid var(--bd);border-radius:12px;overflow:hidden;background:var(--surface);flex-wrap:wrap}
+.seg button{height:34px;padding:0 14px;border:0;background:transparent;font:500 13px var(--sans);color:var(--mut);cursor:pointer}
+.seg button.on{background:var(--tint);color:var(--pri)}
+/* ---- phone: top bar, bottom tab bar, full-screen drawer ---- */
+@media(max-width:720px){
+  .sidebar{position:sticky;top:0;z-index:20;flex-wrap:wrap;padding:8px 12px;gap:8px}
+  .brand>div,.sidefoot,.cmdbtn .navlbl{display:none}
+  .brandrow{flex:0 0 auto}.boardrow{flex:1 1 150px;min-width:0}
+  .cmdbtn{width:44px;height:40px;padding:0;justify-content:center;flex:none}
+  .nav{position:fixed;left:0;right:0;bottom:0;z-index:30;background:var(--surface);border-top:1px solid var(--bd2);padding:4px 4px calc(4px + env(safe-area-inset-bottom));display:flex;flex-direction:row;justify-content:space-around;overflow:visible;order:0;gap:0}
+  .nav .tab{flex:1 1 0;min-width:0;height:54px;flex-direction:column;gap:2px;justify-content:center;padding:0 2px;position:relative}
+  .nav .tab .navlbl{display:block;font-size:10px;line-height:12px}
+  .nav .tab b{position:absolute;top:2px;right:calc(50% - 22px);font-size:10px;line-height:15px;padding:0 5px}
+  .content{padding-bottom:76px}
+  .needrow{flex-wrap:wrap}.needact{width:100%}.needact .mini{flex:1;min-height:44px}
+  dialog#dlg.drawer{width:100vw;border-radius:0}
+  .morefil .morebody{position:fixed;left:12px;right:12px;top:auto;bottom:80px}
+}
+.admnav button{justify-content:flex-start;text-align:left}
+.sprow{display:flex;flex-direction:column;align-items:stretch;gap:8px;text-align:left}.sprow>span{display:block;text-align:left}.sprow progress{height:8px}
+.cmdbtn span,.cmdbtn kbd{white-space:nowrap}.cmdbtn .navlbl:not(kbd){overflow:hidden;text-overflow:ellipsis}

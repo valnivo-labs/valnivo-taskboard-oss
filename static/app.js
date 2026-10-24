@@ -22,7 +22,7 @@ let tok = new URLSearchParams(location.search).get("token") || localStorage.tb_t
 if (tok === null || tok === undefined) tok = prompt("Taskboard token (blank if none)") || "";
 localStorage.tb_token = tok;
 const picked = new Set();
-let boards = [], B = null, es = null, dragId = null, toastT = null, autoSprint = true, view = localStorage.tb_view || "board", feed = [], dashT = null;
+let boards = [], B = null, es = null, dragId = null, toastT = null, autoSprint = true, view = localStorage.tb_view || "today", feed = [], dashT = null;
 
 function setTheme(t) { document.documentElement.dataset.theme = t; localStorage.tb_theme = t; }
 document.documentElement.dataset.theme = localStorage.tb_theme || (matchMedia("(prefers-color-scheme:dark)").matches ? "dark" : "light");
@@ -278,6 +278,7 @@ function render() {
   bar.hidden = !B || view !== "board" || !meth().sprints;
   fil.hidden = !B || view !== "board";
   $("bset").hidden = !B || B.multi || !["board", "overview"].includes(view);
+  if (view === "today") return renderToday();
   if (view === "overview") return renderOverview();
   if (view === "agents") return renderAgents();
   if (view === "specs") return renderSpecs();
@@ -303,6 +304,7 @@ function render() {
   }
   for (const id of [...picked]) if (!B.tasks.some(t => t.id === id)) picked.delete(id);
   document.querySelectorAll(".card").forEach(c => c.classList.toggle("picked", picked.has(+c.dataset.id)));
+  $("mfn").textContent = ["asg", "chan"].filter(k => $(k).value).length || "";
   bulkBar();
   const qi = document.querySelector(".qa input");
   if (qi && !$("dlg").open) { qi.focus(); qi.setSelectionRange(qi.value.length, qi.value.length); }
@@ -465,40 +467,40 @@ async function renderAdmin() {
   catch (_) { el.innerHTML = '<div class="pad"><div class="empty"><b>Admin only</b><br>Your token does not have the admin role.</div></div>'; return; }
   if (view !== "admin") return;
   const last = bk.last;
-  el.innerHTML = `<div class="pad"><div class="grid2 admingrid">
-    <div class="panel wide"><h2>Access — one token per agent</h2><p class="muted hint">Roles: <b>admin</b> everything · <b>supervisor</b> agent + deletes sprints, gets escalations · <b>agent</b> read/write, no deletes of boards/sprints, no admin · <b>viewer</b> read-only. A token's name is the actor in the audit trail and the default inbox.</p>
+  el.innerHTML = `<div class="pad"><div class="adm"><nav class="admnav" aria-label="Admin sections">${[["access", "Access", tk.i.length], ["notifications", "Notifications"], ["chat", "Chat channels", ch.i.length], ["git", "Git and pull requests"], ["budgets", "Budgets and wake-ups"], ["rules", "Board rules"], ["backups", "Backups"], ["templates", "Templates"], ["data", "Import and export"], ["usage", "API usage"]].map(([k, l, n]) => `<button type="button" data-admsec="${k}" class="${admSec === k ? "on" : ""}" ${admSec === k ? 'aria-current="page"' : ""}>${l}${n ? `<span class="chip">${n}</span>` : ""}</button>`).join("")}</nav><div class="admbody" data-cur="${admSec}">
+    <div class="panel" data-sec="access"><h2>Access — one token per agent</h2><p class="muted hint">Roles: <b>admin</b> everything · <b>supervisor</b> agent + deletes sprints, gets escalations · <b>agent</b> read/write, no deletes of boards/sprints, no admin · <b>viewer</b> read-only. A token's name is the actor in the audit trail and the default inbox.</p>
       <table class="tb"><tr><th>Name</th><th>Role</th><th>Boards</th><th>Last used</th><th></th></tr>${tk.i.map(t => `<tr><td>${esc(t.n)}</td><td><span class="stb">${esc(t.role)}</span></td><td class="muted">${t.bs ? esc(t.bs.map(i => (boards.find(b => b.id === i) || {}).name || "#" + i).join(", ")) : "all"}</td><td>${t.env ? '<span class="muted">env</span>' : esc(t.u ? ago(t.u) + " ago" : "never")}</td><td class="num">${t.env ? "" : `<span class="rowacts"><button type="button" class="mini" data-tokscope="${t.id}" data-bs="${(t.bs || []).join(",")}" ${t.role === "admin" ? "disabled" : ""}>Boards…</button><button type="button" class="mini" data-deltoken="${t.id}">Revoke</button></span>`}</td></tr>`).join("")}</table>
       <p><button type="button" class="mini primary" id="newtoken">+ Create agent token</button></p></div>
-    <div class="panel"><h2>Notifications &amp; supervisor</h2><form id="setf" class="stack">
+    <div class="panel" data-sec="notifications"><h2>Notifications &amp; supervisor</h2><form id="setf" class="stack">
       <label>Supervisor agent(s) — get escalations (comma separated names)<input name="supervisors" value="${esc(se.supervisors)}" placeholder="e.g. Supervisor"></label>
       <label>Daily digest webhook (Slack/Teams/Discord incoming URL)<input name="digest_url" value="${esc(se.digest_url)}" placeholder="https://hooks.slack.com/…"></label>
       <div class="row2"><label>Digest hour (UTC)<input type="number" name="digest_hour" min="0" max="23" value="${esc(se.digest_hour || 7)}"></label><label>Backups to keep<input type="number" name="backup_keep" min="1" max="365" value="${esc(se.backup_keep || 14)}"></label></div>
       <label>Instant alert webhook (sprint turns red)<input name="alert_url" value="${esc(se.alert_url)}" placeholder="https://…"></label>
       <div class="rowbtn"><button class="primary mini" type="submit">Save settings</button><button type="button" class="mini" id="digestnow">Send digest now</button></div></form></div>
-    <div class="panel"><h2>Chat notifications</h2><p class="muted hint">Post to Slack, Discord, Teams or Telegram when something needs a human: a blocked task, a finished one, an escalation, a sprint at risk, a budget warning. Web addresses are secrets and are never shown again.</p>
+    <div class="panel" data-sec="chat"><h2>Chat notifications</h2><p class="muted hint">Post to Slack, Discord, Teams or Telegram when something needs a human: a blocked task, a finished one, an escalation, a sprint at risk, a budget warning. Web addresses are secrets and are never shown again.</p>
       ${ch.i.length ? `<table class="tb"><tr><th>Channel</th><th>Where</th><th>Tells you when</th><th>Last</th><th></th></tr>${ch.i.map(c => `<tr><td><b>${esc(c.n)}</b>${c.on ? "" : ' <span class="muted">(paused)</span>'}${c.b ? ` <span class="muted">${esc((boards.find(x => x.id === c.b) || {}).name || "board " + c.b)}</span>` : ""}${c.minpr < 4 ? ` <span class="muted">P${c.minpr}+</span>` : ""}</td><td>${esc(c.kind)} <span class="muted">${esc(c.host)}</span></td><td class="muted">${c.ev.map(e => esc(e)).join(", ")}</td><td>${c.last ? (c.ok ? esc(ago(c.last.slice(0, 19))) + " ago" : '<span class="hl red">' + esc(c.last.slice(20) || "failed") + "</span>") : '<span class="muted">never</span>'}</td><td class="num"><button type="button" class="mini" data-chat="test:${c.id}">Test</button> <button type="button" class="mini" data-chat="toggle:${c.id}">${c.on ? "Pause" : "Resume"}</button> <button type="button" class="mini danger" data-chat="del:${c.id}">Delete</button></td></tr>`).join("")}</table>` : '<p class="muted">No channels yet.</p>'}
       <p><button type="button" class="mini primary" id="newchat">+ Add channel</button></p></div>
-    <div class="panel"><h2>Git: pull requests and commits</h2><p class="muted hint">Point a webhook of GitHub, GitLab or Gitea at <code class="k">${esc(location.origin + BASE)}/api/hooks/git</code> (content type JSON, events: pushes, pull requests, reviews, workflow runs). Commits and PRs attach to a task when the message, title or branch names it (<code class="k">#42</code>, <code class="k">task-42-login</code>). A PR opening moves the task to review; merging closes it unless its board's definition of done or an open review says otherwise.</p>
+    <div class="panel" data-sec="git"><h2>Git: pull requests and commits</h2><p class="muted hint">Point a webhook of GitHub, GitLab or Gitea at <code class="k">${esc(location.origin + BASE)}/api/hooks/git</code> (content type JSON, events: pushes, pull requests, reviews, workflow runs). Commits and PRs attach to a task when the message, title or branch names it (<code class="k">#42</code>, <code class="k">task-42-login</code>). A PR opening moves the task to review; merging closes it unless its board's definition of done or an open review says otherwise.</p>
       <div class="kv"><span>Webhook secret</span><b>${se.git_secret ? "set" : '<span class="hl red">not set - webhook is off</span>'}</b></div>
       <p><button type="button" class="mini primary" id="gitsecret">${se.git_secret ? "Create a new secret" : "Create secret"}</button></p></div>
-    <div class="panel"><h2>Integrations, wake-ups and budgets</h2><form id="opsf" class="stack">
+    <div class="panel" data-sec="budgets"><h2>Integrations, wake-ups and budgets</h2><form id="opsf" class="stack">
       <label>Public address of this board <span class="muted">(adds task links to chat messages)</span><input name="base_url" value="${esc(se.base_url)}" placeholder="https://board.example.com"></label>
       <div class="row2"><label>Wake sleeping agents after (minutes, 0 = off)<input type="number" name="wake_after_min" min="0" max="1440" value="${esc(se.wake_after_min || 10)}"></label><label>Close a task when its PR merges<select name="git_autodone"><option value="1" ${se.git_autodone !== "0" ? "selected" : ""}>Yes (if the gate allows)</option><option value="0" ${se.git_autodone === "0" ? "selected" : ""}>No, only comment</option></select></label></div>
       <label>Monthly budget for all boards (USD, blank = none)<input type="number" step="any" min="0" name="budget_usd" value="${esc(se.budget_usd)}"></label>
       <label>Model prices <span class="muted">(JSON, USD per million tokens [input, output], used when an agent reports tokens without a cost)</span><textarea name="prices" rows="2" placeholder='{"my-model": [3, 15]}'>${esc(se.prices)}</textarea></label>
       <div class="rowbtn"><button class="primary mini" type="submit">Save</button></div></form></div>
-    <div class="panel"><h2>Backups</h2>${last ? `<p>Last: <b>${esc(last.file)}</b> · ${Math.round(last.size / 1024)} KB · ${last.ok ? '<span class="hl green">verified</span>' : '<span class="hl red">verification failed</span>'}<br><span class="muted">${last.counts.tasks} tasks, ${last.counts.boards} boards, ${last.counts.specs} specs · ${esc(last.ts)} UTC</span></p>` : '<p class="muted">No backup yet — one is made automatically every 24h.</p>'}
+    <div class="panel" data-sec="backups"><h2>Backups</h2>${last ? `<p>Last: <b>${esc(last.file)}</b> · ${Math.round(last.size / 1024)} KB · ${last.ok ? '<span class="hl green">verified</span>' : '<span class="hl red">verification failed</span>'}<br><span class="muted">${last.counts.tasks} tasks, ${last.counts.boards} boards, ${last.counts.specs} specs · ${esc(last.ts)} UTC</span></p>` : '<p class="muted">No backup yet — one is made automatically every 24h.</p>'}
       <p class="muted hint">${bk.n} kept in <code class="k">${esc(bk.dir)}</code>. Each backup is integrity-checked right after it is written.</p><p><button type="button" class="mini primary" id="bknow">Back up now</button></p></div>
-    <div class="panel"><h2>Import / export</h2><p class="muted hint">Exports include tasks, sprints, docs, specs and comments. Imports always create new copies — nothing is overwritten.</p>
+    <div class="panel" data-sec="data"><h2>Import / export</h2><p class="muted hint">Exports include tasks, sprints, docs, specs and comments. Imports always create new copies — nothing is overwritten.</p>
       <div class="rowbtn"><button type="button" class="mini" id="expall">Export everything (JSON)</button><button type="button" class="mini" id="expb">Export this board (JSON)</button><button type="button" class="mini" id="expcsv">Tasks (CSV)</button></div>
       <div class="rowbtn"><label class="mini filebtn">Import JSON<input type="file" id="impjson" accept=".json,application/json" hidden></label><label class="mini filebtn">Import CSV into this board<input type="file" id="impcsv" accept=".csv,text/csv" hidden></label></div>
-      <p class="muted hint">CSV header: <code class="k">title,description,status,priority,assignee,kind,channel,labels,points</code></p></div></div>
-    <div class="panel"><h2>Board rules — definition of done${B && !B.multi ? " · " + esc(B.name) : ""}</h2><p class="muted hint">One item per line. A task on this board cannot move to Done until every item is ticked and no review is open.</p><form id="dodf" class="stack"><textarea name="dod" rows="4" placeholder="Tests pass&#10;PR linked&#10;Deployed to test">${esc(B && !B.multi ? B.dod || "" : "")}</textarea><div class="rowbtn"><button class="primary mini" type="submit" ${B && !B.multi ? "" : "disabled"}>Save rules</button></div></form></div>
-    <div class="panel"><h2>Token usage <span class="muted">since ${esc((us.since || "").slice(0, 16))} UTC</span></h2><p class="muted hint">Approximate tokens (bytes ÷ 4) that each agent has sent and received through the API. Use it to see which calls cost the most; <code class="k">briefing</code>, <code class="k">next</code> and <code class="k">finish</code> replace several calls each.</p>
+      <p class="muted hint">CSV header: <code class="k">title,description,status,priority,assignee,kind,channel,labels,points</code></p></div>
+    <div class="panel" data-sec="rules"><h2>Board rules — definition of done${B && !B.multi ? " · " + esc(B.name) : ""}</h2><p class="muted hint">One item per line. A task on this board cannot move to Done until every item is ticked and no review is open.</p><form id="dodf" class="stack"><textarea name="dod" rows="4" placeholder="Tests pass&#10;PR linked&#10;Deployed to test">${esc(B && !B.multi ? B.dod || "" : "")}</textarea><div class="rowbtn"><button class="primary mini" type="submit" ${B && !B.multi ? "" : "disabled"}>Save rules</button></div></form></div>
+    <div class="panel" data-sec="usage"><h2>Token usage <span class="muted">since ${esc((us.since || "").slice(0, 16))} UTC</span></h2><p class="muted hint">Approximate tokens (bytes ÷ 4) that each agent has sent and received through the API. Use it to see which calls cost the most; <code class="k">briefing</code>, <code class="k">next</code> and <code class="k">finish</code> replace several calls each.</p>
       ${us.agents.length ? `<table class="tb"><tr><th>Agent</th><th>Calls</th><th>Tokens</th><th>Costliest routes</th></tr>${us.agents.map(a => `<tr><td>${esc(a.n)}</td><td class="num">${a.calls}</td><td class="num">${a.t}</td><td class="muted">${a.routes.slice(0, 3).map(r => esc(r.r) + " " + r.t).join(" · ")}</td></tr>`).join("")}</table>` : '<span class="muted">No calls yet.</span>'}</div>
-    <div class="panel"><h2>Templates &amp; recurring tasks</h2><p class="muted hint">Rules: ${esc(tp.help)}. A recurring template creates a task on schedule, unless the previous one is still open.</p>
+    <div class="panel" data-sec="templates"><h2>Templates &amp; recurring tasks</h2><p class="muted hint">Rules: ${esc(tp.help)}. A recurring template creates a task on schedule, unless the previous one is still open.</p>
       ${tp.i.length ? `<table class="tb"><tr><th>Template</th><th>Rule</th><th>Next run</th><th>Assignee</th><th></th></tr>${tp.i.map(t => `<tr><td>${esc(t.n)}${t.on ? "" : ' <span class="muted">(paused)</span>'}</td><td>${esc(t.rc || "manual")}</td><td>${esc(t.nx || "—")}</td><td>${esc(t.as || "—")}</td><td class="num"><button type="button" class="mini" data-usetpl="${t.id}">Use</button> <button type="button" class="mini" data-edittpl="${t.id}">Edit</button> <button type="button" class="mini" data-deltpl="${t.id}">Delete</button></td></tr>`).join("")}</table>` : '<p class="muted">No templates yet.</p>'}
-      <div class="rowbtn"><button type="button" class="mini primary" id="newtpl">+ New template</button><button type="button" class="mini" id="runtpl">Run due recurring now</button></div></div></div></div>`;
+      <div class="rowbtn"><button type="button" class="mini primary" id="newtpl">+ New template</button><button type="button" class="mini" id="runtpl">Run due recurring now</button></div></div></div></div></div>`;
   el._tpl = tp.i;
 }
 
@@ -555,11 +557,11 @@ $("v-admin").addEventListener("change", async e => {
 });
 
 // ---- views ----
-const TITLES = {overview: "Overview", board: "Board", mywork: "My work", specs: "Specs", agents: "Agents", admin: "Admin"};
+const TITLES = {today: "Today", overview: "Overview", board: "Board", mywork: "My work", specs: "Specs", agents: "Agents", admin: "Admin"};
 function setView(v) {
   view = v; localStorage.tb_view = v;
   document.querySelectorAll("#tabs .tab").forEach(b => b.classList.toggle("on", b.dataset.view === v));
-  ["overview", "board", "mywork", "specs", "agents", "admin"].forEach(x => { $("v-" + x).hidden = x !== v; });
+  ["today", "overview", "board", "mywork", "specs", "agents", "admin"].forEach(x => { $("v-" + x).hidden = x !== v; });
   $("pagetitle").textContent = TITLES[v];
   $("nt").hidden = false;
   render();
@@ -575,7 +577,7 @@ async function refreshDash() {
     return d;
   } catch (_) { return null; }
 }
-const kickDash = () => { clearTimeout(dashT); dashT = setTimeout(() => { if (view === "overview") renderOverview(); else if (view === "agents") renderAgents(); else refreshDash(); }, 400); };
+const kickDash = () => { clearTimeout(dashT); dashT = setTimeout(() => { if (view === "today") renderToday(); else if (view === "overview") renderOverview(); else if (view === "agents") renderAgents(); else refreshDash(); }, 400); };
 
 const CFD_ORDER = [["done", "#00805c"], ["review", "#7d58c2"], ["in_progress", "#ba5c33"], ["todo", "#326bae"], ["backlog", "#b2b6b5"]];
 function cfdSvg(cfd) {
@@ -734,10 +736,14 @@ async function renderAgents() {
   try { sups = ((await api("GET", "/settings")).supervisors || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean); } catch (_) {}
   if (view !== "agents") return;
   const load = {}; ((d && d.agents) || []).forEach(a => { load[a.as] = a.by; });
+  const agc = {all: ag.i.length, working: 0, blocked: 0, silent: 0, idle: 0}; ag.i.forEach(a => { agc[agentState(a, load[a.n] || {}).k]++; });
   const cards = ag.i.map(a => {
     const by = load[a.n] || {}, open = sum(by) - (by.done || 0) - (by.declined || 0), cap = a.cap || 0, over = cap && open > cap;
-    const sup = sups.includes(a.n.toLowerCase());
-    return `<article class="panel agent${sup ? " sup" : ""}"><div class="hd"><span class="avatar lg ${sup ? "" : "ag"}">${esc(initials(a.n))}</span><div><b>${esc(a.n)}</b><span class="muted">${sup ? "Supervisor · gets escalations" : "Agent"}</span></div>${a.inbox ? `<span class="badge teal">${a.inbox} unread</span>` : ""}${a.silent ? '<span class="badge red">Silent</span>' : ""}${over ? '<span class="badge red">Over capacity</span>' : ""}</div>
+    const sup = sups.includes(a.n.toLowerCase()), ast = agentState(a, by);
+    if (agFilter !== "all" && ast.k !== agFilter) return "";
+    const cur = B && B.tasks.find(x => (x.assignee || "").toLowerCase() === a.n.toLowerCase() && x.status === "in_progress");
+    return `<article class="panel agent${sup ? " sup" : ""}"><div class="hd"><span class="avatar lg ${sup ? "" : "ag"}">${esc(initials(a.n))}</span><div><b>${esc(a.n)}</b><span class="muted">${sup ? "Supervisor · gets escalations" : "Agent"}</span></div>${a.inbox ? `<span class="badge teal">${a.inbox} unread</span>` : ""}<span class="badge ${ast.cls}">${ast.label}</span>${over ? '<span class="badge red">Over capacity</span>' : ""}</div>
+      ${cur ? `<div class="statusline">Doing <button type="button" class="link" data-open="${cur.id}"><span class="mono">#${cur.id}</span> ${esc(cur.title)}</button></div>` : ""}
       ${a.stx ? `<div class="statusline">${esc(a.stx)}${a.stk ? ` <span class="mono">#${a.stk}</span>` : ""}</div>` : ""}
       <div class="kv"><span>Last seen</span><b>${a.seen ? esc(ago(a.seen)) + " ago" : "never"}</b></div>
       <div class="kv"><span>Delivery</span><b>${a.hook ? "Webhook" + (a.hs ? " · signed" : "") : "Polls inbox"}</b></div>
@@ -750,7 +756,8 @@ async function renderAgents() {
   const asks = ak.i.length ? ak.i.map(x => `<div class="coord"><div><b>${esc(x.from)} → ${esc(x.to)}</b>${x.tk ? ` <span class="mono">#${x.tk}</span>` : ""}<div>${esc(x.q)}</div><div class="muted">answer by ${esc(x.due.slice(5, 16))} UTC${x.due < new Date().toISOString().slice(0, 19).replace("T", " ") ? ' · <b style="color:var(--bad)">overdue</b>' : ""}</div></div><button type="button" class="mini primary" data-answer="${x.id}" data-q="${esc(x.q)}" data-to="${esc(x.to)}">Answer</button></div>`).join("") : '<span class="muted">No open questions between agents.</span>';
   const revs = rv.i.length ? rv.i.map(x => `<div class="coord"><div><b>${esc(x.to)}</b> reviews <button type="button" class="link" data-open="${x.tk}"><span class="mono">#${x.tk}</span></button><div class="muted">asked by ${esc(x.from)} · ${esc(ago(x.c))} ago${x.note ? " — " + esc(x.note) : ""}</div></div></div>`).join("") : '<span class="muted">No reviews waiting.</span>';
   el.innerHTML = `<div class="pad"><p class="muted lead">An agent is told the moment a task is assigned to it, handed over, commented on or goes stale. It reads this from its inbox, or gets it pushed to a webhook.</p>
-    ${cards ? `<div class="agentcards">${cards}</div>` : '<span class="muted">No agents yet — assign a task to someone.</span>'}
+    <div class="seg agseg" role="group" aria-label="Show">${[["all", "All"], ["working", "Working"], ["blocked", "Blocked"], ["silent", "Silent"], ["idle", "Idle"]].map(([k, l]) => `<button type="button" data-agf="${k}" class="${agFilter === k ? "on" : ""}">${l} ${agc[k]}</button>`).join("")}</div>
+    ${cards.trim() ? `<div class="agentcards">${cards}</div>` : '<span class="muted">No agents yet — assign a task to someone.</span>'}
     <div class="grid2"><div class="panel"><h2>Locks <span class="muted">${lk.i.length}</span></h2>${locks}</div><div class="panel"><h2>Open questions <span class="muted">${ak.i.length}</span></h2>${asks}</div></div>
     <div class="grid2"><div class="panel"><h2>Reviews waiting <span class="muted">${rv.i.length}</span></h2>${revs}</div><div class="panel" id="inboxview"><h2>Inbox</h2><span class="muted">Pick an agent to see their notifications.</span></div></div>
     <div class="panel"><h2>Messages <span class="muted">latest</span></h2>${msgs.i.length ? msgs.i.slice().reverse().map(m => `<div class="msg"><b>${esc(m.from)}</b> → ${esc(m.to)}${m.tk ? ` <button type="button" class="link" data-open="${m.tk}"><span class="mono">#${m.tk}</span></button>` : ""}<div>${esc(m.c)}</div><small class="muted">${esc(ago(m.ts))} ago</small></div>`).join("") : '<span class="muted">No messages yet. Agents write to each other with the say tool; use Message on an agent card to write to one yourself.</span>'}
@@ -823,6 +830,7 @@ function closeDlg(force) {
 }
 function dlg(html, ok, extra, saveLabel) {
   const f = $("f");
+  $("dlg").classList.remove("drawer");
   dirty = false;
   f.innerHTML = html + `<menu>${extra || ""}<button type="button" id="dcancel">Cancel</button><button class="primary" id="dsave" value="ok">${saveLabel || "Save"}</button></menu>`;
   $("dcancel").onclick = () => closeDlg();
@@ -1026,6 +1034,7 @@ function taskDlg(id, status, title, boardId, pri) {
       else { d.board_id = bid; const nt = await api("POST", "/tasks", d); undoTask(nt); ensureVisible(nt.id); }
     },
     id ? '<button type="button" id="handoff">Hand off…</button><button type="button" class="danger sp" id="del">Delete task</button>' : "", id ? "Save" : "Create task");
+  $("dlg").classList.add("drawer");                  // a task opens in a side drawer, so the board stays in view
   {
     const dq = $("dpq"), dl = $("dpl"); let dqT = null;
     if (dq) {
@@ -1126,12 +1135,103 @@ async function openTask(id, boardId) {
   setView("board"); $("sprint").value = ""; autoSprint = false; render(); taskDlg(+id);
 }
 
+// ---- Today: what needs a person ----
+const NEED_TONE = {"blocked-p12": "bad", "sprint-red": "bad", "sla-breach": "bad", "silent-agent": "warn", "owner-wait": "warn", "human-wait": "warn", stale: "warn", "unassigned-p12": "warn", budget: "warn", "wip-exceeded": "warn", "aging-wip": "warn",
+  "ask-overdue": "info", "review-stale": "info", "dep-cross": "info", declined: "info"};
+const NEED_ICON = {bad: "M12 8v5M12 16.5v.5M10.3 4.5L3 17.5A2 2 0 0 0 4.7 20.5h14.6a2 2 0 0 0 1.7-3L13.7 4.5a2 2 0 0 0-3.4 0z", warn: "M12 7v5l3 2M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z", info: "M12 11v5M12 8v.5M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z"};
+function agentState(a, by) {
+  if (a.silent) return {k: "silent", label: "Silent", cls: "red"};
+  if (by.blocked && !by.in_progress) return {k: "blocked", label: "Blocked", cls: "red"};
+  if (by.in_progress) return {k: "working", label: "Working", cls: "teal"};
+  return {k: "idle", label: "Idle", cls: ""};
+}
+async function renderToday() {
+  const el = $("v-today"), qs0 = B && !B.multi ? "?b=" + B.id : B && B.scopeTeam ? "?tm=" + encodeURIComponent(B.scopeTeam) : "";
+  const soft = p => p.catch(() => null);
+  const [d, ag, cost] = await Promise.all([refreshDash(), soft(api("GET", "/agents")), soft(api("GET", "/cost" + qs0))]);
+  if (view !== "today" || !d) return;
+  const needs = (d.attention || []).slice(0, 8), t = d.totals || {}, by = {};
+  ((d.agents) || []).forEach(a => { by[a.as.toLowerCase()] = a.by; });
+  $("todayn").textContent = (d.attention || []).length; $("todayn").hidden = !(d.attention || []).length;
+  const row = r => {
+    const tone = NEED_TONE[r.k] || "info", first = (r.ids || [])[0];
+    return `<div class="needrow"><div class="ic ${tone}"><svg class="i" viewBox="0 0 24 24"><path d="${NEED_ICON[tone]}"/></svg></div><div class="needtxt"><div>${esc(r.m)}</div><div class="muted">${(r.ids || []).slice(0, 6).map(i => "#" + i).join(" ")}${(r.ids || []).length > 6 ? " …" : ""}${r.sev ? (r.ids && r.ids.length ? " · " : "") + esc(r.sev) + " priority" : ""}</div></div>
+      <div class="needact">${first ? `<button type="button" class="mini primary" data-open="${first}">Open #${first}</button>` : `<button type="button" class="mini primary" data-go="overview">Open overview</button>`}${r.k === "budget" ? '<button type="button" class="mini" data-go="overview">View spend</button>' : r.k === "silent-agent" ? '<button type="button" class="mini" data-go="agents">Agents</button>' : ""}</div></div>`;
+  };
+  const people = ((ag && ag.i) || []).map(a => ({a, st: agentState(a, by[a.n.toLowerCase()] || {})})).sort((x, y) => ["blocked", "silent", "working", "idle"].indexOf(x.st.k) - ["blocked", "silent", "working", "idle"].indexOf(y.st.k)).slice(0, 6);
+  const doing = a => { const c = B && B.tasks.find(x => (x.assignee || "").toLowerCase() === a.n.toLowerCase() && x.status === "in_progress"); return c ? `#${c.id} ${c.title}` : (a.stx || (a.seen ? "last seen " + ago(a.seen) + " ago" : "never seen")); };
+  const sps = (d.boards || []).filter(b => b.sp);
+  el.innerHTML = `<div class="pad today">
+    <section class="panel" aria-labelledby="needs"><h2 id="needs">Needs you <span class="badge ${(d.attention || []).length ? "red" : "green"}">${(d.attention || []).length}</span></h2>
+      ${needs.length ? needs.map(row).join("") : '<div class="calm"><b>Nothing needs you right now.</b><br>Agents are working and nothing is stuck.</div>'}</section>
+    <div class="tiles"><div class="tile"><div class="n">${t.open || 0}</div><div class="l">Open tasks</div></div><div class="tile"><div class="n">${t.in_progress || 0}</div><div class="l">In progress</div></div><div class="tile"><div class="n">${t.review || 0}</div><div class="l">In review</div></div><div class="tile ${t.blocked ? "bad" : ""}"><div class="n">${t.blocked || 0}</div><div class="l">Blocked</div></div><div class="tile ok"><div class="n">${t.done || 0}</div><div class="l">Done</div></div></div>
+    <div class="grid2">
+      <section class="panel" aria-labelledby="agn"><h2 id="agn">Agents right now <button type="button" class="link" data-go="agents" style="margin-left:auto">See all</button></h2>
+        ${people.length ? people.map(({a, st}) => `<div class="agrow"><span class="avatar ag">${esc(initials(a.n))}</span><div class="needtxt"><div><b>${esc(a.n)}</b> <span class="badge ${st.cls}">${st.label}</span></div><div class="muted">${esc(doing(a))}</div></div><button type="button" class="mini" data-msg="${esc(a.n)}">Message</button></div>`).join("") : '<span class="muted">No agents yet. They appear when they connect or get a task.</span>'}</section>
+      <section class="panel" aria-labelledby="spn"><h2 id="spn">Sprints</h2>
+        ${sps.length ? sps.map(b => `<button type="button" class="sprow" data-board="${b.id}"><span><b>${esc(b.n)}</b> <span class="hl ${b.sp.hl}">${esc(HL[b.sp.hl] || b.sp.hl)}</span><br><span class="muted">${esc(b.sp.n)} · ${b.sp.p[0]}/${b.sp.p[1]} done</span></span><progress max="100" value="${b.sp.p[1] ? 100 * b.sp.p[0] / b.sp.p[1] : 0}"></progress></button>`).join("") : '<span class="muted">No active sprints.</span>'}</section>
+    </div>
+    ${costPanel(cost)}</div>`;
+}
+$("v-today").addEventListener("click", e => {
+  const o = e.target.closest("[data-open]"); if (o) return openTask(+o.dataset.open);
+  const b = e.target.closest("[data-board]"); if (b) { $("board").value = "b:" + b.dataset.board; autoSprint = true; setView("board"); return loadBoard(); }
+  const m = e.target.closest("[data-msg]"); if (m) return msgDlg(m.dataset.msg);
+  const g = e.target.closest("[data-go]"); if (g) return setView(g.dataset.go);
+});
+
+// ---- command bar (Ctrl/Cmd + K) ----
+const CMD_VIEWS = [["today", "Today"], ["overview", "Overview"], ["board", "Board"], ["mywork", "My work"], ["specs", "Specs"], ["agents", "Agents"], ["admin", "Admin"]];
+let cmdItems = [], cmdSel = 0, cmdSeq = 0, cmdAg = [], cmdT = null;
+async function cmdBuild(q) {
+  const my = ++cmdSeq, ql = q.trim().toLowerCase(), has = s => !ql || s.toLowerCase().includes(ql), out = [];
+  const num = /^#?(\d+)$/.exec(q.trim());
+  if (num) out.push({g: "Tasks", t: "Open task #" + num[1], s: "", run: () => openTask(+num[1])});
+  else if (ql.length >= 2) {
+    try {
+      const r = await api("GET", `/tasks?q=${encodeURIComponent(q.trim())}&limit=6`);
+      if (my !== cmdSeq) return;
+      (r.items || r.i || []).forEach(x => out.push({g: "Tasks", t: `#${x.id} ${x.title}`, s: [(BS[x.board_id] || boards.find(b => b.id === x.board_id) || {}).name, x.assignee, x.status].filter(Boolean).join(" · "), run: () => openTask(x.id, x.board_id)}));
+    } catch (_) {}
+  }
+  [["New task", "Start in the current board", () => taskDlg()], ["New board", "Create a board", newBoard], ["Message an agent", "Send a direct message", () => msgDlg("")],
+   ["Toggle dark mode", "", () => $("theme").click()], ["Agent API and MCP guide", "Connect an agent", openPlaybook], ["Keyboard shortcuts", "", showHelp]]
+    .filter(a => has(a[0])).forEach(a => out.push({g: "Do something", t: a[0], s: a[1], run: a[2]}));
+  CMD_VIEWS.filter(v => has(v[1])).forEach(v => out.push({g: "Go to", t: v[1], s: "View", run: () => setView(v[0])}));
+  boards.filter(b => has(b.name)).slice(0, 6).forEach(b => out.push({g: "Go to", t: b.name, s: "Board", run: () => { $("board").value = "b:" + b.id; autoSprint = true; setView("board"); loadBoard(); }}));
+  cmdAg.filter(a => has(a.n)).slice(0, 5).forEach(a => out.push({g: "Go to", t: a.n, s: "Agent: send a message", run: () => msgDlg(a.n)}));
+  if (my !== cmdSeq) return;
+  cmdItems = out.slice(0, 24); cmdSel = 0; cmdRender();
+}
+function cmdRender() {
+  let last = "";
+  $("cmdlist").innerHTML = cmdItems.length ? cmdItems.map((x, i) => (x.g !== last ? `<div class="cmdgrp">${last = x.g}</div>` : "") + `<div class="cmditem${i === cmdSel ? " on" : ""}" role="option" aria-selected="${i === cmdSel}" data-i="${i}"><div><div class="cmdt">${esc(x.t)}</div>${x.s ? `<div class="cmds">${esc(x.s)}</div>` : ""}</div></div>`).join("") : '<div class="cmdnone">No matches</div>';
+  const on = $("cmdlist").querySelector(".cmditem.on"); if (on) on.scrollIntoView({block: "nearest"});
+}
+function cmdRun(i) { const x = cmdItems[i]; if (!x) return; $("cmdk").close(); setTimeout(x.run, 30); }
+async function openCmd() {
+  if ($("cmdk").open) return;
+  $("cmdq").value = ""; $("cmdk").showModal(); cmdBuild("");
+  try { cmdAg = ((await api("GET", "/agents")).i || []); if ($("cmdk").open) cmdBuild($("cmdq").value); } catch (_) {}
+}
+$("cmdbtn").onclick = openCmd;
+document.addEventListener("keydown", e => { if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "k" && !$("dlg").open) { e.preventDefault(); openCmd(); } });
+$("cmdq").oninput = () => { clearTimeout(cmdT); cmdT = setTimeout(() => cmdBuild($("cmdq").value), 140); };
+$("cmdq").onkeydown = e => {
+  if (e.key === "ArrowDown") { e.preventDefault(); cmdSel = Math.min(cmdItems.length - 1, cmdSel + 1); cmdRender(); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); cmdSel = Math.max(0, cmdSel - 1); cmdRender(); }
+  else if (e.key === "Enter") { e.preventDefault(); cmdRun(cmdSel); }
+};
+$("cmdlist").onclick = e => { const i = e.target.closest("[data-i]"); if (i) cmdRun(+i.dataset.i); };
+$("cmdk").addEventListener("mousedown", e => { if (e.target === $("cmdk")) $("cmdk").close(); });
+
 // ---- cost, links, chat channels ----
 const money = v => "$" + (v >= 100 ? Math.round(v) : v >= 1 ? v.toFixed(2) : (+v.toFixed(3)).toString());
 const kfmt = n => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? Math.round(n / 1e3) + "k" : String(n || 0);
 const CHAT_EV = [["blocked", "A task is blocked"], ["done", "A task is done"], ["review", "A task goes to review"], ["declined", "A task is declined"], ["assigned", "A task waits on a human"],
   ["escalation", "Escalations to the supervisor"], ["sprint", "Sprint started, closed or at risk"], ["budget", "Budget warnings"], ["git", "Pull requests merged, CI failures"]];
 let CHATS = [];
+let agFilter = "all", admSec = (() => { try { return localStorage.tb_adm || "access"; } catch (_) { return "access"; } })();
 const boardPick = sel => `<fieldset class="fs"><legend>Limit to boards <span class="muted">(none ticked = every board)</span></legend><div class="evgrid">${boards.map(b => `<label class="chk"><input type="checkbox" name="tb_${b.id}" ${sel.includes(b.id) ? "checked" : ""}> ${esc(b.name)}</label>`).join("")}</div></fieldset>`;
 function msgDlg(to) {
   dlg(`<h3>Message${to ? " to " + esc(to) : ""}</h3><div class="row2"><label>To (agent or person, * = everyone)<input name="to" required value="${esc(to)}"></label><label>From<input name="as" required value="${esc(localStorage.tb_from || "Operator")}"></label></div>
@@ -1177,6 +1277,13 @@ function chatDlg() {
 
 async function adminExtras(e) {
   const t = e.target, b = t.closest("[data-chat]");
+  const sn = t.closest("[data-admsec]");
+  if (sn) {
+    admSec = sn.dataset.admsec; try { localStorage.tb_adm = admSec; } catch (_) {}
+    const body = $("v-admin").querySelector(".admbody"); if (body) body.dataset.cur = admSec;
+    $("v-admin").querySelectorAll("[data-admsec]").forEach(b => { b.classList.toggle("on", b === sn); b.toggleAttribute("aria-current", b === sn); });
+    return true;
+  }
   if (t.id === "newchat") { chatDlg(); return true; }
   const ts = t.closest("[data-tokscope]");
   if (ts) {
@@ -1258,17 +1365,19 @@ $("saveview").onclick = () => dlg(`<h3>Save view</h3><label>Name<input name="nam
 viewOptions("");
 
 // ---- keyboard shortcuts ----
-const SHORTCUTS = [["n", "New task"], ["/", "Search the board"], ["1-6", "Overview / Board / My work / Specs / Agents / Admin"], ["?", "This help"], ["Esc", "Close dialog or inline add"], ["Cmd/Ctrl + Enter", "Save the open dialog"]];
+const SHORTCUTS = [["n", "New task"], ["/", "Search the board"], ["Ctrl/Cmd + K", "Search, jump and run commands"], ["1-7", "Today / Overview / Board / My work / Specs / Agents / Admin"], ["?", "This help"], ["Esc", "Close dialog or inline add"], ["Cmd/Ctrl + Enter", "Save the open dialog"]];
 document.addEventListener("keydown", e => {
   if (e.metaKey || e.ctrlKey || e.altKey || $("dlg").open) return;
   const tag = (e.target.tagName || "").toLowerCase();
   if (["input", "textarea", "select"].includes(tag) || e.target.isContentEditable) return;
   if (e.key === "n") { e.preventDefault(); taskDlg(); }
   else if (e.key === "/") { e.preventDefault(); if (view !== "board") setView("board"); $("search").focus(); }
-  else if (/^[1-6]$/.test(e.key)) setView(["overview", "board", "mywork", "specs", "agents", "admin"][+e.key - 1]);
-  else if (e.key === "?") dlg(`<h3>Keyboard shortcuts</h3><table class="tb">${SHORTCUTS.map(([k, v]) => `<tr><td><kbd>${esc(k)}</kbd></td><td>${esc(v)}</td></tr>`).join("")}</table>`, async () => {}, "", "Close");
+  else if (/^[1-7]$/.test(e.key)) setView(["today", "overview", "board", "mywork", "specs", "agents", "admin"][+e.key - 1]);
+  else if (e.key === "?") showHelp();
 });
+function showHelp() { dlg(`<h3>Keyboard shortcuts</h3><table class="tb">${SHORTCUTS.map(([k, v]) => `<tr><td><kbd>${esc(k)}</kbd></td><td>${esc(v)}</td></tr>`).join("")}</table>`, async () => {}, "", "Close"); }
 
+document.addEventListener("click", e => { const d = $("morefil"); if (d && d.open && !d.contains(e.target)) d.open = false; });
 // ---- wiring (id/delegated handlers only; CSP-safe) ----
 const cols = $("v-board");
 cols.addEventListener("click", e => {
@@ -1346,6 +1455,7 @@ ovEl.addEventListener("click", async e => {
 agEl.addEventListener("click", async e => {
   const i = e.target.closest("[data-inbox]"); if (i) return showInbox(i.dataset.inbox);
   const h = e.target.closest("[data-hook]"); if (h) return hookDlg(h.dataset.hook, h.dataset.url, h.dataset.cap, h.dataset.skills);
+  const af = e.target.closest("[data-agf]"); if (af) { agFilter = af.dataset.agf; return renderAgents(); }
   const mg = e.target.closest("[data-msg]"); if (mg) return msgDlg(mg.dataset.msg);
   const wk = e.target.closest("[data-wake]"); if (wk) { try { const r = await api("POST", "/agents/wake", {n: wk.dataset.wake}); toast(`Wake-up sent: ${r.unread} unread, ${r.ready} ready task(s)`); } catch (_) {} return; }
   const a = e.target.closest("[data-ackall]"); if (a) { await api("POST", "/inbox/ack", {as: a.dataset.ackall}); showInbox(a.dataset.ackall); refreshDash(); return; }

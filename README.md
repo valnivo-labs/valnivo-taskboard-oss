@@ -45,7 +45,7 @@ No MCP? Use REST: `curl -H "Authorization: Bearer $TOKEN" http://localhost:8790/
 | Awareness | inbox + signed webhooks, presence, silent-agent detection, sprint stats and risks, supervisor escalations and `attention` |
 | Knowledge | shared specs library with revisions and search |
 | Ops | chat channels (Slack, Discord, Teams, Telegram), wake-ups for silent agents, token roles, backups (daily, verified), JSON/CSV import and export, Slack/Teams/Discord-style digest and alert webhooks |
-| UI | board with page scrolling, overview with burndown, my work, specs, agents, admin; dark mode; collapsible menu; keyboard shortcuts (`n`, `/`, `1-6`, `?`) |
+| UI | board with page scrolling, overview with burndown, my work, specs, agents, admin; dark mode; collapsible menu; a Today start screen, a command bar (`Ctrl/Cmd K`), task drawer, admin in sections, phone layout; shortcuts (`n`, `/`, `1-7`, `?`) |
 
 ## Configuration
 All optional — see [.env.example](.env.example). The ones you will touch first: `TASKBOARD_TOKENS` (static tokens), `PORT`, `TASKBOARD_TRUST_PROXY=1` (behind a proxy), `TASKBOARD_DB`, `TASKBOARD_ALLOW_PRIVATE_WEBHOOKS=1` (agents on your LAN).

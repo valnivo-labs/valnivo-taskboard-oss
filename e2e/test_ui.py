@@ -145,7 +145,7 @@ def test_overview_shows_agent_spend(page):
     tid = mktask(b, "spender")
     api("POST", "/cost", {"task": tid, "in": 5000, "out": 1000, "usd": 1.5, "as": "Worker"})
     goto(page, view="overview", scope="b:%d" % b)
-    page.wait_for_selector("text=Agent spend")
+    page.wait_for_selector("#v-overview h2:has-text('Agent spend')")
     assert "$1.5" in page.inner_text("#v-overview")
 
 
@@ -159,6 +159,7 @@ def test_deep_link_opens_the_task(page):
 
 def test_admin_chat_channel_and_git_secret(page):
     goto(page, view="admin")
+    page.click("[data-admsec=chat]")
     page.wait_for_selector("#newchat")
     page.click("#newchat")
     page.fill("#f [name=n]", "E2E channel")
@@ -171,6 +172,7 @@ def test_admin_chat_channel_and_git_secret(page):
     page.click("#v-admin tr:has-text('E2E channel') [data-chat^='test']")
     assert "Test message sent" in toast_text(page)
     assert sink and "Test message" in sink[0]["text"]
+    page.click("[data-admsec=git]")
     page.once("dialog", lambda d: d.accept())
     page.click("#gitsecret")
     page.wait_for_selector("#gsec")
@@ -213,13 +215,81 @@ def test_token_limited_to_a_board(page):
 def test_message_an_agent_from_the_board(page):
     api("POST", "/agents", {"n": "Mailbox Agent"})
     goto(page, view="agents")
-    page.click("[data-msg='Mailbox Agent']")
+    page.click("#v-agents [data-msg='Mailbox Agent']")
     page.fill("#f [name=c]", "please pick up the release notes")
     page.click("#dsave")
     assert "Sent to 1" in toast_text(page)
     got = [n for n in api("GET", "/inbox?as=Mailbox%20Agent")["i"] if n["ty"] == "msg.direct"]
     assert got and "release notes" in got[0]["m"] and got[0]["do"].startswith("say to="), got
     page.wait_for_selector("#v-agents .msg:has-text('release notes')")
+
+
+def test_today_is_the_start_screen(page):
+    b, _ = mkboard("Today %d" % time.time())
+    t = mktask(b, "stuck on something", st="blocked", pr=1, bl="waiting for a key")
+    page.goto("%s/?token=%s" % (URL, ADMIN))                                         # a fresh browser lands on Today
+    page.wait_for_selector("#v-today .needrow")
+    assert "blocked" in page.inner_text("#v-today").lower() and page.locator("#v-today .tile").count() >= 4
+    page.click("#v-today .needrow [data-open]")
+    page.wait_for_selector("#dlg.drawer[open]")                                      # tasks open in a side drawer
+    assert page.locator("#dlg").bounding_box()["x"] > 400
+
+
+def test_command_bar(page):
+    b, _ = mkboard("Palette %d" % time.time())
+    mktask(b, "find me by the palette")
+    goto(page, view="board", scope="b:%d" % b)
+    page.keyboard.press("Control+k")
+    page.wait_for_selector("#cmdk[open]")
+    page.fill("#cmdq", "by the palette")
+    page.wait_for_selector("#cmdlist .cmditem:has-text('find me by the palette')")
+    page.keyboard.press("Enter")
+    page.wait_for_selector("#dlg.drawer[open]")
+    assert "find me by the palette" in page.inner_text("#dlg")
+    page.keyboard.press("Escape")
+    page.keyboard.press("Control+k")
+    page.fill("#cmdq", "agents")
+    page.wait_for_selector("#cmdlist .cmditem.on:has-text('Agents')")
+    page.keyboard.press("Enter")
+    page.wait_for_selector("#v-agents:not([hidden])")
+    page.click("#cmdbtn")                                                            # the sidebar button opens it too
+    page.wait_for_selector("#cmdk[open]")
+
+
+def test_admin_is_split_into_sections(page):
+    goto(page, view="admin")
+    page.wait_for_selector(".admnav")
+    assert page.locator("[data-sec=access]").is_visible() and not page.locator("[data-sec=chat]").is_visible()
+    page.click("[data-admsec=chat]")
+    assert page.locator("[data-sec=chat]").is_visible() and not page.locator("[data-sec=access]").is_visible()
+    for sec in ("access", "notifications", "chat", "git", "budgets", "rules", "backups", "templates", "data", "usage"):
+        page.click("[data-admsec=%s]" % sec)
+        assert page.locator("[data-sec=%s]" % sec).is_visible(), sec
+        shown = page.evaluate("[...document.querySelectorAll('#v-admin [data-sec]')].filter(p => p.offsetParent).map(p => p.dataset.sec)")
+        assert shown == [sec], shown                                                 # exactly one section at a time
+        over = page.evaluate("[...document.querySelectorAll('#v-admin .panel')].filter(p => p.offsetParent && p.scrollWidth > p.clientWidth + 1).length")
+        assert over == 0, (sec, over)                                                # nothing spills out of its panel
+
+
+def test_agents_show_state_and_filter(page):
+    b, _ = mkboard("States %d" % time.time())
+    mktask(b, "busy work", st="in_progress", **{"as": "State Agent"})
+    goto(page, view="agents", scope="b:%d" % b)
+    page.wait_for_selector(".agent:has-text('State Agent') .badge:has-text('Working')")
+    page.click("[data-agf=blocked]")
+    page.wait_for_selector(".agent:has-text('State Agent')", state="detached")       # filtered out
+    page.click("[data-agf=working]")
+    page.wait_for_selector(".agent:has-text('State Agent')")
+
+
+def test_phone_layout(page):
+    page.set_viewport_size({"width": 390, "height": 844})
+    goto(page, view="today")
+    box = page.locator("#tabs").bounding_box()
+    assert box["y"] + box["height"] >= 840 and box["width"] >= 380, box              # tab bar at the bottom
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth + 1")
+    page.click('#tabs [data-view="agents"]')
+    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth + 1")
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
@@ -245,7 +315,7 @@ def main():
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(channel=os.environ.get("E2E_CHANNEL") or None, headless=True)
-            for fn in TESTS:
+            for fn in [t for t in TESTS if not os.environ.get("E2E_ONLY") or os.environ["E2E_ONLY"] in t.__name__]:
                 ctx = browser.new_context(viewport={"width": 1360, "height": 900})
                 page = ctx.new_page()
                 page.set_default_timeout(10000)
