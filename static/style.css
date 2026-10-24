@@ -463,3 +463,8 @@ body.bulk-on #main{padding-bottom:132px}
 /* agent cards: the button row wraps instead of clipping, labels never break mid-word, badges drop to their own line before the name gets squeezed */
 .btnrow{flex-wrap:wrap}.btnrow button{white-space:nowrap;flex:none}
 .agent .hd>div{flex:1 1 9rem}.agent .hd .badge,.agent .hd .chip{flex:none;white-space:nowrap}
+/* sprint rows on Today are buttons: drop the fixed button height so the bar keeps its size and rows do not run into each other */
+button.sprow{height:auto;min-height:0;padding:14px 0;border-radius:0;display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;gap:8px;line-height:1.35}
+button.sprow:first-of-type{padding-top:0}button.sprow:hover{background:transparent}button.sprow:hover b{color:var(--pri)}
+button.sprow progress{flex:none;height:8px;width:100%}
+.tiles{grid-template-columns:repeat(auto-fit,minmax(112px,1fr))}
