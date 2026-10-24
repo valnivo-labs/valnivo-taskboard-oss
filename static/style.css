@@ -460,3 +460,6 @@ body.bulk-on #main{padding-bottom:132px}
 .bulkbar{gap:6px 8px}.bulkbar select,.bulkbar input{max-width:128px}
 @media(min-width:1100px){.bulkbar{flex-wrap:nowrap}}
 .bulkbar b{white-space:nowrap}
+/* agent cards: the button row wraps instead of clipping, labels never break mid-word, badges drop to their own line before the name gets squeezed */
+.btnrow{flex-wrap:wrap}.btnrow button{white-space:nowrap;flex:none}
+.agent .hd>div{flex:1 1 9rem}.agent .hd .badge,.agent .hd .chip{flex:none;white-space:nowrap}
