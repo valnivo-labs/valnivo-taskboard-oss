@@ -988,9 +988,9 @@ print("v18 selftest OK")
 # ================= v20: runs, quota, daily limits, due dates, approvals, audit log =================
 st, rb = J("POST", "/boards", {"n": "Runs board"}); RB = rb["id"]
 st, rt = J("POST", "/tasks", {"b": RB, "t": "run me", "as": "Runner One", "st": "todo", "pr": 2}); J("POST", f"/tasks/{rt['id']}/claim", {"as": "Runner One"})
-r1 = J("POST", "/runs", {"as": "Runner One", "task": rt["id"], "runtime": "claude", "job": "j1", "log": "https://logs.example.com/j1"})[1]; assert r1["st"] == "running", r1
-assert [x["rt"] for x in J("GET", f"/tasks/{rt['id']}/runs")[1]["i"]] == ["claude"] and J("GET", f"/runs/{r1['id']}")[1]["job"] == "j1"
-assert "running a claude job" in [a for a in J("GET", "/agents")[1]["i"] if a["n"] == "Runner One"][0].get("stx", "")                 # visible on the agent
+r1 = J("POST", "/runs", {"as": "Runner One", "task": rt["id"], "runtime": "agent-cli", "job": "j1", "log": "https://logs.example.com/j1"})[1]; assert r1["st"] == "running", r1
+assert [x["rt"] for x in J("GET", f"/tasks/{rt['id']}/runs")[1]["i"]] == ["agent-cli"] and J("GET", f"/runs/{r1['id']}")[1]["job"] == "j1"
+assert "running a agent-cli job" in [a for a in J("GET", "/agents")[1]["i"] if a["n"] == "Runner One"][0].get("stx", "")                 # visible on the agent
 assert J("POST", f"/runs/{r1['id']}/end", {"st": "ok", "out": "x"}, tok="wtok")[0] == 403                                                    # only its agent (or a supervisor) ends it
 e = J("POST", f"/runs/{r1['id']}/end", {"as": "Runner One", "st": "ok", "out": "built it", "usd": 0.2, "tokens": 1000, "comment": True})[1]
 assert e["st"] == "ok" and e["usd"] == 0.2 and e["secs"] >= 0, e
@@ -1001,7 +1001,7 @@ r2 = J("POST", "/runs", {"as": "Runner One", "task": rt["id"], "runtime": "grok"
 assert any(n["ty"] == "esc.run-failed" and "boom" in n["m"] for n in J("GET", "/inbox?as=Sup%20Bot&ack=1")[1]["i"]) and any("Run failed" in c["c"] for c in J("GET", f"/tasks/{rt['id']}?ctx=1")[1]["cc"])
 assert J("POST", "/runs", {"as": "Runner One", "runtime": "x"}, tok="vtok")[0] == 403 and J("POST", "/runs", {"as": "Runner One", "task": 999999})[1]["e"] == "nf" and J("POST", f"/runs/{r1['id']}/end", {"st": "weird"})[1]["e"] == "bad"
 # quota: the agent is told, work is not handed to it, and it clears
-J("POST", "/agents", {"n": "Runner One", "skills": "quotaskill"}); r3 = J("POST", "/runs", {"as": "Runner One", "runtime": "claude"})[1]
+J("POST", "/agents", {"n": "Runner One", "skills": "quotaskill"}); r3 = J("POST", "/runs", {"as": "Runner One", "runtime": "agent-cli"})[1]
 assert J("POST", f"/runs/{r3['id']}/end", {"as": "Runner One", "st": "quota", "out": "5h limit", "quota_min": 30})[1]["st"] == "quota"
 ra = [a for a in J("GET", "/agents")[1]["i"] if a["n"] == "Runner One"][0]; assert ra["q"] > "2000" and ra["qn"] == "5h limit", ra
 assert J("POST", "/runs", {"as": "Runner One"})[1]["e"] == "quota" and J("POST", "/runs", {"as": "Runner One"})[0] == 429
@@ -1010,7 +1010,7 @@ assert "Runner One" not in [c["n"] for c in J("GET", "/route?skill=quotaskill")[
 J("POST", "/agents", {"n": "Runner One", "quota_until": ""}); assert "q" not in [a for a in J("GET", "/agents")[1]["i"] if a["n"] == "Runner One"][0] and J("POST", "/runs", {"as": "Runner One"})[0] == 201
 # daily limits
 J("POST", "/settings", {"agent_limits": json.dumps({"Capped": {"jobs": 2}})}); assert J("POST", "/settings", {"agent_limits": "[1]"})[1]["e"] == "bad" and J("POST", "/settings", {"agent_limits": '{"x": {"nope": 1}}'})[1]["e"] == "bad"
-assert [J("POST", "/runs", {"as": "Capped", "runtime": "claude"})[0] for _ in range(3)] == [201, 201, 429]
+assert [J("POST", "/runs", {"as": "Capped", "runtime": "agent-cli"})[0] for _ in range(3)] == [201, 201, 429]
 J("POST", "/settings", {"agent_limits": json.dumps({"*": {"usd": 1}})}); J("POST", "/cost", {"as": "Spender", "usd": 1.5}); assert J("POST", "/runs", {"as": "Spender"})[1]["e"] == "limit" and J("POST", "/runs", {"as": "Spender"})[1]["f"] == "usd"
 J("POST", "/settings", {"agent_limits": ""})
 assert len(J("GET", "/runs?agent=Capped")[1]["i"]) == 2 and J("GET", "/runs?st=quota")[1]["i"][0]["ag"] == "Runner One"

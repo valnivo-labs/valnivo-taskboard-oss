@@ -335,7 +335,7 @@ def test_today_can_be_clicked_while_the_boards_still_load(page):
 def test_drawer_shows_due_runs_and_approvals(page):
     b, _ = mkboard("Runs %d" % time.time())
     tid = mktask(b, "task with history", st="in_progress", **{"as": "Runner Two"})
-    rid = api("POST", "/runs", {"as": "Runner Two", "task": tid, "runtime": "claude", "job": "j9"})["id"]
+    rid = api("POST", "/runs", {"as": "Runner Two", "task": tid, "runtime": "agent-cli", "job": "j9"})["id"]
     api("POST", "/runs/%d/end" % rid, {"as": "Runner Two", "st": "failed", "out": "tests did not pass"})
     api("POST", "/tasks/%d/approval" % tid, {"as": "Runner Two", "action": "deploy to production", "to": "admin"})
     goto(page, view="board", scope="b:%d" % b)
