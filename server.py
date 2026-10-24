@@ -173,6 +173,7 @@ db.executescript("""
 CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, ts TEXT DEFAULT CURRENT_TIMESTAMP, sender TEXT NOT NULL COLLATE NOCASE, recipient TEXT NOT NULL COLLATE NOCASE,
   task_id INTEGER, body TEXT NOT NULL, reply_to INTEGER);
 CREATE INDEX IF NOT EXISTS ix_msg_to ON messages(recipient); CREATE INDEX IF NOT EXISTS ix_msg_from ON messages(sender);
+CREATE TABLE IF NOT EXISTS views(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE, filters TEXT DEFAULT '{}', owner TEXT DEFAULT '', created TEXT DEFAULT CURRENT_TIMESTAMP);
 """)
 
 FIELDS = {
@@ -2102,6 +2103,43 @@ def bulk_move(actor, body):
             except ApiError as e:
                 failed.append({"id": i, "e": e.code, **({"f": e.field} if e.field else {})})
     return {"n": len(ok), "moved": ok, "skipped": skipped, "failed": failed}
+
+
+# ---------------------------------------------------------------- saved views: named filter sets shared by everyone (the board's "Saved views" menu)
+VIEW_KEYS = ("preset", "asg", "chan", "sprint", "q", "st", "lb", "as", "k", "b")
+
+
+def views_list():
+    out = []
+    for r in rows("SELECT * FROM views ORDER BY name"):
+        try:
+            f = json.loads(r["filters"] or "{}")
+        except ValueError:
+            f = {}
+        out.append({"id": r["id"], "n": r["name"], "f": f, "by": r["owner"] or None})
+    return {"n": len(out), "i": out}
+
+
+def view_save(actor, body):
+    name = " ".join(str(body.get("n") or body.get("name") or "").split())[:40]
+    if not name:
+        raise ApiError("missing", 400, "n")
+    f = body.get("f", body.get("filters")) or {}
+    if not isinstance(f, dict):
+        raise ApiError("bad", 400, "f")
+    clean = {k: str(v)[:100] for k, v in f.items() if k in VIEW_KEYS and v not in (None, "")}
+    with lock:
+        if not db.execute("SELECT 1 FROM views WHERE name=?", (name,)).fetchone() and db.execute("SELECT COUNT(*) FROM views").fetchone()[0] >= 100:
+            raise ApiError("limit", 400)
+        db.execute("INSERT INTO views(name,filters,owner) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET filters=excluded.filters, owner=excluded.owner", (name, json.dumps(clean, separators=(",", ":")), actor or ""))
+    return {"n": name, "f": clean}
+
+
+def view_del(q):
+    vid, name = qint(q, "id", 0), _qv(q, "n", "name")
+    with lock:
+        db.execute("DELETE FROM views WHERE id=? OR name=?", (vid, name or "\x00"))
+    return {"x": 1}
 
 
 # ---------------------------------------------------------------- direct messages: agent to agent, human to agent, supervisor to everyone
@@ -4666,6 +4704,13 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, bulk_move(actor, self.read_body()))
             if path == "/api/agents/wake" and method == "POST":
                 return self.send_json(200, wake_now(actor, self.role, self.read_body()))
+            if path == "/api/views":
+                if method == "GET":
+                    return self.send_json(200, views_list())
+                if method == "POST":
+                    return self.send_json(200, view_save(actor, self.read_body()))
+                if method == "DELETE":
+                    return self.send_json(200, view_del(q))
             if path == "/api/messages":
                 if method == "POST":
                     return self.send_json(201, say(actor, self.role, self.read_body()))

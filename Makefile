@@ -4,7 +4,7 @@ run:
 demo:
 	python3 server.py --demo
 test:
-	python3 selftest.py >/dev/null && python3 test_security.py && python3 e2e/agent_day.py >/dev/null
+	python3 selftest.py >/dev/null && python3 test_security.py && python3 test_parity.py && python3 e2e/agent_day.py >/dev/null
 e2e:
 	python3 e2e/test_ui.py
 docker:

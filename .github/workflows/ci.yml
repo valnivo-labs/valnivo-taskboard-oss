@@ -9,8 +9,9 @@ jobs:
         with: { python-version: "3.12" }
       - run: python3 selftest.py > /dev/null
       - run: python3 test_security.py
+      - run: python3 test_parity.py
       - run: python3 e2e/agent_day.py
-      - run: python3 -m py_compile server.py mcp_server.py runner.py
+      - run: python3 -m py_compile server.py mcp_server.py runner.py test_parity.py
   e2e:
     runs-on: ubuntu-latest
     steps:

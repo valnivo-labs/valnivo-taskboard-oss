@@ -929,3 +929,24 @@ tkx = mcp_as("tok", "all", "tokens", {"action": "create", "n": "Scoped Via Mcp",
 tx = [x["id"] for x in mcp_as("tok", "all", "tokens", {})["i"] if x["n"] == "Scoped Via Mcp"][0]
 assert mcp_as("tok", "all", "tokens", {"action": "scope", "id": tx, "boards": []})["bs"] == [] and J("GET", f"/boards/{SB}", tok=tkx["token"])[0] == 200
 print("v17 mcp OK")
+
+# ================= v18: saved views, the remaining tools, and agent parity =================
+v1 = J("POST", "/views", {"n": "Blocked work", "f": {"preset": "blocked", "asg": "Coder 1", "bogus": "x"}}, tok="wtok")[1]
+assert v1["f"] == {"preset": "blocked", "asg": "Coder 1"}, v1                                                         # unknown keys are dropped
+assert J("POST", "/views", {"n": "blocked WORK", "f": {"preset": "open"}})[1]["n"] == "blocked WORK"                  # same name, any case: replaced, not duplicated
+vl = J("GET", "/views", tok="vtok")[1]; assert vl["n"] == 1 and vl["i"][0]["f"] == {"preset": "open"} and vl["i"][0]["by"] == "a", vl   # everyone reads them
+assert J("POST", "/views", {"f": {}})[1]["e"] == "missing" and J("POST", "/views", {"n": "x"}, tok="vtok")[0] == 403
+assert mcp_as("wtok", "all", "views", {"action": "save", "n": "Mine", "f": {"q": "api"}})["f"] == {"q": "api"} and len(mcp_as("wtok", "all", "views", {})["i"]) == 2
+assert mcp_as("wtok", "all", "views", {"action": "del", "n": "mine"})["x"] == 1 and [v["n"].lower() for v in J("GET", "/views")[1]["i"]] == ["blocked work"]
+# the other things the screen could do and the tools could not
+assert mcp_as("tok", "all", "health", {})["ok"] is True
+assert "made" in mcp_as("tok", "all", "run_templates", {})
+st, ct_ = J("POST", "/tasks", {"b": BID, "t": "csv round trip", "as": "Csvman", "st": "todo", "pr": 2})
+csv_ = mcp_as("tok", "all", "export_csv", {"b": BID})["csv"]; assert "csv round trip" in csv_ and "title" in csv_.splitlines()[0].split(","), csv_[:120]
+st, cb_ = J("POST", "/boards", {"n": "Csv target"}); im = mcp_as("tok", "all", "import_csv", {"b": cb_["id"], "csv": csv_}); assert im["made"] >= 1, im
+assert mcp_as("wtok", "all", "export_csv", {})["e"] == "forbidden" and mcp_as("wtok", "all", "import_csv", {"b": cb_["id"], "csv": csv_})["e"] == "forbidden"
+J("POST", "/cost", {"task": ct_["id"], "usd": 0.5, "as": "Csvman"}); assert mcp_as("wtok", "all", "task_cost", {"id": ct_["id"]})["cs"] == 0.5
+assert "set" in mcp_as("wtok", "all", "nudge", {})
+assert "csv_round" not in ""  # noqa
+import runpy; runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_parity.py"))
+print("v18 selftest OK")

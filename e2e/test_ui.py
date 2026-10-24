@@ -292,6 +292,24 @@ def test_phone_layout(page):
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth + 1")
 
 
+def test_saved_views_are_shared_with_agents(page):
+    b, _ = mkboard("Views %d" % time.time())
+    mktask(b, "a blocked one", st="blocked", pr=1)
+    api("POST", "/views", {"n": "Made by an agent", "f": {"preset": "blocked"}})
+    goto(page, view="board", scope="b:%d" % b)
+    page.wait_for_selector("#views option:has-text('Made by an agent')", state="attached")        # a view an agent saved shows up on the screen
+    page.click("#morefil summary")
+    page.click("#presets [data-preset=open]")
+    page.fill("#search", "blocked")
+    page.click("#morefil summary")
+    page.click("#saveview")
+    page.fill("#f [name=name]", "Saved on screen")
+    page.click("#dsave")
+    assert "View saved" in toast_text(page)
+    saved = [v for v in api("GET", "/views")["i"] if v["n"] == "Saved on screen"]
+    assert saved and saved[0]["f"].get("q") == "blocked" and saved[0]["f"].get("preset") == "open", saved       # and one saved on screen is there for agents
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

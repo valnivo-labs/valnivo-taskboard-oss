@@ -73,6 +73,31 @@ def S(req=(), **p):
     return {"type": "object", "properties": p, "required": list(req)}
 
 
+def api_text(method, path, text=None, timeout=120):
+    """Endpoints that speak CSV instead of JSON."""
+    req = urllib.request.Request(URL + "/api" + path, method=method, headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "text/csv; charset=utf-8"}, data=text.encode() if text is not None else None)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read().decode("utf-8", "replace")
+            return json.loads(body) if r.headers.get("Content-Type", "").startswith("application/json") else body
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read())
+        except Exception:
+            return {"e": str(e.code)}
+
+
+def _views(a):
+    act = a.pop("action", "list")
+    if act == "list":
+        return api("GET", "/views")
+    if act == "save":
+        return api("POST", "/views", a)
+    if act == "del":
+        return api("DELETE", "/views" + qs(a, ["id", "n"]))
+    return {"e": "bad", "f": "action"}
+
+
 def _tokens(a):
     act = a.pop("action", "list")
     if act == "list":
@@ -282,6 +307,15 @@ TOOLS = {
     "import_data": ("Admin: import an export (data = the object export_data returned). Always creates new copies; nothing is overwritten.", S(["data"], data={"type": "object"}), lambda a: api("POST", "/import", a["data"])),
     "del_board": ("Admin: delete a board and everything on it. Irreversible - export_data first.", S(["id"], id=i), lambda a: api("DELETE", f"/boards/{a['id']}")),
     "del_sprint": ("Supervisor/admin: delete a sprint (its tasks stay, without a sprint).", S(["id"], id=i), lambda a: api("DELETE", f"/sprints/{a['id']}")),
+    "views": ("Saved views of the board's filter menu, shared by everyone. action list (default) | save (n=name, f={preset: open|blocked|gate|owner|nudged, asg, chan, sprint, q}) | del (id or n).",
+              S(action=s, n=s, id=i, f={"type": "object"}), lambda a: _views(dict(a))),
+    "run_templates": ("Create the tasks of every recurring template that is due now (the Admin button 'Run due recurring now'). Returns {made, skipped, failed}.", S(), lambda a: api("POST", "/templates/run", {})),
+    "task_cost": ("What agents spent on one task: total (cs usd, tk tokens) and the last 50 entries.", S(["id"], id=i), lambda a: api("GET", f"/tasks/{a['id']}/cost")),
+    "nudge": ("Flag stale open tasks now (the periodic check): sets the nudge flag, notifies assignees, auto-unblocks tasks whose blockers are done. b = one board.", S(b=i), lambda a: api("POST", "/nudge" + qs(a, ["b"]), {})),
+    "health": ("Is the board up? {ok:true}.", S(), lambda a: api("GET", "/health")),
+    "export_csv": ("Admin: tasks as CSV text (all boards, or b). Columns include id,board_id,sprint_id,title,description,status,priority,assignee,kind,channel,labels,points; import_csv reads the same file back.", S(b=i), lambda a: (lambda r: r if isinstance(r, dict) else {"csv": r})(api_text("GET", "/export.csv" + qs(a, ["b"])))),
+    "import_csv": ("Admin: import tasks into board b from CSV text (header: title,description,status,priority,assignee,kind,channel,labels,points). Returns {made, bad}.",
+                   S(["b", "csv"], b=i, csv=s), lambda a: api_text("POST", "/import/csv?b=%s" % a["b"], a["csv"])),
     "batch": ("Run up to 20 calls in one round trip: ops=[{m:'GET'|'POST'|'PATCH'|'DELETE', p:'/tasks/7', b:{...}}]. Stops at the first error unless cont=true. Returns [{s:status, r:result}].",
               S(["ops"], ops={"type": "array", "items": {"type": "object", "properties": {"m": s, "p": s, "b": {"type": "object"}}}}, cont={"type": "boolean"}), lambda a: api("POST", "/batch", a)),
     "guide": ("A short playbook for your role (~100-250 tokens): agent, coder, reviewer, supervisor or planner.", S(role=s), lambda a: api("GET", "/guide" + qs(a, ["role"]))),
@@ -298,7 +332,7 @@ TOOLS = {
 CORE = ["briefing", "next", "finish", "inbox", "claim", "set_task", "add_task", "tasks", "task", "comment", "say", "handoff", "heartbeat", "answer", "decide_review", "lock", "unlock"]
 COORD = ["messages", "claim_next", "release", "locks", "ask", "asks", "cancel_ask", "request_review", "reviews", "watch", "unwatch", "watches", "attach", "attachments", "del_attachment",
          "cost", "links", "route", "envs", "deploy_env", "freeze_env", "unfreeze_env", "decline_task", "reopen_task", "add_commit", "task_activity", "comments"]
-ADMIN = ["tokens", "settings", "backups", "export_data", "import_data", "del_board", "del_sprint", "chats", "git_secret", "wake_agent", "usage"]
+ADMIN = ["tokens", "settings", "backups", "export_data", "export_csv", "import_csv", "import_data", "del_board", "del_sprint", "chats", "git_secret", "wake_agent", "usage"]
 GROUPS = {"core": CORE, "coord": COORD, "admin": ADMIN, "plan": [n for n in TOOLS if n not in CORE + COORD + ADMIN]}
 PROFILE = os.environ.get("TASKBOARD_TOOLS", "core")      # core (default) | core,coord | core,coord,plan | core,admin | all | tool names
 if PROFILE == "all":

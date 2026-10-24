@@ -1340,29 +1340,38 @@ $("bulkbar").addEventListener("click", async e => {
   } catch (_) {}
 });
 
-// ---- saved views (per browser) ----
-const getViews = () => { try { return JSON.parse(localStorage.tb_views || "[]"); } catch (_) { return []; } };
-function viewOptions(sel) {
-  const vs = getViews();
-  $("views").innerHTML = '<option value="">Saved views…</option>' + vs.map((v, i) => `<option value="${i}" ${String(i) === sel ? "selected" : ""}>${esc(v.name)}</option>`).join("") + (vs.length ? '<option value="del">— delete a view…</option>' : "");
+// ---- saved views (shared: stored on the server, so agents can manage them too) ----
+let VIEWS = [];
+async function loadViews() {
+  try {
+    const old = JSON.parse(localStorage.tb_views || "[]");           // views saved in this browser before they became shared: move them over once
+    for (const v of old) await api("POST", "/views", {n: v.name, f: {preset: v.preset, asg: v.asg, chan: v.chan, sprint: v.sprint, q: v.q}});
+    if (old.length) localStorage.removeItem("tb_views");
+  } catch (_) {}
+  try { VIEWS = (await api("GET", "/views")).i || (await api("GET", "/views")).items || []; } catch (_) { VIEWS = []; }
+  viewOptions("");
 }
-$("views").onchange = e => {
-  const v = e.target.value, vs = getViews();
+function viewOptions(sel) {
+  $("views").innerHTML = '<option value="">Saved views…</option>' + VIEWS.map((v, i) => `<option value="${i}" ${String(i) === sel ? "selected" : ""}>${esc(v.n)}</option>`).join("") + (VIEWS.length ? '<option value="del">— delete a view…</option>' : "");
+}
+$("views").onchange = async e => {
+  const v = e.target.value;
   if (v === "del") {
-    const name = prompt("Delete which view? Type its name:", vs[0] && vs[0].name); if (name === null) return viewOptions("");
-    localStorage.tb_views = JSON.stringify(vs.filter(x => x.name !== name.trim())); return viewOptions("");
+    const name = prompt("Delete which view? Type its name:", VIEWS[0] && VIEWS[0].n); if (name === null) return viewOptions("");
+    try { await api("DELETE", "/views?n=" + encodeURIComponent(name.trim())); } catch (_) {}
+    return loadViews();
   }
-  const x = vs[+v]; if (!x) return;
-  applyPreset(x.preset || "", false); $("asg").value = x.asg || ""; $("chan").value = x.chan || ""; $("sprint").value = x.sprint || ""; $("search").value = x.q || "";
+  const x = VIEWS[+v]; if (!x) return;
+  const f = x.f || {};
+  applyPreset(f.preset || "", false); $("asg").value = f.asg || ""; $("chan").value = f.chan || ""; $("sprint").value = f.sprint || ""; $("search").value = f.q || "";
   autoSprint = false; render();
 };
-$("saveview").onclick = () => dlg(`<h3>Save view</h3><label>Name<input name="name" required maxlength="40" placeholder="e.g. My blocked work"></label><p class="muted hint">Saves preset, assignee, app/channel, sprint and search for this browser.</p>`,
+$("saveview").onclick = () => dlg(`<h3>Save view</h3><label>Name<input name="name" required maxlength="40" placeholder="e.g. My blocked work"></label><p class="muted hint">Saves the preset, assignee, app/channel, sprint and search. Everyone, agents included, can use it.</p>`,
   async d => {
-    const vs = getViews().filter(x => x.name !== d.name.trim());
-    vs.push({name: d.name.trim(), preset, asg: $("asg").value, chan: $("chan").value, sprint: $("sprint").value, q: $("search").value});
-    localStorage.tb_views = JSON.stringify(vs); viewOptions(String(vs.length - 1)); toast("View saved");
+    await api("POST", "/views", {n: d.name.trim(), f: {preset, asg: $("asg").value, chan: $("chan").value, sprint: $("sprint").value, q: $("search").value}});
+    await loadViews(); const i = VIEWS.findIndex(x => x.n.toLowerCase() === d.name.trim().toLowerCase()); viewOptions(String(i)); toast("View saved");
   }, "", "Save view");
-viewOptions("");
+loadViews();
 
 // ---- keyboard shortcuts ----
 const SHORTCUTS = [["n", "New task"], ["/", "Search the board"], ["Ctrl/Cmd + K", "Search, jump and run commands"], ["1-7", "Today / Overview / Board / My work / Specs / Agents / Admin"], ["?", "This help"], ["Esc", "Close dialog or inline add"], ["Cmd/Ctrl + Enter", "Save the open dialog"]];
