@@ -51,8 +51,49 @@ SPRINT_DAYS = int(os.environ.get("TASKBOARD_SPRINT_DAYS", "14"))
 
 os.makedirs(os.path.dirname(DB), exist_ok=True)
 lock = threading.Lock()
-db = sqlite3.connect(DB, check_same_thread=False, isolation_level=None)
-db.row_factory = sqlite3.Row
+
+
+class _Res:
+    """A finished query: rows are read while the connection is locked, so another thread can never disturb them."""
+    def __init__(self, rows, lastrowid, rowcount):
+        self._r, self._i, self.lastrowid, self.rowcount = rows, 0, lastrowid, rowcount
+
+    def fetchone(self):
+        if self._i >= len(self._r):
+            return None
+        self._i += 1
+        return self._r[self._i - 1]
+
+    def fetchall(self):
+        out, self._i = self._r[self._i:], len(self._r)
+        return out
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class _SafeDB:
+    """Serialises every statement on the single shared connection (threads, SSE streams, hooks all use it)."""
+    def __init__(self, conn):
+        self._c, self._l = conn, threading.RLock()
+
+    def execute(self, sql, args=()):
+        with self._l:
+            cur = self._c.execute(sql, args)
+            return _Res(cur.fetchall() if cur.description else [], cur.lastrowid, cur.rowcount)
+
+    def executescript(self, sql):
+        with self._l:
+            return self._c.executescript(sql)
+
+    def backup(self, dst):
+        with self._l:
+            return self._c.backup(dst)
+
+
+_conn = sqlite3.connect(DB, check_same_thread=False, isolation_level=None)
+_conn.row_factory = sqlite3.Row
+db = _SafeDB(_conn)
 db.execute("PRAGMA journal_mode=WAL")
 db.execute("PRAGMA foreign_keys=ON")
 db.executescript("""
@@ -3835,6 +3876,15 @@ class H(BaseHTTPRequestHandler):
             self.err(e.code, e.status, e.field)
         except sqlite3.IntegrityError:
             self.err("bad", 400, "ref")
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            try:
+                self.err("server", 500)
+            except Exception:
+                self.close_connection = True
 
     def changes(self, q):
         """Deltas since event id -> {"c":last_id,"e":[[id,type,entity_id,board,delta],...]}"""
@@ -3933,6 +3983,7 @@ class H(BaseHTTPRequestHandler):
 class S(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 256          # the default (5) drops connections when a page loads many boards at once
 
 
 def _nudge_loop():

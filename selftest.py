@@ -588,3 +588,20 @@ r = J("POST", f"/tasks/{kt2['id']}/move", {"b": KAN}); assert r[0] == 409 and r[
 assert J("POST", f"/tasks/{kt2['id']}/move", {"b": KAN, "force": True})[1]["b"] == KAN                                                                         # admin override
 assert J("POST", f"/tasks/{kt2['id']}/move", {"b": DST, "force": True}, tok="vtok")[0] == 403                                                                  # viewers cannot
 print("v12 selftest OK")
+
+# ================= v13: reload storms must not lose data (one shared connection, many threads) =================
+import concurrent.futures as _cf
+errs = []
+def _hit(i):
+    try:
+        for p in (f"/boards/{BID}", "/changes?since=0&limit=50", "/boards", f"/tasks?b={BID}&limit=20", "/dashboard"):
+            code, _, body = call("GET", p)
+            if code != 200 or not body.strip().startswith(("{", "[")):
+                errs.append((p, code, body[:80]))
+    except Exception as e:
+        errs.append(("exc", repr(e)))
+with _cf.ThreadPoolExecutor(32) as ex:
+    list(ex.map(_hit, range(96)))
+assert not errs, errs[:3]
+assert server.db.execute("SELECT COUNT(*) FROM events").fetchone()[0] > 0 and server.last_event() > 0
+print("v13 selftest OK")

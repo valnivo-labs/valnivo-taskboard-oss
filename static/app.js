@@ -35,19 +35,29 @@ function toast(m, label, fn) {
   clearTimeout(toastT); toastT = setTimeout(() => { t.hidden = true; }, label ? 8000 : 4000);
 }
 
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function api(m, p, b) {
   const sep = p.includes("?") ? "&" : "?";
-  const r = await fetch(BASE + "/api" + p + sep + "full=1", {
-    method: m, headers: {Authorization: "Bearer " + tok, "Content-Type": "application/json"},
-    body: b ? JSON.stringify(b) : undefined,
-  });
-  const j = await r.json();
-  if (!r.ok) {
-    if (j.e === "auth") { localStorage.removeItem("tb_token"); toast("Auth failed — reload and enter a valid token"); }
-    else toast("Error: " + j.e + (j.f ? " (" + j.f + ")" : ""));
-    throw j;
+  for (let i = 0; ; i++) {
+    let r, j;
+    try {
+      r = await fetch(BASE + "/api" + p + sep + "full=1", {
+        method: m, headers: {Authorization: "Bearer " + tok, "Content-Type": "application/json"},
+        body: b ? JSON.stringify(b) : undefined,
+      });
+      j = await r.json();
+    } catch (_) {                                   // dropped connection or a non-JSON error page from a proxy: reads are safe to retry
+      if (m === "GET" && i < 3) { await sleep(300 * 3 ** i); continue; }
+      toast("Could not reach the server — check your connection"); throw {e: "net"};
+    }
+    if (!r.ok) {
+      if (m === "GET" && r.status >= 500 && i < 3) { await sleep(300 * 3 ** i); continue; }
+      if (j.e === "auth") { localStorage.removeItem("tb_token"); toast("Auth failed — reload and enter a valid token"); }
+      else toast("Error: " + j.e + (j.f ? " (" + j.f + ")" : ""));
+      throw j;
+    }
+    return j;
   }
-  return j;
 }
 
 const TEAM_LABELS = {};
@@ -74,7 +84,8 @@ async function loadBoard() {
   if (sc.k === "b") { const one = await api("GET", "/boards/" + sc.id); if (my !== loadSeq) return; B = one; BS = {[B.id]: B}; }
   else {
     const list = boards.filter(b => sc.k === "all" || b.team === sc.team);
-    const snaps = await Promise.all(list.map(b => api("GET", "/boards/" + b.id)));
+    const snaps = [];
+    for (let i = 0; i < list.length; i += 4) snaps.push(...await Promise.all(list.slice(i, i + 4).map(b => api("GET", "/boards/" + b.id))));   // a few at a time
     if (my !== loadSeq) return;
     BS = {}; snaps.forEach(x => { BS[x.id] = x; });
     B = {id: 0, multi: true, name: sc.k === "all" ? "All boards" : teamLabel(sc.team), scopeTeam: sc.k === "team" ? sc.team : "", method: "multi", sprints: [], cfg: "", dod: "",
@@ -713,11 +724,13 @@ function hookDlg(name, url, cap, skills) {
 }
 
 // ---- SSE (events are tiny deltas: {t,a,id,b,d}) ----
+let esDown = false;
+addEventListener("pagehide", () => { if (es) es.close(); });      // a reload must not leave a dead stream behind
 function connect() {
   if (es) es.close();
   es = new EventSource(`${BASE}/api/events?${B.multi ? "" : "board=" + B.id + "&"}token=${encodeURIComponent(tok)}`);
-  es.onopen = () => { $("dot").classList.add("on"); $("who").textContent = "live"; };
-  es.onerror = () => { $("dot").classList.remove("on"); $("who").textContent = "reconnecting…"; };
+  es.onopen = () => { $("dot").classList.add("on"); $("who").textContent = "live"; if (esDown) { esDown = false; loadBoard().catch(() => {}); } };   // catch up after a gap
+  es.onerror = () => { esDown = true; $("dot").classList.remove("on"); $("who").textContent = "reconnecting…"; };
   es.onmessage = e => onEv(JSON.parse(e.data));
 }
 
@@ -1214,7 +1227,15 @@ $("presets").onclick = e => {
 };
 document.querySelectorAll("#presets .preset").forEach(b => b.classList.toggle("on", b.dataset.preset === preset));
 setView(view);
-loadBoards();
+function startLoad() {
+  loadBoards().catch(() => {
+    if (B) return;
+    $("main").insertAdjacentHTML("afterbegin", '<div class="pad" id="loadfail"><div class="empty"><b>Could not load the boards</b><br>Retrying…<br><button type="button" class="mini primary" id="loadretry">Try again now</button></div></div>');
+    const go = () => { const e = $("loadfail"); if (e) e.remove(); startLoad(); };
+    $("loadretry").onclick = go; setTimeout(() => { if ($("loadfail")) go(); }, 5000);
+  });
+}
+startLoad();
 
 // ---- collapsible menu (remembered per browser) ----
 const shellEl = document.querySelector(".shell");
