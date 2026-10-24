@@ -467,7 +467,7 @@ async function renderAdmin() {
   const last = bk.last;
   el.innerHTML = `<div class="pad"><div class="grid2">
     <div class="panel"><h2>Access — one token per agent</h2><p class="muted hint">Roles: <b>admin</b> everything · <b>supervisor</b> agent + deletes sprints, gets escalations · <b>agent</b> read/write, no deletes of boards/sprints, no admin · <b>viewer</b> read-only. A token's name is the actor in the audit trail and the default inbox.</p>
-      <table class="tb"><tr><th>Name</th><th>Role</th><th>Last used</th><th></th></tr>${tk.i.map(t => `<tr><td>${esc(t.n)}</td><td><span class="stb">${esc(t.role)}</span></td><td>${t.env ? '<span class="muted">env</span>' : esc(t.u ? ago(t.u) + " ago" : "never")}</td><td class="num">${t.env ? "" : `<button type="button" class="mini" data-deltoken="${t.id}">Revoke</button>`}</td></tr>`).join("")}</table>
+      <table class="tb"><tr><th>Name</th><th>Role</th><th>Boards</th><th>Last used</th><th></th></tr>${tk.i.map(t => `<tr><td>${esc(t.n)}</td><td><span class="stb">${esc(t.role)}</span></td><td class="muted">${t.bs ? esc(t.bs.map(i => (boards.find(b => b.id === i) || {}).name || "#" + i).join(", ")) : "all"}</td><td>${t.env ? '<span class="muted">env</span>' : esc(t.u ? ago(t.u) + " ago" : "never")}</td><td class="num">${t.env ? "" : `<button type="button" class="mini" data-tokscope="${t.id}" data-bs="${(t.bs || []).join(",")}" ${t.role === "admin" ? "disabled" : ""}>Boards…</button> <button type="button" class="mini" data-deltoken="${t.id}">Revoke</button>`}</td></tr>`).join("")}</table>
       <p><button type="button" class="mini primary" id="newtoken">+ Create agent token</button></p></div>
     <div class="panel"><h2>Notifications &amp; supervisor</h2><form id="setf" class="stack">
       <label>Supervisor agent(s) — get escalations (comma separated names)<input name="supervisors" value="${esc(se.supervisors)}" placeholder="e.g. Supervisor"></label>
@@ -524,8 +524,8 @@ $("v-admin").addEventListener("click", async e => {
   const el = $("v-admin"), id = k => e.target.id === k;
   if (await adminExtras(e)) return;
   const dt = e.target.closest("[data-deltoken]"); if (dt) { if (confirm("Revoke this token? Anything using it stops working.")) { await api("DELETE", "/tokens?id=" + dt.dataset.deltoken); renderAdmin(); } return; }
-  if (id("newtoken")) return dlg(`<h3>Create agent token</h3><label>Agent name (exactly as used in Assignee)<input name="n" required></label><label>Role<select name="role">${opt(["agent", "supervisor", "viewer", "admin"], "agent")}</select></label>`,
-    async d => { const r = await api("POST", "/tokens", d); closeDlg(true); setTimeout(() => dlg(`<h3>Token for ${esc(r.n)}</h3><p class="muted hint">Shown once. Store it in the agent's secret store now.</p><label>Token<input readonly value="${esc(r.token)}" id="tkv"></label>`, async () => { await navigator.clipboard.writeText(r.token).catch(() => {}); toast("Copied"); renderAdmin(); }, "", "Copy & close"), 50); throw {e: "shown"}; }, "", "Create");
+  if (id("newtoken")) return dlg(`<h3>Create agent token</h3><label>Agent name (exactly as used in Assignee)<input name="n" required></label><label>Role<select name="role">${opt(["agent", "supervisor", "viewer", "admin"], "agent")}</select></label>${boardPick([])}`,
+    async d => { const bs = boards.filter(b => d["tb_" + b.id]).map(b => b.id); if (bs.length && d.role === "admin") { toast("Admin tokens cannot be limited to boards"); throw {e: "bad"}; } const r = await api("POST", "/tokens", {n: d.n, role: d.role, boards: bs}); closeDlg(true); setTimeout(() => dlg(`<h3>Token for ${esc(r.n)}</h3><p class="muted hint">Shown once. Store it in the agent's secret store now.</p><label>Token<input readonly value="${esc(r.token)}" id="tkv"></label>`, async () => { await navigator.clipboard.writeText(r.token).catch(() => {}); toast("Copied"); renderAdmin(); }, "", "Copy & close"), 50); throw {e: "shown"}; }, "", "Create");
   if (id("bknow")) { try { const r = await api("POST", "/admin/backup"); toast(r.ok ? "Backup created and verified" : "Backup created but verification FAILED"); renderAdmin(); } catch (_) {} return; }
   if (id("digestnow")) { const r = await api("POST", "/admin/digest"); return toast(r.sent ? "Digest sent" : "Not sent: " + (r.why || "nothing to do")); }
   if (id("expall")) return download("/export", "taskboard-export.json");
@@ -729,7 +729,7 @@ async function renderOverview() {
 
 async function renderAgents() {
   const el = $("v-agents");
-  const [ag, d, lk, ak, rv] = await Promise.all([api("GET", "/agents"), refreshDash(), api("GET", "/locks"), api("GET", "/asks"), api("GET", "/reviews")]);
+  const [ag, d, lk, ak, rv, msgs] = await Promise.all([api("GET", "/agents"), refreshDash(), api("GET", "/locks"), api("GET", "/asks"), api("GET", "/reviews"), api("GET", "/messages?limit=12").catch(() => ({i: []}))]);
   let sups = [];
   try { sups = ((await api("GET", "/settings")).supervisors || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean); } catch (_) {}
   if (view !== "agents") return;
@@ -744,7 +744,7 @@ async function renderAgents() {
       <div class="kv"><span>Open tasks</span><b>${open}${cap ? " of " + cap : ""}</b></div>
       ${cap ? `<div class="bar"><i class="${over ? "bad" : ""}" style="width:${Math.min(100, Math.round(100 * open / cap))}%"></i></div>` : ""}
       ${a.sk ? `<div class="skills">${a.sk.split(",").map(x => `<span class="chip">${esc(x)}</span>`).join("")}</div>` : ""}
-      <div class="btnrow"><button type="button" class="mini" data-inbox="${esc(a.n)}">Open inbox</button>${a.hook ? `<button type="button" class="mini" data-wake="${esc(a.n)}" title="Send a wake-up ping to its webhook">Wake</button>` : ""}<button type="button" class="mini" data-hook="${esc(a.n)}" data-url="${esc(a.hook || "")}" data-cap="${a.cap || ""}" data-skills="${esc(a.sk || "")}">Settings</button></div></article>`;
+      <div class="btnrow"><button type="button" class="mini" data-inbox="${esc(a.n)}">Open inbox</button>${a.hook ? `<button type="button" class="mini" data-wake="${esc(a.n)}" title="Send a wake-up ping to its webhook">Wake</button>` : ""}<button type="button" class="mini" data-msg="${esc(a.n)}">Message</button><button type="button" class="mini" data-hook="${esc(a.n)}" data-url="${esc(a.hook || "")}" data-cap="${a.cap || ""}" data-skills="${esc(a.sk || "")}">Settings</button></div></article>`;
   }).join("");
   const locks = lk.i.length ? lk.i.map(l => `<div class="coord"><div><b class="mono">${esc(l.name)}</b><div class="muted">held by ${esc(l.owner)} until ${esc(l.until.slice(11, 16))} UTC${l.note ? " — " + esc(l.note) : ""}</div></div><button type="button" class="mini" data-unlock="${esc(l.name)}" data-owner="${esc(l.owner)}">Release</button></div>`).join("") : '<span class="muted">Nothing is locked.</span>';
   const asks = ak.i.length ? ak.i.map(x => `<div class="coord"><div><b>${esc(x.from)} → ${esc(x.to)}</b>${x.tk ? ` <span class="mono">#${x.tk}</span>` : ""}<div>${esc(x.q)}</div><div class="muted">answer by ${esc(x.due.slice(5, 16))} UTC${x.due < new Date().toISOString().slice(0, 19).replace("T", " ") ? ' · <b style="color:var(--bad)">overdue</b>' : ""}</div></div><button type="button" class="mini primary" data-answer="${x.id}" data-q="${esc(x.q)}" data-to="${esc(x.to)}">Answer</button></div>`).join("") : '<span class="muted">No open questions between agents.</span>';
@@ -753,6 +753,8 @@ async function renderAgents() {
     ${cards ? `<div class="agentcards">${cards}</div>` : '<span class="muted">No agents yet — assign a task to someone.</span>'}
     <div class="grid2"><div class="panel"><h2>Locks <span class="muted">${lk.i.length}</span></h2>${locks}</div><div class="panel"><h2>Open questions <span class="muted">${ak.i.length}</span></h2>${asks}</div></div>
     <div class="grid2"><div class="panel"><h2>Reviews waiting <span class="muted">${rv.i.length}</span></h2>${revs}</div><div class="panel" id="inboxview"><h2>Inbox</h2><span class="muted">Pick an agent to see their notifications.</span></div></div>
+    <div class="panel"><h2>Messages <span class="muted">latest</span></h2>${msgs.i.length ? msgs.i.slice().reverse().map(m => `<div class="msg"><b>${esc(m.from)}</b> → ${esc(m.to)}${m.tk ? ` <button type="button" class="link" data-open="${m.tk}"><span class="mono">#${m.tk}</span></button>` : ""}<div>${esc(m.c)}</div><small class="muted">${esc(ago(m.ts))} ago</small></div>`).join("") : '<span class="muted">No messages yet. Agents write to each other with the say tool; use Message on an agent card to write to one yourself.</span>'}
+      <p><button type="button" class="mini primary" data-msg="">New message</button></p></div>
     <div class="panel"><h2>Register an agent</h2><p class="muted">Add a push webhook, a signing secret, a capacity and skills for an agent. Skills drive automatic routing (assign a task to “auto” with a matching label). Agents also appear here once a task is assigned to them or they send a heartbeat.</p><button type="button" class="mini primary" id="addagent">+ Register agent</button></div></div>`;
 }
 
@@ -1130,6 +1132,12 @@ const kfmt = n => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? Math.round(
 const CHAT_EV = [["blocked", "A task is blocked"], ["done", "A task is done"], ["review", "A task goes to review"], ["declined", "A task is declined"], ["assigned", "A task waits on a human"],
   ["escalation", "Escalations to the supervisor"], ["sprint", "Sprint started, closed or at risk"], ["budget", "Budget warnings"], ["git", "Pull requests merged, CI failures"]];
 let CHATS = [];
+const boardPick = sel => `<fieldset class="fs"><legend>Limit to boards <span class="muted">(none ticked = every board)</span></legend><div class="evgrid">${boards.map(b => `<label class="chk"><input type="checkbox" name="tb_${b.id}" ${sel.includes(b.id) ? "checked" : ""}> ${esc(b.name)}</label>`).join("")}</div></fieldset>`;
+function msgDlg(to) {
+  dlg(`<h3>Message${to ? " to " + esc(to) : ""}</h3><div class="row2"><label>To (agent or person, * = everyone)<input name="to" required value="${esc(to)}"></label><label>From<input name="as" required value="${esc(localStorage.tb_from || "Operator")}"></label></div>
+    <label>Message<textarea name="c" required rows="4" placeholder="What should they know or do?"></textarea></label><label>About task # (optional)<input name="task" type="number" min="1"></label>`,
+    async d => { localStorage.tb_from = d.as; const body = {to: d.to, c: d.c, as: d.as}; if (d.task) body.task = +d.task; const r = await api("POST", "/messages", body); toast(`Sent to ${r.n} recipient(s)`); if (view === "agents") renderAgents(); }, "", "Send");
+}
 
 function codeBox(t) {
   const cm = t.commits || [], pr = /^https:\/\//.test(t.pr_url || "");
@@ -1170,6 +1178,12 @@ function chatDlg() {
 async function adminExtras(e) {
   const t = e.target, b = t.closest("[data-chat]");
   if (t.id === "newchat") { chatDlg(); return true; }
+  const ts = t.closest("[data-tokscope]");
+  if (ts) {
+    const cur = ts.dataset.bs ? ts.dataset.bs.split(",").map(Number) : [];
+    dlg(`<h3>Boards this token may use</h3>${boardPick(cur)}`, async d => { await api("POST", "/tokens", {id: +ts.dataset.tokscope, boards: boards.filter(b => d["tb_" + b.id]).map(b => b.id)}); renderAdmin(); }, "", "Save");
+    return true;
+  }
   if (b) {
     const [act, cid] = b.dataset.chat.split(":");
     try {
@@ -1332,6 +1346,7 @@ ovEl.addEventListener("click", async e => {
 agEl.addEventListener("click", async e => {
   const i = e.target.closest("[data-inbox]"); if (i) return showInbox(i.dataset.inbox);
   const h = e.target.closest("[data-hook]"); if (h) return hookDlg(h.dataset.hook, h.dataset.url, h.dataset.cap, h.dataset.skills);
+  const mg = e.target.closest("[data-msg]"); if (mg) return msgDlg(mg.dataset.msg);
   const wk = e.target.closest("[data-wake]"); if (wk) { try { const r = await api("POST", "/agents/wake", {n: wk.dataset.wake}); toast(`Wake-up sent: ${r.unread} unread, ${r.ready} ready task(s)`); } catch (_) {} return; }
   const a = e.target.closest("[data-ackall]"); if (a) { await api("POST", "/inbox/ack", {as: a.dataset.ackall}); showInbox(a.dataset.ackall); refreshDash(); return; }
   const ul = e.target.closest("[data-unlock]"); if (ul) { await api("DELETE", "/locks?name=" + encodeURIComponent(ul.dataset.unlock) + "&as=" + encodeURIComponent(ul.dataset.owner)); return renderAgents(); }

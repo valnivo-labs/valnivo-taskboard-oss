@@ -156,7 +156,7 @@ for _t, _c, _d in (("tasks", "blocker", "TEXT DEFAULT ''"), ("tasks", "blocked_b
                    ("boards", "method", "TEXT DEFAULT 'scrum'"), ("boards", "cfg", "TEXT DEFAULT ''"), ("tasks", "type", "TEXT DEFAULT 'task'"), ("tasks", "parent", "INTEGER"),
                    ("sprints", "committed", "INTEGER DEFAULT 0"), ("tasks", "target", "REAL"), ("tasks", "current", "REAL"),
                    ("notifications", "cnt", "INTEGER DEFAULT 1"), ("agents", "mute", "TEXT DEFAULT ''"),
-                   ("boards", "team", "TEXT DEFAULT ''"), ("tasks", "cost", "REAL DEFAULT 0"), ("tasks", "tokens", "INTEGER DEFAULT 0"),
+                   ("boards", "team", "TEXT DEFAULT ''"), ("tasks", "cost", "REAL DEFAULT 0"), ("tasks", "tokens", "INTEGER DEFAULT 0"), ("tokens", "boards", "TEXT DEFAULT ''"),
                    ("agents", "wake_at", "TEXT DEFAULT ''"), ("agents", "wake_n", "INTEGER DEFAULT 0")):
     if _c not in [r[1] for r in db.execute(f"PRAGMA table_info({_t})")]:
         db.execute(f"ALTER TABLE {_t} ADD COLUMN {_c} {_d}")
@@ -167,6 +167,12 @@ CREATE TABLE IF NOT EXISTS costs(id INTEGER PRIMARY KEY, ts TEXT DEFAULT CURRENT
 CREATE INDEX IF NOT EXISTS ix_cost_task ON costs(task_id); CREATE INDEX IF NOT EXISTS ix_cost_ts ON costs(ts);
 CREATE TABLE IF NOT EXISTS chats(id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT DEFAULT 'slack', url TEXT NOT NULL, target TEXT DEFAULT '', events TEXT DEFAULT '',
   board_id INTEGER, minpr INTEGER DEFAULT 4, active INTEGER DEFAULT 1, last TEXT DEFAULT '', last_ok INTEGER DEFAULT 1, created TEXT DEFAULT CURRENT_TIMESTAMP);
+""")
+
+db.executescript("""
+CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, ts TEXT DEFAULT CURRENT_TIMESTAMP, sender TEXT NOT NULL COLLATE NOCASE, recipient TEXT NOT NULL COLLATE NOCASE,
+  task_id INTEGER, body TEXT NOT NULL, reply_to INTEGER);
+CREATE INDEX IF NOT EXISTS ix_msg_to ON messages(recipient); CREATE INDEX IF NOT EXISTS ix_msg_from ON messages(sender);
 """)
 
 FIELDS = {
@@ -381,6 +387,7 @@ def append_commit(actor, tid, body):
     cs = norm_commits(body)
     if not cs:
         raise ApiError("missing", 400, "h")
+    need_task(tid)
     with lock:
         r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
         if not r:
@@ -402,7 +409,7 @@ def append_commit_by_msg(actor, body):
         try:
             res.append(append_commit(actor, int(i), body))
         except ApiError as e:
-            if e.code != "nf":
+            if e.code not in ("nf", "scope"):
                 raise
     return {"n": len(res), "i": res}
 
@@ -703,7 +710,7 @@ def crud(actor, method, table, rid, body, q, full):
         if table == "sprints":
             bid = q.get("board_id", [None])[0]
             rs = rows("SELECT * FROM sprints" + (" WHERE board_id=?" if bid else "") + " ORDER BY id", (bid,) if bid else ())
-            items = [sprint_row(r, full) for r in rs]
+            items = [sprint_row(r, full) for r in rs if _board_ok(r["board_id"])]
         elif table == "docs":
             wh, ar = [], []
             for k, col in (("scope", "scope"), ("sc", "scope"), ("ref", "ref_id"), ("r", "ref_id"), ("board_id", "board_id")):
@@ -711,10 +718,10 @@ def crud(actor, method, table, rid, body, q, full):
                     wh.append(col + "=?")
                     ar.append(q[k][0])
             rs = rows("SELECT * FROM docs" + (" WHERE " + " AND ".join(wh) if wh else "") + " ORDER BY id", ar)
-            items = [cdict("docs", r, full, () if ("d" in q or full) else ("body",)) for r in rs]
+            items = [cdict("docs", r, full, () if ("d" in q or full) else ("body",)) for r in rs if _board_ok(r["board_id"])]
         else:
             bs = rows("SELECT * FROM boards" + (" WHERE team=?" if "tm" in q else "") + " ORDER BY id", (q["tm"][0],) if "tm" in q else ())
-            items = [cdict("boards", r, full, () if full else ("description",)) for r in bs]
+            items = [cdict("boards", r, full, () if full else ("description",)) for r in bs if _board_ok(r["id"])]
         return items if full else {"n": len(items), "i": items}
     if method == "GET":
         r = rows(f"SELECT * FROM {table} WHERE id=?", (rid,))
@@ -908,7 +915,7 @@ def comment_out(c):
     return {"id": c["id"], "by": c["actor"], "c": c["body"], "ts": c["ts"]}
 
 
-NOTIF_DO = {"task.assigned": "claim", "task.handoff": "claim", "task.ready": "claim", "task.unblocked": "claim", "claim.expired": "claim", "task.comment": "comment",
+NOTIF_DO = {"msg.direct": "say", "task.assigned": "claim", "task.handoff": "claim", "task.ready": "claim", "task.unblocked": "claim", "claim.expired": "claim", "task.comment": "comment",
             "ask.new": "answer", "ask.overdue": "answer", "review.requested": "decide_review", "task.nudged": "set_task", "sla.breach": "set_task",
             "review.changes": "set_task", "review.approved": "finish", "ask.answered": "task", "sprint.risk": "risks", "env.frozen": "envs"}
 COALESCE_TYPES = frozenset({"task.updated", "task.status", "task.comment", "watch.task", "task.attachment"})
@@ -919,7 +926,9 @@ def ndict(r):
     if r["payload"]:
         o["d"] = json.loads(r["payload"])
     op = NOTIF_DO.get(r["type"])
-    if op:      # the next call that acts on this item, so the agent does not have to fetch the task just to decide
+    if r["type"] == "msg.direct":
+        o["do"] = "say to=%s" % r["actor"]
+    elif op:      # the next call that acts on this item, so the agent does not have to fetch the task just to decide
         ref = (o.get("d") or {}).get("ask") or (o.get("d") or {}).get("review") or r["task_id"]
         o["do"] = "%s id=%s" % (op, ref) if ref and op not in ("risks", "envs") else op
     if (r.get("cnt") or 1) > 1:
@@ -2063,6 +2072,7 @@ def task_links(tid):
                 "open": x["status"] not in ("done", "declined"), "x": x["board_id"] != t["board_id"]}
     dp = [row(x) for x in rows("SELECT * FROM tasks WHERE id IN (%s)" % ",".join("?" * len(ids)), ids)] if ids else []
     bl = [row(x) for x in rows("SELECT * FROM tasks WHERE (',' || depends || ',') LIKE ? AND status NOT IN ('done','declined') ORDER BY id", ("%," + str(tid) + ",%",))]
+    dp, bl = [x for x in dp if _board_ok(x["b"])], [x for x in bl if _board_ok(x["b"])]
     return {"id": tid, "dp": dp, "bl": bl, "cross": sum(1 for x in dp + bl if x["x"])}
 
 
@@ -2092,6 +2102,67 @@ def bulk_move(actor, body):
             except ApiError as e:
                 failed.append({"id": i, "e": e.code, **({"f": e.field} if e.field else {})})
     return {"n": len(ok), "moved": ok, "skipped": skipped, "failed": failed}
+
+
+# ---------------------------------------------------------------- direct messages: agent to agent, human to agent, supervisor to everyone
+def say(actor, role, body):
+    me = _me(actor, body)
+    text = str(body.get("c") or body.get("text") or body.get("body") or "").strip()[:2000]
+    if not text:
+        raise ApiError("missing", 400, "c")
+    to = body.get("to")
+    to = [to] if isinstance(to, str) else (to or [])
+    to = [" ".join(str(x).split())[:60] for x in to if str(x).strip()]
+    if not to:
+        raise ApiError("missing", 400, "to")
+    tid = body.get("task")
+    try:
+        reply = int(body["reply"]) if body.get("reply") not in (None, "") else None
+    except (TypeError, ValueError):
+        raise ApiError("bad", 400, "reply")
+    sent = []
+    with lock:
+        if "*" in to:
+            if not _priv(role):
+                raise ApiError("forbidden", 403)
+            to = [r["name"] for r in rows("SELECT name FROM agents ORDER BY name LIMIT 50")]
+        bid = None
+        if tid not in (None, ""):
+            t = rows("SELECT board_id FROM tasks WHERE id=?", (int(tid),))
+            if not t:
+                raise ApiError("nf", 404, "task")
+            tid, bid = int(tid), t[0]["board_id"]
+        else:
+            tid = None
+        for rc in dict.fromkeys(to):
+            if rc.lower() == me.lower():
+                continue
+            db.execute("INSERT OR IGNORE INTO agents(name) VALUES(?)", (rc,))
+            mid = db.execute("INSERT INTO messages(sender,recipient,task_id,body,reply_to) VALUES(?,?,?,?,?)", (me, rc, tid, text, reply)).lastrowid
+            notify(rc, "msg.direct", me, tid, bid, "%s: %s" % (me, text[:240]), {"msg": mid})
+            sent.append(mid)
+    if not sent:
+        raise ApiError("bad", 400, "to")
+    return {"n": len(sent), "ids": sent}
+
+
+def messages_get(actor, role, q):
+    """A conversation log. Agents see only messages they sent or received; admins and supervisors can read any (as=, with=)."""
+    me, other = _qv(q, "as", "agent"), _qv(q, "with")
+    lim = max(1, min(qint(q, "limit", 30) or 30, 200))
+    wh, ar = ["id>?"], [qint(q, "since", 0) or 0]
+    if not _priv(role):
+        me = actor if actor and actor.lower() not in GENERIC_ACTORS else me
+        if not me:
+            raise ApiError("missing", 400, "as")
+    if me:
+        wh.append("(sender=? OR recipient=?)")
+        ar += [me, me]
+    if other:
+        wh.append("(sender=? OR recipient=?)")
+        ar += [other, other]
+    rs = rows("SELECT * FROM (SELECT * FROM messages WHERE " + " AND ".join(wh) + " ORDER BY id DESC LIMIT ?) ORDER BY id", ar + [lim])
+    return {"n": len(rs), "i": [{"id": m["id"], "ts": m["ts"], "from": m["sender"], "to": m["recipient"], "tk": m["task_id"], "c": m["body"], **({"re": m["reply_to"]} if m["reply_to"] else {})} for m in rs]}
 
 
 # ---------------------------------------------------------------- templates + recurring tasks
@@ -2313,6 +2384,41 @@ def _priv(role):
     return role in ("admin", "supervisor")
 
 
+def allowed_boards():
+    """Boards the calling token is limited to (a set), or None for all."""
+    return getattr(_ctx, "allowed", None)
+
+
+def _board_ok(bid):
+    a = allowed_boards()
+    return a is None or (bid is not None and int(bid) in a)
+
+
+def need_board(bid):
+    if not _board_ok(bid):
+        raise ApiError("scope", 403, "b")
+
+
+def need_task(tid):
+    if allowed_boards() is None:
+        return
+    r = db.execute("SELECT board_id FROM tasks WHERE id=?", (int(tid),)).fetchone()
+    if r:
+        need_board(r[0])
+
+
+def _clip(sc):
+    """Narrow a board scope (None/0 = all, int, or list) to what the token may see."""
+    a = allowed_boards()
+    if a is None:
+        return sc
+    if sc is None or sc == 0:
+        return sorted(a)
+    if isinstance(sc, int):
+        sc = [sc]
+    return [i for i in sc if i in a]
+
+
 _seen = {}
 
 
@@ -2397,6 +2503,10 @@ def claim_next(actor, body):
     me = _me(actor, body)
     wh = ["status='todo'", "(claimed_by='' OR claim_until<?)", "(assignee='' OR assignee=? COLLATE NOCASE)", READY_SQL]
     ar = [now_s(), me]
+    if allowed_boards() is not None:
+        frag, fa = _in("board_id", sorted(allowed_boards()))
+        wh.append(frag.replace(" AND ", "", 1))
+        ar += fa
     if body.get("b") or body.get("board_id"):
         wh.append("board_id=?")
         ar.append(int(body.get("b") or body.get("board_id")))
@@ -3339,7 +3449,7 @@ def _avail(me, since, scope):
     return db.execute("SELECT COUNT(*) FROM tasks WHERE " + base + fr, args + fa).fetchone()[0]
 
 
-def briefing(actor, q):
+def _briefing_once(actor, q):
     """One call instead of inbox + dashboard + risks. With `since=<c from the last call>` it returns only what changed, or just {"c":N} when nothing did."""
     me = _qv(q, "as", "agent") or (actor if actor and actor.lower() not in GENERIC_ACTORS else "")
     if not me:
@@ -3369,6 +3479,21 @@ def briefing(actor, q):
         if rk:
             out["rk"] = rk
     return out
+
+
+def briefing(actor, q):
+    """One briefing call. With wait=<seconds, max 30> and a since cursor the request is held open until something changes: a cheap alternative to polling."""
+    res = _briefing_once(actor, q)
+    wait = max(0, min(qint(q, "wait", 0) or 0, 30))
+    if wait and qint(q, "since", None) is not None and set(res) == {"c"}:
+        end = time.time() + wait
+        while time.time() < end:
+            with inbox_cv:
+                inbox_cv.wait(min(1.0, max(0.05, end - time.time())))
+            res = _briefing_once(actor, q)
+            if set(res) != {"c"}:
+                break
+    return res
 
 
 def next_task(actor, body):
@@ -3703,12 +3828,12 @@ def scope_ids(q):
     if _qv(q, "tm", "team"):
         tids = [r["id"] for r in rows("SELECT id FROM boards WHERE team=? COLLATE NOCASE", (_qv(q, "tm", "team"),))]
         ids = tids if ids is None else [i for i in ids if i in tids]
-    return ids
+    return _clip(ids)
 
 
 def scope_of(q):
     b = qint(q, "b") or qint(q, "board_id")
-    return [b] if b else scope_ids(q)
+    return _clip([b]) if b else scope_ids(q)
 
 
 def active_risks(bid=None):
@@ -3745,15 +3870,15 @@ def risk_alerts(actor="system"):
 
 # ---------------------------------------------------------------- tokens, settings, backups, digests, export/import
 def lookup_token(t):
-    """-> (name, role) or None. Env tokens first, then DB tokens (stored as sha256)."""
+    """-> (name, role, boards) or None. Env tokens first, then DB tokens (stored as sha256). boards = the set of board ids the token is limited to, None = all."""
     if t in TOKENS:
-        return TOKENS[t]
+        return (*TOKENS[t], None)
     if not t:
         return None
-    r = db.execute("SELECT id, name, role FROM tokens WHERE hash=?", (hashlib.sha256(t.encode()).hexdigest(),)).fetchone()
+    r = db.execute("SELECT id, name, role, boards FROM tokens WHERE hash=?", (hashlib.sha256(t.encode()).hexdigest(),)).fetchone()
     if r:
         db.execute("UPDATE tokens SET used=CURRENT_TIMESTAMP WHERE id=?", (r["id"],))
-        return (r["name"], r["role"])
+        return (r["name"], r["role"], {int(x) for x in re.findall(r"\d+", r["boards"] or "")} or None)
     return None
 
 
@@ -3761,22 +3886,43 @@ def auth_open():
     return not TOKENS and not db.execute("SELECT 1 FROM tokens LIMIT 1").fetchone()
 
 
+def _board_ids(v):
+    ids = [int(x) for x in re.findall(r"\d+", ",".join(str(i) for i in v) if isinstance(v, list) else str(v or ""))]
+    if ids and len(rows("SELECT id FROM boards WHERE id IN (%s)" % ",".join("?" * len(ids)), ids)) != len(set(ids)):
+        raise ApiError("nf", 404, "boards")
+    return sorted(set(ids))
+
+
 def token_create(body):
+    """Create a token, or (with id) change which boards an existing one may touch. boards = [ids]; empty = all boards (admin tokens cannot be limited)."""
+    has_b = "boards" in body or "bs" in body
+    ids = _board_ids(body.get("boards", body.get("bs"))) if has_b else []
+    if body.get("id"):
+        with lock:
+            r = db.execute("SELECT role FROM tokens WHERE id=?", (int(body["id"]),)).fetchone()
+            if not r:
+                raise ApiError("nf", 404)
+            if ids and r["role"] == "admin":
+                raise ApiError("bad", 400, "boards")
+            db.execute("UPDATE tokens SET boards=? WHERE id=?", (",".join(str(i) for i in ids), int(body["id"])))
+        return {"id": int(body["id"]), "bs": ids}
     name = " ".join(str(body.get("n") or body.get("name") or "").split())[:60]
     role = body.get("role") or "agent"
     if not name:
         raise ApiError("missing", 400, "n")
     if role not in ROLES:
         raise ApiError("bad", 400, "role")
+    if ids and role == "admin":
+        raise ApiError("bad", 400, "boards")
     tk = secrets.token_urlsafe(24)
     with lock:
-        db.execute("INSERT INTO tokens(name,hash,role) VALUES(?,?,?)", (name, hashlib.sha256(tk.encode()).hexdigest(), role))
-    return {"n": name, "role": role, "token": tk, "note": "shown once - store it now"}
+        db.execute("INSERT INTO tokens(name,hash,role,boards) VALUES(?,?,?,?)", (name, hashlib.sha256(tk.encode()).hexdigest(), role, ",".join(str(i) for i in ids)))
+    return {"n": name, "role": role, "token": tk, **({"bs": ids} if ids else {}), "note": "shown once - store it now"}
 
 
 def tokens_list():
     items = [{"n": n, "role": r, "env": 1} for n, r in TOKENS.values()]
-    items += [{"id": r["id"], "n": r["name"], "role": r["role"], "u": r["used"] or None, "c": r["created"]} for r in rows("SELECT * FROM tokens ORDER BY id")]
+    items += [{"id": r["id"], "n": r["name"], "role": r["role"], "u": r["used"] or None, "c": r["created"], "bs": [int(x) for x in re.findall(r"\d+", r["boards"] or "")] or None} for r in rows("SELECT * FROM tokens ORDER BY id")]
     return {"n": len(items), "i": [{k: v for k, v in o.items() if v is not None} for o in items]}
 
 
@@ -4026,7 +4172,7 @@ def import_csv(actor, bid, text):
 # ---------------------------------------------------------------- dashboard
 def dashboard(q):
     bid = qint(q, "b") or qint(q, "board_id")
-    scope = [bid] if bid else scope_ids(q)
+    scope = _clip([bid]) if bid else scope_ids(q)
     try:
         nudge_tick(bid)
     except Exception:
@@ -4130,6 +4276,7 @@ class H(BaseHTTPRequestHandler):
 
     def actor(self, query):
         self.role = "admin"
+        self.allowed = None
         if auth_open():
             return "anon"
         t = ""
@@ -4142,6 +4289,7 @@ class H(BaseHTTPRequestHandler):
         if not r:
             return None
         self.role = r[1]
+        self.allowed = r[2]
         touch_presence(r[0])
         return r[0]
 
@@ -4199,6 +4347,56 @@ class H(BaseHTTPRequestHandler):
                 break
         return {"n": len(out), "i": out}
 
+    def scope_check(self, method, path, q):
+        """A token limited to some boards may only name those boards, and tasks, sprints, docs, reviews and attachments on them."""
+        if allowed_boards() is None:
+            return
+        for k in ("b", "board_id", "board"):
+            v = (q.get(k) or [""])[0]
+            if v.isdigit():
+                need_board(int(v))
+        m = re.match(r"/api/(boards|sprints|tasks|docs|reviews|attachments|templates)/(\d+)", path)
+        if m:
+            kind, i = m.group(1), int(m.group(2))
+            col = {"sprints": ("sprints", "board_id"), "docs": ("docs", "board_id"), "templates": ("templates", "board_id")}.get(kind)
+            if kind == "boards":
+                need_board(i)
+            elif kind == "tasks":
+                need_task(i)
+            elif kind in ("reviews", "attachments"):
+                r = db.execute("SELECT task_id FROM %s WHERE id=?" % kind, (i,)).fetchone()
+                if r:
+                    need_task(r[0])
+            else:
+                r = db.execute("SELECT %s FROM %s WHERE id=?" % (col[1], col[0]), (i,)).fetchone()
+                if r and not (kind == "templates" and r[0] is None):
+                    need_board(r[0])
+        if method == "POST" and path == "/api/boards":
+            raise ApiError("scope", 403, "b")
+        if method in ("POST", "PATCH", "PUT", "DELETE") and not path.startswith("/api/import"):
+            n = int(self.headers.get("Content-Length") or 0)
+            if 0 < n <= 2 * 1024 * 1024:
+                raw = self.rfile.read(n)
+                self.rfile = io.BytesIO(raw)             # the route reads the body again
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    return
+                for b in (body if isinstance(body, list) else [body]):
+                    if not isinstance(b, dict):
+                        continue
+                    for k in ("b", "board", "board_id"):
+                        if str(b.get(k) or "").isdigit():
+                            need_board(int(b[k]))
+                    ids = list(b.get("ids") or []) if isinstance(b.get("ids"), list) else []
+                    if path in ("/api/tasks", "/api/tasks/bulk") and str(b.get("id") or "").isdigit():
+                        ids.append(b["id"])
+                    if str(b.get("task") or "").isdigit():
+                        ids.append(b["task"])
+                    for i in ids:
+                        if str(i).isdigit():
+                            need_task(int(i))
+
     def git_hook(self):
         n = int(self.headers.get("Content-Length") or 0)
         if n > 5 * 1024 * 1024:
@@ -4236,6 +4434,7 @@ class H(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         path = u.path
+        _ctx.allowed = None
         if path == "/api/health":
             return self.send_json(200, {"ok": True})
         if not path.startswith("/api/"):
@@ -4265,6 +4464,7 @@ class H(BaseHTTPRequestHandler):
             self.close_connection = True
             return self.err("too_big", 413)
         _ctx.role = self.role
+        _ctx.allowed = self.allowed
         full = (q.get("full", ["0"])[0] not in ("0", "")) or self.headers.get("X-TB-Full") == "1"
         try:
             if path in ("/api/nudge", "/api/tasks/nudge/run") and method == "POST":
@@ -4273,6 +4473,7 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, {"ok": True, **res, "h": NUDGE_HOURS})
             if self.role == "viewer" and method != "GET":
                 return self.err("forbidden", 403)
+            self.scope_check(method, path, q)
             if self.role != "admin" and (path.startswith(("/api/admin", "/api/tokens", "/api/settings", "/api/import", "/api/chats", "/api/export")) or
                                          (method == "DELETE" and (re.match(r"/api/boards/", path) or (re.match(r"/api/sprints/", path) and self.role != "supervisor")))):
                 return self.err("forbidden", 403)
@@ -4465,6 +4666,11 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, bulk_move(actor, self.read_body()))
             if path == "/api/agents/wake" and method == "POST":
                 return self.send_json(200, wake_now(actor, self.role, self.read_body()))
+            if path == "/api/messages":
+                if method == "POST":
+                    return self.send_json(201, say(actor, self.role, self.read_body()))
+                if method == "GET":
+                    return self.send_json(200, messages_get(actor, self.role, q))
             if path == "/api/overview" and method == "GET":
                 return self.send_json(200, scope_analytics(q))
             if path == "/api/briefing" and method == "GET":
@@ -4585,9 +4791,12 @@ class H(BaseHTTPRequestHandler):
         lim = max(1, min(qint(q, "limit", 200), 1000))
         board = q.get("board_id", [None])[0]
         out, last = [], since
+        al = allowed_boards()
         for r in rows("SELECT * FROM events WHERE id>? ORDER BY id LIMIT ?", (since, lim)):
             last = r["id"]
             p = json.loads(r["payload"])
+            if al is not None and p.get("b") not in al:
+                continue
             if board and str(p.get("b")) != board:
                 continue
             out.append([r["id"], r["type"], p["id"], p.get("b"), p.get("d")])
@@ -4627,6 +4836,7 @@ class H(BaseHTTPRequestHandler):
 
     def sse(self, q):
         board = q.get("board", [None])[0]
+        al = allowed_boards()
         last = self.headers.get("Last-Event-ID") or q.get("last", [None])[0]
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -4651,6 +4861,8 @@ class H(BaseHTTPRequestHandler):
                 except queue.Empty:
                     self.wfile.write(b": ping\n\n")
                     self.wfile.flush()
+                    continue
+                if al is not None and ev.get("b") not in al:
                     continue
                 if board and ev.get("b") is not None and str(ev["b"]) != board:
                     continue

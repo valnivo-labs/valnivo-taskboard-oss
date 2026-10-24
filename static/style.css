@@ -338,3 +338,5 @@ button.link.lk small{color:var(--mut)}button.link.lk.done{opacity:.6;text-decora
 .sprintgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
 .sprintmini{border:1px solid var(--bd2);border-radius:12px;padding:12px;display:grid;gap:8px;background:var(--surface)}
 .sprintmini header{display:flex;justify-content:space-between;align-items:center;gap:8px}
+
+.msg{padding:8px 0;border-bottom:1px solid var(--bd2);overflow-wrap:anywhere}.msg:last-of-type{border-bottom:0}

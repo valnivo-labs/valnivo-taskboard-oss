@@ -44,10 +44,10 @@ class Sink(http.server.BaseHTTPRequestHandler):
 
 class Agent:
     """One agent = one MCP server process speaking JSON-RPC over stdio, exactly like an agent client would."""
-    def __init__(self, name, tools):
+    def __init__(self, name, tools, token=None):
         self.name, self.calls, self.bytes = name, 0, 0
         self.p = subprocess.Popen([sys.executable, os.path.join(ROOT, "mcp_server.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
-                                  env={**os.environ, "TASKBOARD_URL": URL, "TASKBOARD_TOKEN": TOK[name], "TASKBOARD_AGENT": name, "TASKBOARD_TOOLS": tools})
+                                  env={**os.environ, "TASKBOARD_URL": URL, "TASKBOARD_TOKEN": token or TOK[name], "TASKBOARD_AGENT": name, "TASKBOARD_TOOLS": tools})
         self.n = 0
         self.rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": name, "version": "1"}})
 
@@ -223,9 +223,20 @@ def main():
         b2 = rest("POST", "/boards", {"n": "Agent day archive %d" % time.time()})["id"]
         mv = planner.call("move_tasks", ids=[epic, t1], b=b2)
         step("bulk move takes an epic with its child and a loose task", sorted(mv["moved"]) == sorted([epic, kid, t1]) and not mv["failed"], mv)
+        c1.call("say", to="Coder2", c="the API schema moved boards - same ids, check the epic", task=t1)
+        mb = c2.call("briefing")
+        step("Coder1 messages Coder2 about a task and the reply hint is prepared", any(n["ty"] == "msg.direct" and n["do"] == "say to=Coder1" and n["tk"] == t1 for n in mb["in"]), mb)
+        boss.call("say", to="*", c="stand-up notes are in the specs")
+        step("the supervisor can broadcast to every agent", all("msg.direct" in kinds(a.call("briefing")) for a in (planner, c1, rev)))
+        step("an agent cannot broadcast", c1.call("say", to="*", c="spam").get("e") == "forbidden")
+        log = c2.tb("messages", **{"with": "Coder1"})
+        step("the conversation log keeps it", [m["c"] for m in log["i"]] == ["the API schema moved boards - same ids, check the epic"], log)
         idle = c1.call("briefing")
         idle2 = c1.call("briefing")
         step("an idle briefing costs almost nothing", list(idle2) == ["c"], idle2)
+        t0 = time.time()
+        held = c1.call("briefing", wait=1)
+        step("a briefing with wait holds the call open instead of polling", list(held) == ["c"] and time.time() - t0 >= 0.9, held)
 
         print("\nclose of day: admin")
         tk = admin.call("tokens", action="create", n="Night Agent", role="agent")
@@ -234,6 +245,13 @@ def main():
         tid = [x["id"] for x in admin.call("tokens")["i"] if x["n"] == "Night Agent"][0]
         admin.call("tokens", action="revoke", id=tid)
         step("revoked tokens stop working", rest("GET", "/boards", tok=tk["token"]).get("e") == "auth")
+        ct = admin.call("tokens", action="create", n="Contractor", role="agent", boards=[bid])
+        contractor = Agent("Contractor", "core", token=ct["token"]); agents.append(contractor)
+        seen = contractor.call("tasks", limit=100)
+        step("a token limited to one board sees only that board's tasks", seen["r"] and all(row_b == bid for row_b in [contractor.call("task", id=r_[0]).get("b") for r_ in seen["r"][:6]]), seen)
+        step("and is refused anything on the others", contractor.call("task", id=t1).get("e") == "scope" and contractor.call("add_task", b=b2, t="sneak", ch="Sim").get("e") == "scope")
+        nxt = contractor.call("next")
+        step("its next never reaches into other boards", nxt.get("id") not in (kid, epic, t1), nxt)
         step("a verified backup runs on demand", admin.call("backups", action="run")["ok"] is True)
         ex = admin.call("export_data", b=bid)
         step("export returns the board", ex["boards"] and any(t["title"] == "Implement the API" for t in ex["tasks"]))

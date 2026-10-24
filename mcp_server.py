@@ -4,7 +4,7 @@
 Responses are the compact REST JSON as-is (short keys: id,b,s,t,st,pr,as,k,u,d / n,g / p=[done,total]).
 Repeated GETs send If-None-Match; an unchanged resource returns {"same":1}.
 """
-import json, os, re, sys, urllib.request, urllib.error
+import json, os, re, sys, threading, time, urllib.request, urllib.error
 from urllib.parse import urlencode
 
 URL = os.environ.get("TASKBOARD_URL", "http://127.0.0.1:8790").rstrip("/")
@@ -46,7 +46,9 @@ _BRIEF = {"c": None}
 def _briefing(a):
     """Remembers the cursor of the last briefing so repeat calls return only changes."""
     since = None if a.get("full") else _BRIEF["c"]
-    r = api("GET", "/briefing" + qs({"as": a.get("as") or ME, "since": since, "ack": a.get("ack"), "tm": a.get("tm"), "bs": a.get("bs"), "full": 1 if a.get("full") else None}, ["as", "since", "ack", "tm", "bs", "full"]))
+    wait = min(int(a.get("wait") or 0), 30) if since is not None else 0           # hold the call open until something arrives (needs the cursor of an earlier briefing)
+    r = api("GET", "/briefing" + qs({"as": a.get("as") or ME, "since": since, "ack": a.get("ack"), "tm": a.get("tm"), "bs": a.get("bs"), "full": 1 if a.get("full") else None, "wait": wait or None},
+                                    ["as", "since", "ack", "tm", "bs", "full", "wait"]), timeout=wait + 20)
     if isinstance(r, dict) and isinstance(r.get("c"), int):
         _BRIEF["c"] = r["c"]
     return r
@@ -79,6 +81,8 @@ def _tokens(a):
         return api("POST", "/tokens", a)
     if act == "revoke" and "id" in a:
         return api("DELETE", "/tokens?id=%s" % a["id"])
+    if act == "scope" and "id" in a:
+        return api("POST", "/tokens", a)
     return {"e": "bad", "f": "action"}
 
 
@@ -242,7 +246,7 @@ TOOLS = {
     "move_task": ("Move a task to another board: b = target board id; s = target sprint (optional); children (default true) = an epic's child tasks move with it; force = supervisor/admin override of a WIP block. It joins the target's active sprint (none if the board has no sprints or the task is done), its epic link is cleared, and the target board's limits apply.",
                   S(["id", "b"], id=i, b=i, s=i, children={"type": "boolean"}, force={"type": "boolean"}), lambda a: api("POST", f"/tasks/{a.pop('id')}/move", a)),
     "briefing": ("Session start and idle check in ONE call: your unread notifications (each with a `do` hint for the next call), your open work, what needs attention, sprints at risk, and `nw` = ready tasks you could claim. Call it again with no arguments: it then returns only what changed, or just {c:N} when nothing did. full=1 resets. tm/bs scope it across boards.",
-                 S(**{"as": s}, full=i, ack=i, tm=s, bs=s), lambda a: _briefing(a)),
+                 S(**{"as": s}, full=i, ack=i, tm=s, bs=s, wait=i), lambda a: _briefing(a)),
     "next": ("Claim the best ready task for you (priority, todo, no open dependencies, unclaimed) and get its context in the same response: description, open deps, latest comments, rules, attachment count. lb=labels/skills to match, b=board, ttl=minutes. {none:1} when the queue is empty.",
              S(lb=s, b=i, ttl=i, **{"as": s}), lambda a: api("POST", "/next", idn(a))),
     "finish": ("Wrap up a task in ONE call: summary (required) is posted as a comment; optional attach=[{name,url,kind}], pr, sha, dn=[ticked checklist items]; then st=done (default), or review=<reviewer> to ask for review, or to=<agent> (+next) to hand it over. The done gate (checklist, open reviews) is checked before anything is written.",
@@ -264,8 +268,12 @@ TOOLS = {
               S(action=s, id=i, n=s, kind=s, url=s, token=s, target=s, events={"type": "array", "items": s}, minpr=i, b=i, on={"type": "boolean"}), lambda a: _chats(dict(a))),
     "git_secret": ("Admin: create a new secret for the git webhook (POST /api/hooks/git from GitHub, GitLab or Gitea). Returns the secret once to paste into the forge.",
                    S(), lambda a: api("POST", "/admin/git-secret", {})),
-    "tokens": ("Admin: access tokens. action list | create (n=name, role agent|supervisor|viewer|admin; the token is returned once) | revoke (id).",
-               S(action=s, n=s, role=s, id=i), lambda a: _tokens(dict(a))),
+    "tokens": ("Admin: access tokens. action list | create (n=name, role agent|supervisor|viewer|admin; the token is returned once) | revoke (id) | scope (id, boards=[ids]: limit an existing token to those boards, [] = all). create also takes boards=[ids].",
+               S(action=s, n=s, role=s, id=i, boards={"type": "array", "items": i}), lambda a: _tokens(dict(a))),
+    "say": ("Send a direct message to an agent or a human by name: to (a name, a list of names, or '*' for everyone - supervisors and admins only), c (text), optional task (id it is about) and reply (message id). The recipient sees it in briefing with do='say to=<you>'.",
+            S(["to", "c"], to={"type": ["string", "array"]}, c=s, task=i, reply=i, **{"as": s}), lambda a: api("POST", "/messages", idn(a))),
+    "messages": ("Conversation log: with=<name>, limit, since (message id). You only read messages you sent or received; supervisors and admins may pass as=<name> to read anyone's.",
+                 S(**{"with": s}, limit=i, since=i, **{"as": s}), lambda a: api("GET", "/messages" + qs(a, ["with", "limit", "since", "as"]))),
     "settings": ("Admin: with no arguments reads the settings; with keys changes them: digest_url, digest_hour, alert_url, backup_keep, supervisors (csv names), base_url, wake_after_min, budget_usd, prices (JSON string), git_autodone (1|0).",
                  S(digest_url=s, digest_hour=s, alert_url=s, backup_keep=s, supervisors=s, base_url=s, wake_after_min=s, budget_usd=s, prices=s, git_autodone=s),
                  lambda a: api("POST", "/settings", a) if a else api("GET", "/settings")),
@@ -287,8 +295,8 @@ TOOLS = {
 }
 
 
-CORE = ["briefing", "next", "finish", "inbox", "claim", "set_task", "add_task", "tasks", "task", "comment", "handoff", "heartbeat", "answer", "decide_review", "lock", "unlock"]
-COORD = ["claim_next", "release", "locks", "ask", "asks", "cancel_ask", "request_review", "reviews", "watch", "unwatch", "watches", "attach", "attachments", "del_attachment",
+CORE = ["briefing", "next", "finish", "inbox", "claim", "set_task", "add_task", "tasks", "task", "comment", "say", "handoff", "heartbeat", "answer", "decide_review", "lock", "unlock"]
+COORD = ["messages", "claim_next", "release", "locks", "ask", "asks", "cancel_ask", "request_review", "reviews", "watch", "unwatch", "watches", "attach", "attachments", "del_attachment",
          "cost", "links", "route", "envs", "deploy_env", "freeze_env", "unfreeze_env", "decline_task", "reopen_task", "add_commit", "task_activity", "comments"]
 ADMIN = ["tokens", "settings", "backups", "export_data", "import_data", "del_board", "del_sprint", "chats", "git_secret", "wake_agent", "usage"]
 GROUPS = {"core": CORE, "coord": COORD, "admin": ADMIN, "plan": [n for n in TOOLS if n not in CORE + COORD + ADMIN]}
@@ -300,7 +308,8 @@ else:
 
 # one-line descriptions with a key legend for the daily tools; the rest use the first sentence. help(op) returns the full text.
 SHORT = {
-    "briefing": "Start/idle check in one call: unread items (with `do` hint), your work, attention, sprints at risk, nw=claimable tasks. Repeat calls return only changes.",
+    "briefing": "Start/idle check in one call: unread items (with `do` hint), your work, attention, sprints at risk, nw=claimable tasks. Repeat calls return only changes; wait=<=30 holds the call open until something arrives.",
+    "say": "Message an agent or human: to (name|[names]|'*' supervisors only), c, task?, reply?. They get it in briefing with a reply hint.",
     "next": "Claim the best ready task and get its context (desc, deps, comments, rules). lb,b,ttl. {none:1} if empty.",
     "finish": "Wrap up: summary(required)+attach[],pr,sha,dn[],cost{in,out,usd,model}; then st=done | review=<who> | to=<who>,next. Gate checked first.",
     "inbox": "Notifications (unread). wait<=30 long-polls, ack=1 marks read. Prefer briefing.",
@@ -355,9 +364,35 @@ INSTRUCTIONS = ("Valnivo Taskboard. Loop: briefing (call again with no args: ret
                 "help(op) explains any operation, tb(op,a) calls any operation not listed, guide(role) gives a short playbook. Lists: use fields= and brief=1 to save tokens.")
 
 
+_out = threading.Lock()
+
+
 def send(o):
-    sys.stdout.write(json.dumps(o, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
+    with _out:
+        sys.stdout.write(json.dumps(o, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+
+
+_watching = []
+
+
+def watch():
+    """TASKBOARD_WATCH=1: tell the client (a notifications/message) when something new lands in the inbox, so a sleeping agent does not have to poll.
+    Long-polls the inbox without acknowledging anything; the agent still reads and clears items with briefing."""
+    seen = 0
+    while True:
+        try:
+            r = api("GET", "/inbox" + qs({"as": ME, "since": seen, "wait": 25}, ["as", "since", "wait"]), timeout=45)
+            if not isinstance(r, dict) or "e" in r:
+                time.sleep(10)
+                continue
+            fresh = r.get("i") or []
+            if fresh:
+                seen = max(n["id"] for n in fresh)
+                send({"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info", "logger": "taskboard",
+                      "data": "taskboard: %d new item(s) for %s (%s) - call briefing" % (len(fresh), ME, fresh[-1].get("m", "")[:80])}})
+        except Exception:
+            time.sleep(10)
 
 
 for line in sys.stdin:
@@ -370,7 +405,10 @@ for line in sys.stdin:
         continue
     if meth == "initialize":
         send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": m["params"].get("protocolVersion", "2024-11-05"),
-              "capabilities": {"tools": {}}, "serverInfo": {"name": "valnivo-taskboard", "version": "0.4"}, "instructions": INSTRUCTIONS}})
+              "capabilities": {"tools": {}, "logging": {}}, "serverInfo": {"name": "valnivo-taskboard", "version": "0.4"}, "instructions": INSTRUCTIONS}})
+        if os.environ.get("TASKBOARD_WATCH") in ("1", "true", "yes") and ME and not _watching:
+            _watching.append(threading.Thread(target=watch, daemon=True))
+            _watching[0].start()
     elif meth == "tools/list":
         tl = [{"name": n, "description": short(n, TOOLS[n][0]), "inputSchema": slim(TOOLS[n][1])} for n in VISIBLE]
         tl += [{"name": n, "description": d, "inputSchema": sc} for n, (d, sc) in META.items()]

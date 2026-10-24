@@ -192,6 +192,36 @@ def test_all_boards_overview_has_the_analytics(page):
     page.wait_for_selector("#v-overview th:has-text('Done 30d')")
 
 
+def test_token_limited_to_a_board(page):
+    a, _ = mkboard("Walled in %d" % time.time())
+    b, _ = mkboard("Walled out %d" % time.time())
+    goto(page, view="admin")
+    page.wait_for_selector("#newtoken")
+    page.click("#newtoken")
+    page.fill("#f [name=n]", "Boxed Agent")
+    page.check("#f [name=tb_%d]" % a)
+    page.click("#dsave")
+    page.wait_for_selector("#tkv")
+    tok = page.input_value("#tkv")
+    seen = [x["id"] for x in api("GET", "/boards", tok=tok)["i"]]
+    assert seen == [a], seen                                                         # the other boards do not exist for this token
+    assert api("GET", "/boards/%d" % b, tok=tok).get("e") == "scope"
+    page.click("#dsave")                                                             # "Copy & close"
+    page.wait_for_selector("#v-admin tr:has-text('Boxed Agent') :text('Walled in')")
+
+
+def test_message_an_agent_from_the_board(page):
+    api("POST", "/agents", {"n": "Mailbox Agent"})
+    goto(page, view="agents")
+    page.click("[data-msg='Mailbox Agent']")
+    page.fill("#f [name=c]", "please pick up the release notes")
+    page.click("#dsave")
+    assert "Sent to 1" in toast_text(page)
+    got = [n for n in api("GET", "/inbox?as=Mailbox%20Agent")["i"] if n["ty"] == "msg.direct"]
+    assert got and "release notes" in got[0]["m"] and got[0]["do"].startswith("say to="), got
+    page.wait_for_selector("#v-agents .msg:has-text('release notes')")
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

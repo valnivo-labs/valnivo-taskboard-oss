@@ -842,3 +842,90 @@ assert J("PATCH", f"/tasks/{rg['id']}", {"st": "done", "dn": [0]})[1]["e"] == "r
 J("POST", f"/reviews/{r2['id']}/decide", {"decision": "approve"}, tok="tok")
 assert J("PATCH", f"/tasks/{rg['id']}", {"st": "done", "dn": [0]})[1].get("st") == "done"
 print("v16 review loop OK")
+
+# ================= v17: direct messages, briefing that waits, tokens limited to some boards =================
+import time as _t17
+# ---- messages
+r = J("POST", "/messages", {"to": "Sup Bot", "c": "can you look at the schema?"}, tok="wtok")[1]; assert r["n"] == 1, r
+ib = J("GET", "/inbox?as=Sup%20Bot&ack=1")[1]["i"]; mm = [n for n in ib if n["ty"] == "msg.direct"]
+assert mm and mm[0]["by"] == "Worker" and mm[0]["do"] == "say to=Worker" and "schema" in mm[0]["m"], ib
+assert J("POST", "/messages", {"to": "Worker", "c": "yes, on it", "reply": r["ids"][0]}, tok="stok")[1]["n"] == 1
+conv = J("GET", "/messages?with=Sup%20Bot", tok="wtok")[1]["i"]; assert [m["c"] for m in conv] == ["can you look at the schema?", "yes, on it"] and conv[1]["re"] == r["ids"][0], conv
+J("POST", "/messages", {"to": "Someone Else", "c": "private note", "as": "Planner X"})
+assert not [m for m in J("GET", "/messages?as=Someone%20Else", tok="wtok")[1]["i"] if m["c"] == "private note"]                # an agent only reads its own conversations
+assert [m["c"] for m in J("GET", "/messages?as=Someone%20Else")[1]["i"]] == ["private note"]                              # admins and supervisors can read any
+assert J("POST", "/messages", {"to": "*", "c": "all hands"}, tok="wtok")[0] == 403
+bc = J("POST", "/messages", {"to": "*", "c": "stand-up in five"}, tok="stok")[1]; assert bc["n"] >= 2
+assert any(n["ty"] == "msg.direct" and "stand-up" in n["m"] for n in J("GET", "/inbox?as=Worker&ack=1")[1]["i"])
+assert J("POST", "/messages", {"to": "Worker", "c": "x"}, tok="wtok")[1]["e"] == "bad" and J("POST", "/messages", {"to": "Sup Bot"}, tok="wtok")[1]["e"] == "missing"
+assert J("POST", "/messages", {"to": "Sup Bot", "c": "x", "task": 999999}, tok="wtok")[1]["e"] == "nf" and J("POST", "/messages", {"to": "Sup Bot", "c": "x"}, tok="vtok")[0] == 403
+J("POST", "/agents", {"n": "Quiet", "mute": "msg.direct"}); J("POST", "/messages", {"to": "Quiet", "c": "shh"}, tok="wtok"); assert not J("GET", "/inbox?as=Quiet")[1]["i"]
+print("v17 messages OK")
+
+# ---- briefing that waits
+c0 = J("GET", "/briefing?as=Waiter")[1]["c"]
+t0 = _t17.time(); r = J("GET", f"/briefing?as=Waiter&since={c0}&wait=2")[1]; dt = _t17.time() - t0
+assert list(r) == ["c"] and 1.8 <= dt < 4, (r, dt)                                                                       # nothing happened: held open, then an empty answer
+threading.Timer(0.6, lambda: J("POST", "/messages", {"to": "Waiter", "c": "wake up", "as": "Poker"})).start()
+t0 = _t17.time(); r = J("GET", f"/briefing?as=Waiter&since={c0}&wait=10")[1]; dt = _t17.time() - t0
+assert r.get("in") and "wake up" in r["in"][0]["m"] and dt < 3, (r, dt)                                                   # something arrived: answered at once
+t0 = _t17.time(); J("GET", "/briefing?as=Waiter&wait=5"); assert _t17.time() - t0 < 1.5                                   # no cursor = a full briefing, never held
+print("v17 wait OK")
+
+# ---- tokens limited to some boards
+st, sa = J("POST", "/boards", {"n": "Scope A"}); st, sb = J("POST", "/boards", {"n": "Scope B"}); SA, SB = sa["id"], sb["id"]
+J("POST", "/sprints", {"b": SA, "st": "active"}); J("POST", "/sprints", {"b": SB, "st": "active"})
+st, ta = J("POST", "/tasks", {"b": SA, "t": "scoped A low", "pr": 4, "st": "todo"}); st, tb_ = J("POST", "/tasks", {"b": SB, "t": "scoped B urgent", "pr": 1, "st": "todo"})
+assert J("POST", "/tokens", {"n": "Walled", "role": "admin", "boards": [SA]})[1]["e"] == "bad" and J("POST", "/tokens", {"n": "Walled", "boards": [999999]})[1]["e"] == "nf"
+tk = J("POST", "/tokens", {"n": "Walled", "role": "agent", "boards": [SA]})[1]; W = tk["token"]; assert tk["bs"] == [SA]
+assert [b["id"] for b in J("GET", "/boards", tok=W)[1]["i"]] == [SA]                                                            # the other board does not exist for it
+assert J("GET", f"/boards/{SB}", tok=W)[1]["e"] == "scope" and J("GET", f"/boards/{SB}", tok=W)[0] == 403
+assert {t["b"] for t in J("GET", "/tasks?limit=500", tok=W)[1]["i"]} == {SA} and J("GET", f"/tasks?b={SB}", tok=W)[0] == 403
+assert J("GET", f"/tasks/{tb_['id']}", tok=W)[0] == 403 and J("PATCH", f"/tasks/{tb_['id']}", {"st": "done"}, tok=W)[0] == 403 and J("POST", f"/tasks/{tb_['id']}/comments", {"c": "hi"}, tok=W)[0] == 403
+assert J("GET", f"/tasks/{ta['id']}", tok=W)[0] == 200 and J("POST", "/tasks", {"b": SB, "t": "sneak"}, tok=W)[0] == 403 and J("POST", "/tasks", {"b": SA, "t": "allowed"}, tok=W)[0] == 201
+assert J("POST", "/tasks/bulk", {"ids": [ta["id"], tb_["id"]], "pr": 2}, tok=W)[0] == 403 and J("GET", f"/tasks/{ta['id']}")[1]["pr"] == 4          # one forbidden id refuses the whole batch
+assert J("POST", f"/tasks/{ta['id']}/move", {"b": SB}, tok=W)[0] == 403 and J("POST", "/tasks/move", {"ids": [ta["id"]], "b": SB}, tok=W)[0] == 403
+assert J("POST", "/boards", {"n": "mine now"}, tok=W)[0] == 403 and J("POST", "/cost", {"task": tb_["id"], "usd": 1}, tok=W)[0] == 403
+assert {x["b"] for x in J("GET", "/sprints", tok=W)[1]["i"]} == {SA}
+nx = J("POST", "/next", {}, tok=W)[1]; assert nx.get("id") != tb_["id"] and (nx.get("none") or J("GET", f"/tasks/{nx['id']}")[1]["b"] == SA), nx     # next never reaches into the other board
+assert J("GET", "/dashboard", tok=W)[1]["totals"]["boards"] == 1 and J("GET", "/overview", tok=W)[1]["boards"] == 1
+assert not any(e[3] == SB for e in J("GET", "/changes?since=0&limit=1000", tok=W)[1]["e"]) and any(e[3] == SB for e in J("GET", "/changes?since=0&limit=1000")[1]["e"])
+assert J("POST", "/tasks/commits", {"h": "abc", "m": f"touches #{tb_['id']} and #{ta['id']}"}, tok=W)[1]["n"] == 1                # the forbidden id is skipped, the allowed one gets the commit
+assert J("GET", f"/tasks/{tb_['id']}")[1].get("cm") is None
+assert len(J("GET", "/boards")[1]["i"]) > 1                                                          # unlimited tokens still see everything
+tid_ = [x["id"] for x in J("GET", "/tokens")[1]["i"] if x["n"] == "Walled"][0]
+assert J("GET", "/tokens")[1]["i"][-1]["bs"] == [SA]
+assert J("POST", "/tokens", {"id": tid_, "boards": [SA, SB]})[1]["bs"] == [SA, SB] and J("GET", f"/tasks/{tb_['id']}", tok=W)[0] == 200                  # widen it
+assert J("POST", "/tokens", {"id": tid_, "boards": []})[1]["bs"] == [] and J("GET", f"/tasks/{tb_['id']}", tok=W)[0] == 200                                  # empty = all
+print("v17 scope OK")
+print("v17 selftest OK")
+
+# ---- MCP: say, messages, waiting briefing, the inbox watcher, token scope
+core_names = names_("core"); assert "say" in core_names and "messages" not in core_names and "messages" in names_("core,coord") and len(json.dumps(mcp("core", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})[0]["result"]["tools"])) < 9000
+assert mcp_as("wtok", "core", "say", {"to": "Sup Bot", "c": "via mcp"})["n"] == 1 and any("via mcp" in n["m"] for n in J("GET", "/inbox?as=Sup%20Bot&ack=1")[1]["i"])
+assert [m["c"] for m in mcp_as("wtok", "core,coord", "messages", {"with": "Sup Bot", "limit": 5})["i"]][-1] == "via mcp"
+def mcp_session(tok, name, extra_env, msgs, listen=4):
+    pr = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
+                          env={**os.environ, "TASKBOARD_URL": "http://127.0.0.1:8791", "TASKBOARD_TOKEN": tok, "TASKBOARD_AGENT": name, "TASKBOARD_TOOLS": "core", **extra_env})
+    out = []
+    threading.Thread(target=lambda: [out.append(json.loads(l)) for l in pr.stdout if l.strip()], daemon=True).start()
+    for m in msgs:
+        pr.stdin.write(json.dumps(m) + "\n"); pr.stdin.flush()
+    return pr, out
+init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}}
+pr, out = mcp_session("wtok", "Worker", {"TASKBOARD_WATCH": "1"}, [init])
+_t17.sleep(0.8); J("POST", "/messages", {"to": "Worker", "c": "ping from the supervisor"}, tok="stok")
+note = waitfor(lambda: [o for o in out if o.get("method") == "notifications/message"], 80)
+pr.stdin.close(); pr.wait(timeout=10)
+assert note and "new item" in note[0]["params"]["data"] and "briefing" in note[0]["params"]["data"], out                  # a sleeping agent is told without polling
+assert out[0]["result"]["capabilities"].get("logging") == {}
+pr, out = mcp_session("wtok", "Worker", {}, [init, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "briefing", "arguments": {}}},
+                                             {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "briefing", "arguments": {}}}])
+waitfor(lambda: len([o for o in out if o.get("id") in (2, 3)]) == 2, 60)
+t0 = _t17.time(); pr.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "briefing", "arguments": {"wait": 2}}}) + "\n"); pr.stdin.flush()
+r4 = waitfor(lambda: [o for o in out if o.get("id") == 4], 100); pr.stdin.close(); pr.wait(timeout=10)
+assert r4 and json.loads(r4[0]["result"]["content"][0]["text"]).keys() == {"c"} and 1.8 <= _t17.time() - t0 < 5, (r4, _t17.time() - t0)         # held open, then an empty answer
+tkx = mcp_as("tok", "all", "tokens", {"action": "create", "n": "Scoped Via Mcp", "boards": [SA]}); assert tkx["bs"] == [SA]
+tx = [x["id"] for x in mcp_as("tok", "all", "tokens", {})["i"] if x["n"] == "Scoped Via Mcp"][0]
+assert mcp_as("tok", "all", "tokens", {"action": "scope", "id": tx, "boards": []})["bs"] == [] and J("GET", f"/boards/{SB}", tok=tkx["token"])[0] == 200
+print("v17 mcp OK")
