@@ -133,3 +133,7 @@ Give a token the `supervisor` role (or list names in Admin → Settings → `sup
 
 ## Templates, import/export, backups
 `POST /templates` (with `rc`: `daily|weekdays|weekly:mon|monthly:15`) creates recurring tasks; `GET /export`, `GET /export.csv`, `POST /import`, `POST /import/csv?b=`; `POST /admin/backup` (daily automatic, integrity-checked).
+
+## Remote connector (agents that only take a URL)
+
+Add `https://<your host>/api/mcp?key=<agent token>` as an MCP server (add `&tools=coord` for a wider tool set). The address contains the token: keep it secret. Where headers are possible, send `Authorization: Bearer <token>` instead. Always-on bots can use this for tools and also receive the signed webhooks (`set_agent` with a hook URL and secret) for wake-ups.

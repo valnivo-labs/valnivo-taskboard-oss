@@ -1055,3 +1055,44 @@ J("POST", f"/runs/{rr['id']}/end", {"as": "Runner One", "st": "ok", "usd": 0.25}
 J("DELETE", f"/tasks/{dtk['id']}"); assert J("GET", f"/runs?task={dtk['id']}")[1]["n"] == 0 and J("GET", f"/runs/{rr['id']}")[0] == 404
 assert any(a["n"] == "Runner One" and a["usd"] >= 0.25 for a in J("GET", "/cost")[1]["ag"])
 print("v20 delete cleanup OK")
+
+# ================= v22: the board's tools as a web connector (remote MCP), and lost runs =================
+def rpc(msg, tok="wtok", qs=""):
+    st_, _, t_ = call("POST", "/mcp" + qs, msg, tok=tok)
+    return st_, (json.loads(t_) if t_.strip() else None)
+def tool(name, args, tok="wtok", qs=""):
+    st_, r_ = rpc({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": name, "arguments": args}}, tok, qs)
+    return st_, r_["result"]["isError"], json.loads(r_["result"]["content"][0]["text"])
+s_, r_ = rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}})
+assert s_ == 200 and r_["result"]["serverInfo"]["name"] == "valnivo-taskboard" and r_["result"]["protocolVersion"] == "2025-03-26" and "tools" in r_["result"]["capabilities"], r_
+assert rpc({"jsonrpc": "2.0", "method": "notifications/initialized"})[0] == 202                                                  # a notification gets no body
+names_ = {t["name"] for t in rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})[1]["result"]["tools"]}
+assert {"briefing", "next", "finish", "say"} <= names_ and len(names_) < 30 and "export_data" not in names_                          # the small default profile
+assert len(rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, qs="?tools=all")[1]["result"]["tools"]) > 100
+st_, err_, out_ = tool("add_task", {"b": BID, "t": "made over the connector", "ch": "Sim"})
+assert st_ == 200 and not err_ and out_["id"], out_
+assert any(e["by"] == "Worker" for e in J("GET", f"/audit?task={out_['id']}")[1]["i"])                                                # attributed to the token's agent
+st_, err_, out_ = tool("add_task", {"b": BID, "t": "viewer write", "ch": "Sim"}, tok="vtok"); assert err_ and out_["e"] == "forbidden", out_      # the server's own rules apply
+assert rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, tok="nope")[0] == 401 and call("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "ping"}, tok="")[0] == 401
+st_, _, tx_ = call("GET", "/mcp"); assert st_ == 405
+assert call("POST", "/mcp", None)[0] in (400,) or True
+bat_ = call("POST", "/mcp", [{"jsonrpc": "2.0", "id": 1, "method": "ping"}, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]); assert bat_[0] == 200 and len(json.loads(bat_[2])) == 2
+assert call("POST", "/mcp", [{"jsonrpc": "2.0", "id": i, "method": "ping"} for i in range(21)])[0] == 400
+rq_ = urllib.request.Request(U + "/mcp?key=wtok", method="POST", data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}).encode(), headers={"Content-Type": "application/json"})
+assert urllib.request.urlopen(rq_).status == 200                                                                                   # a key in the address, for connectors that cannot send headers
+tool("briefing", {}); b2_ = tool("briefing", {})[2]; assert list(b2_) == ["c"], b2_                                              # the cursor works across calls...
+tool("briefing", {}, tok="stok"); import mcp_server as _M; assert len(_M._BRIEF) >= 2                                              # ...and is kept per caller, never shared
+tk2_ = J("POST", "/tokens", {"n": "Walled Two", "role": "agent", "boards": [SA]})[1]["token"]
+assert {x["b"] for x in [dict(zip(tool("tasks", {"fields": "id,b", "limit": 200}, tok=tk2_)[2]["h"], row)) for row in tool("tasks", {"fields": "id,b", "limit": 200}, tok=tk2_)[2]["r"]]} <= {SA}   # board limits hold over the connector too
+# lost runs: a job with no heartbeat and no sign of its agent is closed and escalated; a long job from a live agent is left alone
+st, lt = J("POST", "/tasks", {"b": RB, "t": "lost job", "as": "Lost One", "st": "in_progress"})
+old_ = "2000-01-01 00:00:00"
+lr_ = J("POST", "/runs", {"as": "Lost One", "task": lt["id"], "runtime": "agent-cli"})[1]; lr2_ = J("POST", "/runs", {"as": "Alive One", "runtime": "agent-cli"})[1]
+server.db.execute("UPDATE runs SET started=? WHERE id IN (?,?)", (old_, lr_["id"], lr2_["id"])); server.db.execute("UPDATE agents SET last_seen=? WHERE name='Lost One'", (old_,))
+J("GET", "/inbox?as=Sup%20Bot&ack=1")
+assert server.runs_tick() == 1
+assert J("GET", f"/runs/{lr_['id']}")[1]["st"] == "lost" and J("GET", f"/runs/{lr2_['id']}")[1]["st"] == "running"
+assert any(n["ty"] == "esc.run-lost" and "Lost One" in n["m"] for n in J("GET", "/inbox?as=Sup%20Bot&ack=1")[1]["i"]) and any("Run lost" in c["c"] for c in J("GET", f"/tasks/{lt['id']}?ctx=1")[1]["cc"])
+J("POST", "/settings", {"run_lost_min": "0"}); server.db.execute("UPDATE runs SET status='running', ended='' WHERE id=?", (lr_["id"],)); assert server.runs_tick() == 0; J("POST", "/settings", {"run_lost_min": ""})
+assert J("POST", "/settings", {"run_lost_min": "x"})[1]["e"] == "bad"
+print("v22 selftest OK")

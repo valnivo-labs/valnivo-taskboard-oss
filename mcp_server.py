@@ -12,18 +12,24 @@ TOKEN = os.environ.get("TASKBOARD_TOKEN", "")
 ME = os.environ.get("TASKBOARD_AGENT", "")  # default agent name for inbox/dashboard
 ST = ["backlog", "todo", "in_progress", "review", "blocked", "done"]
 etags = {}
+_ctx = threading.local()      # set by the taskboard's own /api/mcp endpoint: the caller's address and token for this one call
+
+
+def _creds():
+    return (getattr(_ctx, "url", None) or URL, getattr(_ctx, "token", None) or TOKEN, not getattr(_ctx, "token", None))
 
 
 def api(method, path, body=None, timeout=20):
-    h = {"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"}
-    if method == "GET" and path in etags:
+    url, tok, own = _creds()      # own: a stdio server has one token, so its ETag cache is safe; a web caller never shares one
+    h = {"Authorization": "Bearer " + tok, "Content-Type": "application/json"}
+    if own and method == "GET" and path in etags:
         h["If-None-Match"] = etags[path][0]
-    req = urllib.request.Request(URL + "/api" + path, method=method, headers=h,
+    req = urllib.request.Request(url + "/api" + path, method=method, headers=h,
                                  data=json.dumps(body).encode() if body is not None else None)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             out = json.load(r)
-            if method == "GET" and r.headers.get("ETag"):
+            if own and method == "GET" and r.headers.get("ETag"):
                 etags[path] = (r.headers["ETag"], out)
             return out
     except urllib.error.HTTPError as e:
@@ -40,17 +46,17 @@ def idn(a):
     return {**a, "as": a.get("as") or ME} if (a.get("as") or ME) else a
 
 
-_BRIEF = {"c": None}
+_BRIEF = {}                   # briefing cursor per caller (one key for a stdio server, one per token over the web)
 
 
 def _briefing(a):
     """Remembers the cursor of the last briefing so repeat calls return only changes."""
-    since = None if a.get("full") else _BRIEF["c"]
+    since = None if a.get("full") else _BRIEF.get(getattr(_ctx, "key", "") or "")
     wait = min(int(a.get("wait") or 0), 30) if since is not None else 0           # hold the call open until something arrives (needs the cursor of an earlier briefing)
     r = api("GET", "/briefing" + qs({"as": a.get("as") or ME, "since": since, "ack": a.get("ack"), "tm": a.get("tm"), "bs": a.get("bs"), "full": 1 if a.get("full") else None, "wait": wait or None},
                                     ["as", "since", "ack", "tm", "bs", "full", "wait"]), timeout=wait + 20)
     if isinstance(r, dict) and isinstance(r.get("c"), int):
-        _BRIEF["c"] = r["c"]
+        _BRIEF[getattr(_ctx, "key", "") or ""] = r["c"]
     return r
 
 
@@ -75,7 +81,7 @@ def S(req=(), **p):
 
 def api_text(method, path, text=None, timeout=120):
     """Endpoints that speak CSV instead of JSON."""
-    req = urllib.request.Request(URL + "/api" + path, method=method, headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "text/csv; charset=utf-8"}, data=text.encode() if text is not None else None)
+    req = urllib.request.Request(_creds()[0] + "/api" + path, method=method, headers={"Authorization": "Bearer " + _creds()[1], "Content-Type": "text/csv; charset=utf-8"}, data=text.encode() if text is not None else None)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read().decode("utf-8", "replace")
@@ -345,10 +351,15 @@ COORD = ["messages", "claim_next", "release", "locks", "ask", "asks", "cancel_as
 ADMIN = ["tokens", "settings", "backups", "export_data", "export_csv", "import_csv", "import_data", "del_board", "del_sprint", "chats", "git_secret", "wake_agent", "usage"]
 GROUPS = {"core": CORE, "coord": COORD, "admin": ADMIN, "plan": [n for n in TOOLS if n not in CORE + COORD + ADMIN]}
 PROFILE = os.environ.get("TASKBOARD_TOOLS", "core")      # core (default) | core,coord | core,coord,plan | core,admin | all | tool names
-if PROFILE == "all":
-    VISIBLE = list(TOOLS)
-else:
-    VISIBLE = [n for n in dict.fromkeys(x for part in PROFILE.split(",") for x in (GROUPS.get(part.strip()) or ([part.strip()] if part.strip() in TOOLS else [])))]
+
+
+def profile_names(profile):
+    if profile == "all":
+        return list(TOOLS)
+    return [n for n in dict.fromkeys(x for part in profile.split(",") for x in (GROUPS.get(part.strip()) or ([part.strip()] if part.strip() in TOOLS else [])))]
+
+
+VISIBLE = profile_names(PROFILE)
 
 # one-line descriptions with a key legend for the daily tools; the rest use the first sentence. help(op) returns the full text.
 SHORT = {
@@ -439,33 +450,45 @@ def watch():
             time.sleep(10)
 
 
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    m = json.loads(line)
+def handle(m, profile=None):
+    """One JSON-RPC message -> the response, or None for a notification. Used by the stdio loop below and by the taskboard's /api/mcp (profile = tools=...)."""
     mid, meth = m.get("id"), m.get("method")
     if mid is None:
-        continue
+        return None
     if meth == "initialize":
-        send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": m["params"].get("protocolVersion", "2024-11-05"),
-              "capabilities": {"tools": {}, "logging": {}}, "serverInfo": {"name": "valnivo-taskboard", "version": "0.4"}, "instructions": INSTRUCTIONS}})
-        if os.environ.get("TASKBOARD_WATCH") in ("1", "true", "yes") and ME and not _watching:
+        return {"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": (m.get("params") or {}).get("protocolVersion", "2024-11-05"),
+                "capabilities": {"tools": {}, "logging": {}}, "serverInfo": {"name": "valnivo-taskboard", "version": "0.4"}, "instructions": INSTRUCTIONS}}
+    if meth == "tools/list":
+        tl = [{"name": n, "description": short(n, TOOLS[n][0]), "inputSchema": slim(TOOLS[n][1])} for n in (VISIBLE if profile is None else profile_names(profile))]
+        tl += [{"name": n, "description": d, "inputSchema": sc} for n, (d, sc) in META.items()]
+        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": tl}}
+    if meth == "tools/call":
+        p = m.get("params") or {}
+        try:
+            args = dict(p.get("arguments") or {})
+            out = meta_call(p["name"], args) if p["name"] in META else TOOLS[p["name"]][2](args)
+            return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(out, separators=(",", ":"), ensure_ascii=False)}],
+                    "isError": isinstance(out, dict) and "e" in out}}
+        except Exception as e:
+            return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": '{"e":"%s"}' % type(e).__name__}], "isError": True}}
+    if meth == "ping":
+        return {"jsonrpc": "2.0", "id": mid, "result": {}}
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "unknown method"}}
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        m = json.loads(line)
+        out = handle(m)
+        if out is not None:
+            send(out)
+        if m.get("method") == "initialize" and os.environ.get("TASKBOARD_WATCH") in ("1", "true", "yes") and ME and not _watching:
             _watching.append(threading.Thread(target=watch, daemon=True))
             _watching[0].start()
-    elif meth == "tools/list":
-        tl = [{"name": n, "description": short(n, TOOLS[n][0]), "inputSchema": slim(TOOLS[n][1])} for n in VISIBLE]
-        tl += [{"name": n, "description": d, "inputSchema": sc} for n, (d, sc) in META.items()]
-        send({"jsonrpc": "2.0", "id": mid, "result": {"tools": tl}})
-    elif meth == "tools/call":
-        p = m["params"]
-        try:
-            out = meta_call(p["name"], dict(p.get("arguments") or {})) if p["name"] in META else TOOLS[p["name"]][2](dict(p.get("arguments") or {}))
-            send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": json.dumps(out, separators=(",", ":"), ensure_ascii=False)}],
-                  "isError": isinstance(out, dict) and "e" in out}})
-        except Exception as e:
-            send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": '{"e":"%s"}' % type(e).__name__}], "isError": True}})
-    elif meth == "ping":
-        send({"jsonrpc": "2.0", "id": mid, "result": {}})
-    else:
-        send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "unknown method"}})
+
+
+if __name__ == "__main__":
+    main()

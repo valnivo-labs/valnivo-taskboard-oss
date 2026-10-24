@@ -1883,6 +1883,7 @@ def _wake_loop():
         time.sleep(60)
         try:
             wake_tick()
+            runs_tick()
         except Exception:
             pass
 
@@ -2265,6 +2266,27 @@ def limit_check(name):
         raise ApiError("limit", 429, "usd")
     if lim.get("secs") and sum(_secs(r) for r in rows("SELECT started, ended FROM runs WHERE agent=? AND started>=?", (name, day))) >= int(lim["secs"]):
         raise ApiError("limit", 429, "secs")
+
+
+def runs_tick(actor="system"):
+    """A run still 'running' long after it began, with no sign of its agent, was lost (the session died, the machine restarted). Close it and tell the supervisors."""
+    mins = int(get_setting("run_lost_min", "90") or 0)
+    if mins <= 0:
+        return 0
+    cut, n = plus_min(-mins), 0
+    for r in rows("SELECT * FROM runs WHERE status='running' AND started<?", (cut,)):
+        a = db.execute("SELECT last_seen FROM agents WHERE name=?", (r["agent"],)).fetchone()
+        if a and a["last_seen"] and a["last_seen"] > cut:          # the agent is still around: a long job, not a lost one
+            continue
+        with lock:
+            db.execute("UPDATE runs SET status='lost', ended=?, outcome=? WHERE id=?", (now_s(), "no sign of the agent for %d minutes" % mins, r["id"]))
+            db.execute("UPDATE agents SET status_text='', status_task=NULL WHERE name=? AND status_text LIKE 'running a%'", (r["agent"],))
+            emit(actor, "run.ended", r["id"], r["board_id"], {"st": "lost", "tk": r["task_id"]})
+            if r["task_id"]:
+                db.execute("INSERT INTO comments(task_id,actor,body) VALUES(?,?,?)", (r["task_id"], actor, "Run lost (%s, started %s UTC): no sign of the agent for %d minutes" % (r["runtime"] or "job", r["started"][11:16], mins)))
+            escalate("run-lost", actor, r["task_id"], r["board_id"], "%s's %s job%s was lost: no sign of it for %d minutes" % (r["agent"], r["runtime"] or "", (" on #%d" % r["task_id"]) if r["task_id"] else "", mins), skip=(r["agent"],))
+        n += 1
+    return n
 
 
 def run_out(r):
@@ -4260,7 +4282,7 @@ def token_delete(tid):
     return {"id": tid, "x": 1}
 
 
-SETTING_KEYS = ("digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd", "agent_limits", "media_hosts")
+SETTING_KEYS = ("digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd", "agent_limits", "run_lost_min", "media_hosts")
 
 
 def get_setting(k, default=""):
@@ -4286,9 +4308,9 @@ def settings_set(body):
                         check_public_url(v)
                     except ApiError as e:
                         raise ApiError(e.code, 400, k)
-                if k in ("digest_hour", "backup_keep", "wake_after_min") and v:
+                if k in ("digest_hour", "backup_keep", "wake_after_min", "run_lost_min") and v:
                     try:
-                        assert 0 <= int(v) <= (23 if k == "digest_hour" else 1440 if k == "wake_after_min" else 365)
+                        assert 0 <= int(v) <= (23 if k == "digest_hour" else 1440 if k in ("wake_after_min", "run_lost_min") else 365)
                     except Exception:
                         raise ApiError("bad", 400, k)
                 if k == "budget_usd" and v:
@@ -4629,13 +4651,14 @@ class H(BaseHTTPRequestHandler):
         a = self.headers.get("Authorization", "")
         if a.lower().startswith("bearer "):
             t = a[7:].strip()
-        if not t and self.path.split("?")[0] == "/api/events":    # EventSource cannot set headers; no other endpoint takes a URL token
-            t = query.get("token", [""])[0]
+        if not t and self.path.split("?")[0] in ("/api/events", "/api/mcp"):    # EventSource cannot set headers; no other endpoint takes a URL token
+            t = query.get("token", [""])[0] or query.get("key", [""])[0]
         r = lookup_token(t)
         if not r:
             return None
         self.role = r[1]
         self.allowed = r[2]
+        self.tok = t
         touch_presence(r[0])
         return r[0]
 
@@ -4747,6 +4770,33 @@ class H(BaseHTTPRequestHandler):
                         if str(i).isdigit():
                             need_task(int(i))
 
+    def mcp_http(self, actor, q, method):
+        """Remote MCP over HTTP (streamable HTTP, JSON answers, stateless): the same tools as mcp_server.py, each call made with the caller's own token."""
+        if method != "POST":
+            return self.err("method", 405)
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(n) or b"null")
+        except ValueError:
+            return self.send_json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+        msgs = body if isinstance(body, list) else [body]
+        if not msgs or len(msgs) > 20 or not all(isinstance(x, dict) for x in msgs):
+            return self.send_json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}})
+        import mcp_server as M
+        tok = getattr(self, "tok", "") or "-"
+        M._ctx.url, M._ctx.token, M._ctx.key = "http://127.0.0.1:%d" % self.server.server_address[1], tok, hashlib.sha256(tok.encode()).hexdigest()[:16]
+        try:
+            outs = [M.handle(x, _qv(q, "tools") or "core") for x in msgs]
+        finally:
+            M._ctx.url = M._ctx.token = M._ctx.key = None
+        outs = [o for o in outs if o is not None]
+        if not outs:
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        return self.send_json(200, outs if isinstance(body, list) else outs[0])
+
     def git_hook(self):
         n = int(self.headers.get("Content-Length") or 0)
         if n > 5 * 1024 * 1024:
@@ -4817,6 +4867,8 @@ class H(BaseHTTPRequestHandler):
         _ctx.allowed = self.allowed
         full = (q.get("full", ["0"])[0] not in ("0", "")) or self.headers.get("X-TB-Full") == "1"
         try:
+            if path == "/api/mcp":
+                return self.mcp_http(actor, q, method)
             if path in ("/api/nudge", "/api/tasks/nudge/run") and method == "POST":
                 bid = qint(q, "b") or qint(q, "board_id")
                 res = nudge_tick(bid, actor=actor or "agent")
