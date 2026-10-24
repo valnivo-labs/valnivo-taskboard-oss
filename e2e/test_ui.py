@@ -321,6 +321,17 @@ def test_saved_views_are_shared_with_agents(page):
     assert saved and saved[0]["f"].get("q") == "blocked" and saved[0]["f"].get("preset") == "open", saved       # and one saved on screen is there for agents
 
 
+def test_today_can_be_clicked_while_the_boards_still_load(page):
+    b, _ = mkboard("Slow %d" % time.time())
+    mktask(b, "blocked while loading", st="blocked", pr=1, bl="slow")
+    page.add_init_script("const of = window.fetch; window.fetch = (u, o) => /\\/api\\/boards\\/\\d+/.test(String(u)) ? new Promise(r => setTimeout(r, 2500)).then(() => of(u, o)) : of(u, o);")   # a slow network for the board snapshots
+    page.goto("%s/?token=%s" % (URL, ADMIN))
+    page.wait_for_selector("#v-today .needrow [data-open]")
+    assert page.evaluate("B === null"), "the boards must still be loading for this test to mean anything"
+    page.click("#v-today .needrow [data-open]")                                       # clicked before B exists: the app waits for it, then opens the task
+    page.wait_for_selector("#dlg.drawer[open]", timeout=15000)
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

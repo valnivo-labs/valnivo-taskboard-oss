@@ -1130,7 +1130,9 @@ function taskDlg(id, status, title, boardId, pri) {
 
 
 // ---- open a task from any view (switches board if needed) ----
+let bootP = null;                                    // the first board load: Today can be clicked before it finishes
 async function openTask(id, boardId) {
+  if (!B && bootP) await bootP.catch(() => {});
   if (boardId && !(B && (B.multi ? B.boardIds.includes(+boardId) : B.id == boardId))) { $("board").value = "b:" + boardId; autoSprint = true; await loadBoard(); }
   setView("board"); $("sprint").value = ""; autoSprint = false; render(); taskDlg(+id);
 }
@@ -1173,9 +1175,9 @@ async function renderToday() {
     </div>
     ${costPanel(cost)}</div>`;
 }
-$("v-today").addEventListener("click", e => {
+$("v-today").addEventListener("click", async e => {
   const o = e.target.closest("[data-open]"); if (o) return openTask(+o.dataset.open);
-  const b = e.target.closest("[data-board]"); if (b) { $("board").value = "b:" + b.dataset.board; autoSprint = true; setView("board"); return loadBoard(); }
+  const b = e.target.closest("[data-board]"); if (b) { if (bootP) await bootP.catch(() => {}); $("board").value = "b:" + b.dataset.board; autoSprint = true; setView("board"); return loadBoard(); }
   const m = e.target.closest("[data-msg]"); if (m) return msgDlg(m.dataset.msg);
   const g = e.target.closest("[data-go]"); if (g) return setView(g.dataset.go);
 });
@@ -1513,7 +1515,7 @@ $("presets").onclick = e => {
 document.querySelectorAll("#presets .preset").forEach(b => b.classList.toggle("on", b.dataset.preset === preset));
 setView(view);
 function startLoad() {
-  loadBoards().then(() => { const m = /^#t\/(\d+)/.exec(location.hash); if (m && B) openTask(+m[1]); }).catch(() => {
+  bootP = loadBoards().then(() => { const m = /^#t\/(\d+)/.exec(location.hash); if (m && B) openTask(+m[1]); }).catch(() => {
     if (B) return;
     $("main").insertAdjacentHTML("afterbegin", '<div class="pad" id="loadfail"><div class="empty"><b>Could not load the boards</b><br>Retrying…<br><button type="button" class="mini primary" id="loadretry">Try again now</button></div></div>');
     const go = () => { const e = $("loadfail"); if (e) e.remove(); startLoad(); };
