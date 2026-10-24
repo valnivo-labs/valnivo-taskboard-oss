@@ -332,6 +332,44 @@ def test_today_can_be_clicked_while_the_boards_still_load(page):
     page.wait_for_selector("#dlg.drawer[open]", timeout=15000)
 
 
+def test_drawer_shows_due_runs_and_approvals(page):
+    b, _ = mkboard("Runs %d" % time.time())
+    tid = mktask(b, "task with history", st="in_progress", **{"as": "Runner Two"})
+    rid = api("POST", "/runs", {"as": "Runner Two", "task": tid, "runtime": "claude", "job": "j9"})["id"]
+    api("POST", "/runs/%d/end" % rid, {"as": "Runner Two", "st": "failed", "out": "tests did not pass"})
+    api("POST", "/tasks/%d/approval" % tid, {"as": "Runner Two", "action": "deploy to production", "to": "admin"})
+    goto(page, view="board", scope="b:%d" % b)
+    page.click(".card[data-id='%d'] .t" % tid)
+    page.wait_for_selector("#runsbox:not([hidden]) .chip:has-text('failed')")
+    assert "tests did not pass" in page.inner_text("#runsbox")
+    page.fill("#f [name=due]", "2020-01-01")
+    page.click("#dsave")
+    page.wait_for_selector(".card[data-id='%d'] .chip.late" % tid)                   # overdue shows in red on the card
+    assert api("GET", "/tasks/%d" % tid)["du"] == "2020-01-01"
+    page.click(".card[data-id='%d'] .t" % tid)
+    page.click("#f [data-tab=review]")
+    page.wait_for_selector("#rvbox .chip:has-text('approval')")
+
+
+def test_audit_log_section(page):
+    b, _ = mkboard("Audit %d" % time.time())
+    mktask(b, "audited change")
+    goto(page, view="admin")
+    page.click("[data-admsec=audit]")
+    page.wait_for_selector("#auditbox table tr:has-text('task.created')")
+    page.fill("#auditf [name=type]", "run.")
+    page.click("#auditf button[type=submit]")
+    page.wait_for_selector("#auditbox:has-text('Nothing matches'), #auditbox tr:has-text('run.')")
+
+
+def test_agent_quota_is_visible_and_clearable(page):
+    api("POST", "/agents", {"n": "Quota Agent", "quota_min": 45, "quota_note": "5h limit"})
+    goto(page, view="agents")
+    page.wait_for_selector("#v-agents .agent:has-text('Quota Agent') .badge:has-text('Quota')")
+    page.click("#v-agents .agent:has-text('Quota Agent') [data-clearq]")
+    page.wait_for_selector("#v-agents .agent:has-text('Quota Agent') .badge:has-text('Quota')", state="detached")
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

@@ -9,7 +9,7 @@ const lbShow = l => LB_DISP[l] || l;
 const BASE = (location.pathname.match(/^(\/taskboard(?=\/|$))/) || ["", ""])[1];
 // short event keys -> full task/sprint/board fields
 const KM = {
-  task: {cs: "cost", tk: "tokens", b: "board_id", s: "sprint_id", t: "title", d: "description", st: "status", pr: "priority", as: "assignee", k: "kind", u: "updated", bl: "blocker", bb: "blocked_by", lb: "labels", ch: "channel", w: "watch", sh: "short_url", vid: "video_id", at: "publish_at", pu: "pr_url", sha: "sha", cm: "commits", dp: "depends", pt: "points", cb: "claimed_by", cu: "claim_until", v: "version", dn: "dod_done", ty: "type", pa: "parent", tg: "target", cr: "current"},
+  task: {du: "due", cs: "cost", tk: "tokens", b: "board_id", s: "sprint_id", t: "title", d: "description", st: "status", pr: "priority", as: "assignee", k: "kind", u: "updated", bl: "blocker", bb: "blocked_by", lb: "labels", ch: "channel", w: "watch", sh: "short_url", vid: "video_id", at: "publish_at", pu: "pr_url", sha: "sha", cm: "commits", dp: "depends", pt: "points", cb: "claimed_by", cu: "claim_until", v: "version", dn: "dod_done", ty: "type", pa: "parent", tg: "target", cr: "current"},
   sprint: {b: "board_id", n: "name", g: "goal", from: "start", to: "end", st: "state"},
   board: {n: "name", d: "description", tm: "team"},
 };
@@ -198,6 +198,7 @@ function card(t) {
   }
   if (t.points) meta.push(`<span class="chip" title="Points">${t.points}pt</span>`);
   if (t.cost) meta.push(`<span class="chip cost" title="Agent spend on this task">${money(t.cost)}</span>`);
+  if (t.due) meta.push(`<span class="chip${t.due < new Date().toISOString().slice(0, 10) && !["done", "declined"].includes(t.status) ? " late" : ""}" title="Due date ${esc(t.due)}">due ${esc(t.due.slice(5))}</span>`);
   if (t.claimed_by && (t.claim_until || "") > new Date().toISOString().slice(0, 19).replace("T", " ")) meta.push(`<span class="chip claim" title="Claimed until ${esc(t.claim_until)} UTC">claimed · ${esc(t.claimed_by)}</span>`);
   if (t.nudge || csv(t.labels).map(l => l.toLowerCase()).includes("nudge"))
     meta.push(`<span class="chip nudge" title="Stale — nudged ${esc(t.nudge || "")}">Nudge</span>`);
@@ -467,7 +468,7 @@ async function renderAdmin() {
   catch (_) { el.innerHTML = '<div class="pad"><div class="empty"><b>Admin only</b><br>Your token does not have the admin role.</div></div>'; return; }
   if (view !== "admin") return;
   const last = bk.last;
-  el.innerHTML = `<div class="pad"><div class="adm"><nav class="admnav" aria-label="Admin sections">${[["access", "Access", tk.i.length], ["notifications", "Notifications"], ["chat", "Chat channels", ch.i.length], ["git", "Git and pull requests"], ["budgets", "Budgets and wake-ups"], ["rules", "Board rules"], ["backups", "Backups"], ["templates", "Templates"], ["data", "Import and export"], ["usage", "API usage"]].map(([k, l, n]) => `<button type="button" data-admsec="${k}" class="${admSec === k ? "on" : ""}" ${admSec === k ? 'aria-current="page"' : ""}>${l}${n ? `<span class="chip">${n}</span>` : ""}</button>`).join("")}</nav><div class="admbody" data-cur="${admSec}">
+  el.innerHTML = `<div class="pad"><div class="adm"><nav class="admnav" aria-label="Admin sections">${[["access", "Access", tk.i.length], ["notifications", "Notifications"], ["chat", "Chat channels", ch.i.length], ["git", "Git and pull requests"], ["budgets", "Budgets and wake-ups"], ["rules", "Board rules"], ["backups", "Backups"], ["templates", "Templates"], ["data", "Import and export"], ["usage", "API usage"], ["audit", "Audit log"]].map(([k, l, n]) => `<button type="button" data-admsec="${k}" class="${admSec === k ? "on" : ""}" ${admSec === k ? 'aria-current="page"' : ""}>${l}${n ? `<span class="chip">${n}</span>` : ""}</button>`).join("")}</nav><div class="admbody" data-cur="${admSec}">
     <div class="panel" data-sec="access"><h2>Access — one token per agent</h2><p class="muted hint">Roles: <b>admin</b> everything · <b>supervisor</b> agent + deletes sprints, gets escalations · <b>agent</b> read/write, no deletes of boards/sprints, no admin · <b>viewer</b> read-only. A token's name is the actor in the audit trail and the default inbox.</p>
       <table class="tb"><tr><th>Name</th><th>Role</th><th>Boards</th><th>Last used</th><th></th></tr>${tk.i.map(t => `<tr><td>${esc(t.n)}</td><td><span class="stb">${esc(t.role)}</span></td><td class="muted">${t.bs ? esc(t.bs.map(i => (boards.find(b => b.id === i) || {}).name || "#" + i).join(", ")) : "all"}</td><td>${t.env ? '<span class="muted">env</span>' : esc(t.u ? ago(t.u) + " ago" : "never")}</td><td class="num">${t.env ? "" : `<span class="rowacts"><button type="button" class="mini" data-tokscope="${t.id}" data-bs="${(t.bs || []).join(",")}" ${t.role === "admin" ? "disabled" : ""}>Boards…</button><button type="button" class="mini" data-deltoken="${t.id}">Revoke</button></span>`}</td></tr>`).join("")}</table>
       <p><button type="button" class="mini primary" id="newtoken">+ Create agent token</button></p></div>
@@ -487,6 +488,8 @@ async function renderAdmin() {
       <label>Public address of this board <span class="muted">(adds task links to chat messages)</span><input name="base_url" value="${esc(se.base_url)}" placeholder="https://board.example.com"></label>
       <div class="row2"><label>Wake sleeping agents after (minutes, 0 = off)<input type="number" name="wake_after_min" min="0" max="1440" value="${esc(se.wake_after_min || 10)}"></label><label>Close a task when its PR merges<select name="git_autodone"><option value="1" ${se.git_autodone !== "0" ? "selected" : ""}>Yes (if the gate allows)</option><option value="0" ${se.git_autodone === "0" ? "selected" : ""}>No, only comment</option></select></label></div>
       <label>Monthly budget for all boards (USD, blank = none)<input type="number" step="any" min="0" name="budget_usd" value="${esc(se.budget_usd)}"></label>
+      <label>Daily limits per agent <span class="muted">(JSON, per UTC day: jobs, usd, secs; "*" = everyone)</span><textarea name="agent_limits" rows="2" placeholder='{"*": {"jobs": 40}, "coder-agent": {"usd": 5}}'>${esc(se.agent_limits)}</textarea></label>
+      <label>Sites allowed to show images, video and audio <span class="muted">(https addresses, comma separated; only needed when the server restricts content)</span><input name="media_hosts" value="${esc(se.media_hosts)}" placeholder="https://media.example.com"></label>
       <label>Model prices <span class="muted">(JSON, USD per million tokens [input, output], used when an agent reports tokens without a cost)</span><textarea name="prices" rows="2" placeholder='{"my-model": [3, 15]}'>${esc(se.prices)}</textarea></label>
       <div class="rowbtn"><button class="primary mini" type="submit">Save</button></div></form></div>
     <div class="panel" data-sec="backups"><h2>Backups</h2>${last ? `<p>Last: <b>${esc(last.file)}</b> · ${Math.round(last.size / 1024)} KB · ${last.ok ? '<span class="hl green">verified</span>' : '<span class="hl red">verification failed</span>'}<br><span class="muted">${last.counts.tasks} tasks, ${last.counts.boards} boards, ${last.counts.specs} specs · ${esc(last.ts)} UTC</span></p>` : '<p class="muted">No backup yet — one is made automatically every 24h.</p>'}
@@ -498,10 +501,14 @@ async function renderAdmin() {
     <div class="panel" data-sec="rules"><h2>Board rules — definition of done${B && !B.multi ? " · " + esc(B.name) : ""}</h2><p class="muted hint">One item per line. A task on this board cannot move to Done until every item is ticked and no review is open.</p><form id="dodf" class="stack"><textarea name="dod" rows="4" placeholder="Tests pass&#10;PR linked&#10;Deployed to test">${esc(B && !B.multi ? B.dod || "" : "")}</textarea><div class="rowbtn"><button class="primary mini" type="submit" ${B && !B.multi ? "" : "disabled"}>Save rules</button></div></form></div>
     <div class="panel" data-sec="usage"><h2>Token usage <span class="muted">since ${esc((us.since || "").slice(0, 16))} UTC</span></h2><p class="muted hint">Approximate tokens (bytes ÷ 4) that each agent has sent and received through the API. Use it to see which calls cost the most; <code class="k">briefing</code>, <code class="k">next</code> and <code class="k">finish</code> replace several calls each.</p>
       ${us.agents.length ? `<table class="tb"><tr><th>Agent</th><th>Calls</th><th>Tokens</th><th>Costliest routes</th></tr>${us.agents.map(a => `<tr><td>${esc(a.n)}</td><td class="num">${a.calls}</td><td class="num">${a.t}</td><td class="muted">${a.routes.slice(0, 3).map(r => esc(r.r) + " " + r.t).join(" · ")}</td></tr>`).join("")}</table>` : '<span class="muted">No calls yet.</span>'}</div>
+    <div class="panel" data-sec="audit"><h2>Audit log <span class="muted">who changed what, newest first</span></h2>
+      <form id="auditf" class="rowbtn" style="margin-bottom:12px"><input name="actor" placeholder="Who, e.g. coder-agent" aria-label="Actor"><input name="type" placeholder="Type, e.g. task. or run." aria-label="Event type"><input name="task" type="number" min="1" placeholder="Task #" aria-label="Task number" style="max-width:110px"><button class="mini primary" type="submit">Filter</button></form>
+      <div id="auditbox"><span class="muted">Loading…</span></div></div>
     <div class="panel" data-sec="templates"><h2>Templates &amp; recurring tasks</h2><p class="muted hint">Rules: ${esc(tp.help)}. A recurring template creates a task on schedule, unless the previous one is still open.</p>
       ${tp.i.length ? `<table class="tb"><tr><th>Template</th><th>Rule</th><th>Next run</th><th>Assignee</th><th></th></tr>${tp.i.map(t => `<tr><td>${esc(t.n)}${t.on ? "" : ' <span class="muted">(paused)</span>'}</td><td>${esc(t.rc || "manual")}</td><td>${esc(t.nx || "—")}</td><td>${esc(t.as || "—")}</td><td class="num"><button type="button" class="mini" data-usetpl="${t.id}">Use</button> <button type="button" class="mini" data-edittpl="${t.id}">Edit</button> <button type="button" class="mini" data-deltpl="${t.id}">Delete</button></td></tr>`).join("")}</table>` : '<p class="muted">No templates yet.</p>'}
       <div class="rowbtn"><button type="button" class="mini primary" id="newtpl">+ New template</button><button type="button" class="mini" id="runtpl">Run due recurring now</button></div></div></div></div></div>`;
   el._tpl = tp.i;
+  if (admSec === "audit") loadAudit();
 }
 
 function tplDlg(t) {
@@ -541,6 +548,7 @@ $("v-admin").addEventListener("click", async e => {
 });
 $("v-admin").addEventListener("submit", async e => {
   if (e.target.id === "dodf" && B && !B.multi) { e.preventDefault(); try { await api("PATCH", "/boards/" + B.id, {dod: new FormData(e.target).get("dod")}); await loadBoard(); toast("Board rules saved"); } catch (_) {} return; }
+  if (e.target.id === "auditf") { e.preventDefault(); loadAudit(Object.fromEntries(new FormData(e.target))); return; }
   if (e.target.id === "opsf") { e.preventDefault(); try { await api("POST", "/settings", Object.fromEntries(new FormData(e.target))); toast("Saved"); } catch (_) {} return; }
   if (e.target.id !== "setf") return;
   e.preventDefault();
@@ -731,18 +739,23 @@ async function renderOverview() {
 
 async function renderAgents() {
   const el = $("v-agents");
-  const [ag, d, lk, ak, rv, msgs] = await Promise.all([api("GET", "/agents"), refreshDash(), api("GET", "/locks"), api("GET", "/asks"), api("GET", "/reviews"), api("GET", "/messages?limit=12").catch(() => ({i: []}))]);
+  const [ag, d, lk, ak, rv, msgs, runs] = await Promise.all([api("GET", "/agents"), refreshDash(), api("GET", "/locks"), api("GET", "/asks"), api("GET", "/reviews"), api("GET", "/messages?limit=12").catch(() => ({i: []})), api("GET", "/runs?limit=500&since=" + encodeURIComponent(new Date().toISOString().slice(0, 10) + " 00:00:00")).catch(() => ({i: []}))]);
   let sups = [];
   try { sups = ((await api("GET", "/settings")).supervisors || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean); } catch (_) {}
   if (view !== "agents") return;
   const load = {}; ((d && d.agents) || []).forEach(a => { load[a.as] = a.by; });
-  const agc = {all: ag.i.length, working: 0, blocked: 0, silent: 0, idle: 0}; ag.i.forEach(a => { agc[agentState(a, load[a.n] || {}).k]++; });
+  const agc = {all: ag.i.length, working: 0, blocked: 0, silent: 0, idle: 0, quota: 0};
+  const runBy = {}; (runs.i || []).forEach(x => { const k = x.ag.toLowerCase(), e = runBy[k] = runBy[k] || {n: 0, bad: 0, on: null}; e.n++; if (["failed", "timeout"].includes(x.st)) e.bad++; if (x.st === "running" && !e.on) e.on = x; }); ag.i.forEach(a => { agc[agentState(a, load[a.n] || {}).k]++; });
   const cards = ag.i.map(a => {
     const by = load[a.n] || {}, open = sum(by) - (by.done || 0) - (by.declined || 0), cap = a.cap || 0, over = cap && open > cap;
     const sup = sups.includes(a.n.toLowerCase()), ast = agentState(a, by);
     if (agFilter !== "all" && ast.k !== agFilter) return "";
     const cur = B && B.tasks.find(x => (x.assignee || "").toLowerCase() === a.n.toLowerCase() && x.status === "in_progress");
+    const rb = runBy[a.n.toLowerCase()] || {n: 0, bad: 0, on: null};
     return `<article class="panel agent${sup ? " sup" : ""}"><div class="hd"><span class="avatar lg ${sup ? "" : "ag"}">${esc(initials(a.n))}</span><div><b>${esc(a.n)}</b><span class="muted">${sup ? "Supervisor · gets escalations" : "Agent"}</span></div>${a.inbox ? `<span class="badge teal">${a.inbox} unread</span>` : ""}<span class="badge ${ast.cls}">${ast.label}</span>${over ? '<span class="badge red">Over capacity</span>' : ""}</div>
+      ${a.q ? `<div class="statusline warnline">No new work until ${esc(a.q.slice(11, 16))} UTC${a.qn ? " (" + esc(a.qn) + ")" : ""} <button type="button" class="link" data-clearq="${esc(a.n)}">Clear</button></div>` : ""}
+      ${rb.on ? `<div class="statusline">Running a ${esc(rb.on.rt || "")} job${rb.on.tk ? ` on <button type="button" class="link" data-open="${rb.on.tk}"><span class="mono">#${rb.on.tk}</span></button>` : ""}</div>` : ""}
+      ${rb.n ? `<div class="kv"><span>Runs today</span><b>${rb.n}${rb.bad ? ` · <span style="color:var(--bad)">${rb.bad} failed</span>` : ""}</b></div>` : ""}
       ${cur ? `<div class="statusline">Doing <button type="button" class="link" data-open="${cur.id}"><span class="mono">#${cur.id}</span> ${esc(cur.title)}</button></div>` : ""}
       ${a.stx ? `<div class="statusline">${esc(a.stx)}${a.stk ? ` <span class="mono">#${a.stk}</span>` : ""}</div>` : ""}
       <div class="kv"><span>Last seen</span><b>${a.seen ? esc(ago(a.seen)) + " ago" : "never"}</b></div>
@@ -756,7 +769,7 @@ async function renderAgents() {
   const asks = ak.i.length ? ak.i.map(x => `<div class="coord"><div><b>${esc(x.from)} → ${esc(x.to)}</b>${x.tk ? ` <span class="mono">#${x.tk}</span>` : ""}<div>${esc(x.q)}</div><div class="muted">answer by ${esc(x.due.slice(5, 16))} UTC${x.due < new Date().toISOString().slice(0, 19).replace("T", " ") ? ' · <b style="color:var(--bad)">overdue</b>' : ""}</div></div><button type="button" class="mini primary" data-answer="${x.id}" data-q="${esc(x.q)}" data-to="${esc(x.to)}">Answer</button></div>`).join("") : '<span class="muted">No open questions between agents.</span>';
   const revs = rv.i.length ? rv.i.map(x => `<div class="coord"><div><b>${esc(x.to)}</b> reviews <button type="button" class="link" data-open="${x.tk}"><span class="mono">#${x.tk}</span></button><div class="muted">asked by ${esc(x.from)} · ${esc(ago(x.c))} ago${x.note ? " — " + esc(x.note) : ""}</div></div></div>`).join("") : '<span class="muted">No reviews waiting.</span>';
   el.innerHTML = `<div class="pad"><p class="muted lead">An agent is told the moment a task is assigned to it, handed over, commented on or goes stale. It reads this from its inbox, or gets it pushed to a webhook.</p>
-    <div class="seg agseg" role="group" aria-label="Show">${[["all", "All"], ["working", "Working"], ["blocked", "Blocked"], ["silent", "Silent"], ["idle", "Idle"]].map(([k, l]) => `<button type="button" data-agf="${k}" class="${agFilter === k ? "on" : ""}">${l} ${agc[k]}</button>`).join("")}</div>
+    <div class="seg agseg" role="group" aria-label="Show">${[["all", "All"], ["working", "Working"], ["blocked", "Blocked"], ["silent", "Silent"], ["quota", "Quota"], ["idle", "Idle"]].map(([k, l]) => `<button type="button" data-agf="${k}" class="${agFilter === k ? "on" : ""}">${l} ${agc[k]}</button>`).join("")}</div>
     ${cards.trim() ? `<div class="agentcards">${cards}</div>` : '<span class="muted">No agents yet — assign a task to someone.</span>'}
     <div class="grid2"><div class="panel"><h2>Locks <span class="muted">${lk.i.length}</span></h2>${locks}</div><div class="panel"><h2>Open questions <span class="muted">${ak.i.length}</span></h2>${asks}</div></div>
     <div class="grid2"><div class="panel"><h2>Reviews waiting <span class="muted">${rv.i.length}</span></h2>${revs}</div><div class="panel" id="inboxview"><h2>Inbox</h2><span class="muted">Pick an agent to see their notifications.</span></div></div>
@@ -986,7 +999,8 @@ function taskDlg(id, status, title, boardId, pri) {
     <label>Epic<select name="parent"><option value="">none</option>${B.tasks.filter(x => x.type === "epic" && x.board_id == bid && x.id != id).map(x => `<option value="${x.id}" ${x.id == t.parent ? "selected" : ""}>#${x.id} ${esc(x.title)}</option>`).join("")}</select></label></div>
     <div class="row2"><label>Depends on (task ids, any board)<input name="depends" value="${esc(csv(t.depends).join(", "))}" placeholder="e.g. 12, 15"><input id="dpq" class="dpq" list="dpl" placeholder="Search a task on any board to add it" autocomplete="off"><datalist id="dpl"></datalist></label>
     <label>Points (estimate)<input type="number" name="points" min="0" max="1000" value="${t.points || ""}"></label></div>
-    ${id ? '<div id="linksbox" class="linksbox"></div>' + codeBox(t) : ""}
+    <div class="row2"><label>Due date<input type="date" name="due" value="${esc(t.due || "")}"></label><span></span></div>
+    ${id ? '<div id="linksbox" class="linksbox"></div>' + codeBox(t) + '<div id="runsbox" class="codebox" hidden></div>' : ""}
     ${meth().group === "okr" ? `<div class="row2"><label>Target (key result)<input type="number" step="any" min="0" name="target" value="${t.target ?? ""}"></label><label>Current value<input type="number" step="any" min="0" name="current" value="${t.current ?? ""}"></label></div>` : ""}
     ${(bd.dod || "").trim() ? `<div class="dod"><label>Definition of done — every item before this task can be done</label>${bd.dod.split("\n").filter(x => x.trim()).map((x, i) => `<label class="chk"><input type="checkbox" name="dodi" value="${i}" ${csv(t.dod_done).includes(String(i)) ? "checked" : ""}> ${esc(x)}</label>`).join("")}</div>` : ""}
     <details class="more"><summary>More fields (labels, links, blockers, PR)</summary>
@@ -1053,6 +1067,11 @@ function taskDlg(id, status, title, boardId, pri) {
     }
   }
   if (id) {
+    api("GET", `/tasks/${id}/runs`).then(r => {
+      const box = $("runsbox"); if (!box || !r.i.length) return;
+      box.hidden = false;
+      box.innerHTML = "<b>Runs</b>" + r.i.map(x => `<div class="cbrow"><span class="chip ${x.st === "ok" ? "cost" : x.st === "running" ? "link2" : "late"}">${esc(x.st)}</span><span>${esc(x.ag)} · ${esc(x.rt || "job")} · ${x.secs >= 60 ? Math.round(x.secs / 60) + " min" : x.secs + " s"}${x.usd ? " · " + money(x.usd) : ""}${x.out ? " — " + esc(x.out.slice(0, 140)) : ""}</span>${/^https:\/\//.test(x.log || "") ? `<a href="${esc(x.log)}" target="_blank" rel="noopener">log</a>` : ""}</div>`).join("");
+    }).catch(() => {});
     api("GET", `/tasks/${id}/links`).then(l => {
       const chip = x => `<button type="button" class="link lk${x.open ? "" : " done"}" data-open="${x.id}" title="${esc(x.t)}">#${x.id} ${esc(x.t.slice(0, 36))}<small>${x.x ? esc(x.bn) + " · " : ""}${esc(x.st)}</small></button>`;
       const box = $("linksbox"); if (!box) return;
@@ -1079,12 +1098,12 @@ function taskDlg(id, status, title, boardId, pri) {
     };
     const loadFiles = async () => {
       const r = await api("GET", `/tasks/${id}/attachments`);
-      $("filesbox").innerHTML = (r.i.length ? r.i.map(a => `<div class="filerow"><span class="chip">${esc(a.k || "link")}</span>${a.u ? `<a href="${esc(a.u)}" target="_blank" rel="noopener">${esc(a.n)}</a>` : esc(a.n)}<span class="muted">${esc(a.by || "")} · ${esc(ago(a.c))} ago</span><button type="button" class="mini" data-delatt="${a.id}">Remove</button></div>`).join("") : '<span class="muted">No files yet. Agents register outputs (reports, builds, PRs) here with the attach tool.</span>') +
-        `<div class="filesadd"><input id="fan" placeholder="Name"><input id="fau" placeholder="https://…"><select id="fak">${["link", "file", "pr", "report", "log", "other"].map(k => `<option>${k}</option>`).join("")}</select><button type="button" class="mini primary" id="faadd">Add</button></div>`;
+      $("filesbox").innerHTML = (r.i.length ? r.i.map(a => `<div class="filerow"><span class="chip">${esc(a.k || "link")}</span>${a.u ? `<a href="${esc(a.u)}" target="_blank" rel="noopener">${esc(a.n)}</a>` : esc(a.n)}${mediaPrev(a)}<span class="muted">${esc(a.by || "")} · ${esc(ago(a.c))} ago</span><button type="button" class="mini" data-delatt="${a.id}">Remove</button></div>`).join("") : '<span class="muted">No files yet. Agents register outputs (reports, builds, PRs) here with the attach tool.</span>') +
+        `<div class="filesadd"><input id="fan" placeholder="Name"><input id="fau" placeholder="https://…"><select id="fak">${["link", "file", "image", "video", "audio", "pr", "report", "log", "other"].map(k => `<option>${k}</option>`).join("")}</select><button type="button" class="mini primary" id="faadd">Add</button></div>`;
     };
     const loadReviews = async () => {
       const r = await api("GET", `/reviews?task=${id}&st=all`);
-      $("rvbox").innerHTML = (r.i.length ? r.i.map(v => `<div class="rvrow"><div><b>${esc(v.to)}</b> <span class="badge ${v.st === "approved" ? "teal" : v.st === "changes" ? "red" : ""}">${esc(v.st === "changes" ? "changes requested" : v.st)}</span><div class="muted">requested by ${esc(v.from)} · ${esc(ago(v.c))} ago${v.note ? " — " + esc(v.note) : ""}${v.dn ? "<br>Reviewer: " + esc(v.dn) : ""}</div></div>${v.st === "pending" ? `<div class="rvact"><input class="rvnote" data-rv="${v.id}" placeholder="Note (required for changes)"><button type="button" class="mini primary" data-rvdec="approve" data-rv="${v.id}">Approve</button><button type="button" class="mini danger" data-rvdec="changes" data-rv="${v.id}">Request changes</button></div>` : ""}</div>`).join("") : '<span class="muted">No review requested. While a review is pending or has requested changes this task cannot be marked done.</span>') +
+      $("rvbox").innerHTML = (r.i.length ? r.i.map(v => `<div class="rvrow"><div><b>${esc(v.to)}</b>${v.kind ? ' <span class="chip">approval</span>' : ""} <span class="badge ${v.st === "approved" ? "teal" : v.st === "changes" ? "red" : ""}">${esc(v.st === "changes" ? "changes requested" : v.st)}</span><div class="muted">requested by ${esc(v.from)} · ${esc(ago(v.c))} ago${v.note ? " — " + esc(v.note) : ""}${v.dn ? "<br>Reviewer: " + esc(v.dn) : ""}</div></div>${v.st === "pending" ? `<div class="rvact"><input class="rvnote" data-rv="${v.id}" placeholder="Note (required for changes)"><button type="button" class="mini primary" data-rvdec="approve" data-rv="${v.id}">Approve</button><button type="button" class="mini danger" data-rvdec="changes" data-rv="${v.id}">Request changes</button></div>` : ""}</div>`).join("") : '<span class="muted">No review requested. While a review is pending or has requested changes this task cannot be marked done.</span>') +
         `<div class="filesadd"><input id="rvto" placeholder="Reviewer (agent or person)"><input id="rvn" placeholder="What should they look at?"><button type="button" class="mini primary" id="rvreq">Request review</button></div>`;
     };
     $("f").addEventListener("click", async e => {
@@ -1139,9 +1158,10 @@ async function openTask(id, boardId) {
 
 // ---- Today: what needs a person ----
 const NEED_TONE = {"blocked-p12": "bad", "sprint-red": "bad", "sla-breach": "bad", "silent-agent": "warn", "owner-wait": "warn", "human-wait": "warn", stale: "warn", "unassigned-p12": "warn", budget: "warn", "wip-exceeded": "warn", "aging-wip": "warn",
-  "ask-overdue": "info", "review-stale": "info", "dep-cross": "info", declined: "info"};
+  "ask-overdue": "info", overdue: "bad", "due-soon": "info", "approval-wait": "warn", "review-stale": "info", "dep-cross": "info", declined: "info"};
 const NEED_ICON = {bad: "M12 8v5M12 16.5v.5M10.3 4.5L3 17.5A2 2 0 0 0 4.7 20.5h14.6a2 2 0 0 0 1.7-3L13.7 4.5a2 2 0 0 0-3.4 0z", warn: "M12 7v5l3 2M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z", info: "M12 11v5M12 8v.5M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z"};
 function agentState(a, by) {
+  if (a.q) return {k: "quota", label: "Quota", cls: "warn"};
   if (a.silent) return {k: "silent", label: "Silent", cls: "red"};
   if (by.blocked && !by.in_progress) return {k: "blocked", label: "Blocked", cls: "red"};
   if (by.in_progress) return {k: "working", label: "Working", cls: "teal"};
@@ -1161,7 +1181,7 @@ async function renderToday() {
       <div class="needact">${first ? `<button type="button" class="mini primary" data-open="${first}">Open #${first}</button>` : `<button type="button" class="mini primary" data-go="overview">Open overview</button>`}${r.k === "budget" ? '<button type="button" class="mini" data-go="overview">View spend</button>' : r.k === "silent-agent" ? '<button type="button" class="mini" data-go="agents">Agents</button>' : ""}</div></div>`;
   };
   const people = ((ag && ag.i) || []).map(a => ({a, st: agentState(a, by[a.n.toLowerCase()] || {})})).sort((x, y) => ["blocked", "silent", "working", "idle"].indexOf(x.st.k) - ["blocked", "silent", "working", "idle"].indexOf(y.st.k)).slice(0, 6);
-  const doing = a => { const c = B && B.tasks.find(x => (x.assignee || "").toLowerCase() === a.n.toLowerCase() && x.status === "in_progress"); return c ? `#${c.id} ${c.title}` : (a.stx || (a.seen ? "last seen " + ago(a.seen) + " ago" : "never seen")); };
+  const doing = a => { if (a.q) return "quota until " + a.q.slice(11, 16) + " UTC" + (a.qn ? " (" + a.qn + ")" : ""); const c = B && B.tasks.find(x => (x.assignee || "").toLowerCase() === a.n.toLowerCase() && x.status === "in_progress"); return c ? `#${c.id} ${c.title}` : (a.stx || (a.seen ? "last seen " + ago(a.seen) + " ago" : "never seen")); };
   const sps = (d.boards || []).filter(b => b.sp);
   el.innerHTML = `<div class="pad today">
     <section class="panel" aria-labelledby="needs"><h2 id="needs">Needs you <span class="badge ${(d.attention || []).length ? "red" : "green"}">${(d.attention || []).length}</span></h2>
@@ -1241,6 +1261,13 @@ function msgDlg(to) {
     async d => { localStorage.tb_from = d.as; const body = {to: d.to, c: d.c, as: d.as}; if (d.task) body.task = +d.task; const r = await api("POST", "/messages", body); toast(`Sent to ${r.n} recipient(s)`); if (view === "agents") renderAgents(); }, "", "Send");
 }
 
+function mediaPrev(a) {                                   // images, video and audio show inline (the hosting site must be listed under Admin > Budgets > media hosts when the server restricts them)
+  if (!/^https:\/\//.test(a.u || "")) return "";
+  if (a.k === "image") return `<img class="fprev" src="${esc(a.u)}" alt="${esc(a.n)}" loading="lazy">`;
+  if (a.k === "video") return `<video class="fprev" src="${esc(a.u)}" controls preload="metadata"></video>`;
+  if (a.k === "audio") return `<audio class="fapre" src="${esc(a.u)}" controls preload="none"></audio>`;
+  return "";
+}
 function codeBox(t) {
   const cm = t.commits || [], pr = /^https:\/\//.test(t.pr_url || "");
   if (!pr && !cm.length && !t.cost) return "";
@@ -1277,12 +1304,22 @@ function chatDlg() {
     }, "", "Add channel");
 }
 
+async function loadAudit(f) {
+  const box = $("auditbox"); if (!box) return;
+  const q = new URLSearchParams(Object.entries(f || {}).filter(([, v]) => v !== "")); q.set("limit", "100");
+  try {
+    const r = await api("GET", "/audit?" + q);
+    box.innerHTML = r.i.length ? `<table class="tb"><tr><th>When</th><th>Who</th><th>What</th><th>Board</th><th>Task</th><th>Change</th></tr>${r.i.map(x => `<tr><td class="muted nowrap">${esc(x.ts.slice(5, 16))}</td><td>${esc(x.by)}</td><td><span class="mono">${esc(x.ty)}</span></td><td>${esc(x.bn || "")}</td><td>${x.ty.startsWith("task.") && x.e ? `<button type="button" class="link" data-open="${x.e}"><span class="mono">#${x.e}</span></button>` : x.e ? `<span class="mono">#${x.e}</span>` : ""}</td><td class="muted">${esc(x.m || "")}</td></tr>`).join("")}</table>` : '<span class="muted">Nothing matches.</span>';
+  } catch (_) { box.innerHTML = '<span class="muted">The audit log is for admins and supervisors.</span>'; }
+}
 async function adminExtras(e) {
   const t = e.target, b = t.closest("[data-chat]");
+  const op = t.closest("[data-open]"); if (op) { openTask(+op.dataset.open); return true; }
   const sn = t.closest("[data-admsec]");
   if (sn) {
     admSec = sn.dataset.admsec; try { localStorage.tb_adm = admSec; } catch (_) {}
     const body = $("v-admin").querySelector(".admbody"); if (body) body.dataset.cur = admSec;
+    if (admSec === "audit") loadAudit();
     $("v-admin").querySelectorAll("[data-admsec]").forEach(b => { b.classList.toggle("on", b === sn); b.toggleAttribute("aria-current", b === sn); });
     return true;
   }
@@ -1466,6 +1503,7 @@ ovEl.addEventListener("click", async e => {
 agEl.addEventListener("click", async e => {
   const i = e.target.closest("[data-inbox]"); if (i) return showInbox(i.dataset.inbox);
   const h = e.target.closest("[data-hook]"); if (h) return hookDlg(h.dataset.hook, h.dataset.url, h.dataset.cap, h.dataset.skills);
+  const cq = e.target.closest("[data-clearq]"); if (cq) { try { await api("POST", "/agents", {n: cq.dataset.clearq, quota_until: ""}); toast("Quota cleared"); renderAgents(); } catch (_) {} return; }
   const af = e.target.closest("[data-agf]"); if (af) { agFilter = af.dataset.agf; return renderAgents(); }
   const mg = e.target.closest("[data-msg]"); if (mg) return msgDlg(mg.dataset.msg);
   const wk = e.target.closest("[data-wake]"); if (wk) { try { const r = await api("POST", "/agents/wake", {n: wk.dataset.wake}); toast(`Wake-up sent: ${r.unread} unread, ${r.ready} ready task(s)`); } catch (_) {} return; }

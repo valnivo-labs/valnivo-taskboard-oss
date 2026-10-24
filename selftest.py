@@ -984,3 +984,67 @@ assert len([g for g in got if g["agent"] == "Hooky" and g["n"]["ty"] == "msg.dir
 print("hook dedupe OK")
 import runpy; runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_parity.py"))
 print("v18 selftest OK")
+
+# ================= v20: runs, quota, daily limits, due dates, approvals, audit log =================
+st, rb = J("POST", "/boards", {"n": "Runs board"}); RB = rb["id"]
+st, rt = J("POST", "/tasks", {"b": RB, "t": "run me", "as": "Runner One", "st": "todo", "pr": 2}); J("POST", f"/tasks/{rt['id']}/claim", {"as": "Runner One"})
+r1 = J("POST", "/runs", {"as": "Runner One", "task": rt["id"], "runtime": "claude", "job": "j1", "log": "https://logs.example.com/j1"})[1]; assert r1["st"] == "running", r1
+assert [x["rt"] for x in J("GET", f"/tasks/{rt['id']}/runs")[1]["i"]] == ["claude"] and J("GET", f"/runs/{r1['id']}")[1]["job"] == "j1"
+assert "running a claude job" in [a for a in J("GET", "/agents")[1]["i"] if a["n"] == "Runner One"][0].get("stx", "")                 # visible on the agent
+assert J("POST", f"/runs/{r1['id']}/end", {"st": "ok", "out": "x"}, tok="wtok")[0] == 403                                                    # only its agent (or a supervisor) ends it
+e = J("POST", f"/runs/{r1['id']}/end", {"as": "Runner One", "st": "ok", "out": "built it", "usd": 0.2, "tokens": 1000, "comment": True})[1]
+assert e["st"] == "ok" and e["usd"] == 0.2 and e["secs"] >= 0, e
+assert J("GET", f"/tasks/{rt['id']}")[1]["cs"] == 0.2 and any("Run ok" in c["c"] for c in J("GET", f"/tasks/{rt['id']}?ctx=1")[1]["cc"])
+assert J("POST", f"/runs/{r1['id']}/end", {"as": "Runner One", "st": "failed"})[1]["st"] == "ok"                                              # ending twice changes nothing
+J("GET", "/inbox?as=Sup%20Bot&ack=1")
+r2 = J("POST", "/runs", {"as": "Runner One", "task": rt["id"], "runtime": "grok"})[1]; J("POST", f"/runs/{r2['id']}/end", {"as": "Runner One", "st": "failed", "out": "boom"})
+assert any(n["ty"] == "esc.run-failed" and "boom" in n["m"] for n in J("GET", "/inbox?as=Sup%20Bot&ack=1")[1]["i"]) and any("Run failed" in c["c"] for c in J("GET", f"/tasks/{rt['id']}?ctx=1")[1]["cc"])
+assert J("POST", "/runs", {"as": "Runner One", "runtime": "x"}, tok="vtok")[0] == 403 and J("POST", "/runs", {"as": "Runner One", "task": 999999})[1]["e"] == "nf" and J("POST", f"/runs/{r1['id']}/end", {"st": "weird"})[1]["e"] == "bad"
+# quota: the agent is told, work is not handed to it, and it clears
+J("POST", "/agents", {"n": "Runner One", "skills": "quotaskill"}); r3 = J("POST", "/runs", {"as": "Runner One", "runtime": "claude"})[1]
+assert J("POST", f"/runs/{r3['id']}/end", {"as": "Runner One", "st": "quota", "out": "5h limit", "quota_min": 30})[1]["st"] == "quota"
+ra = [a for a in J("GET", "/agents")[1]["i"] if a["n"] == "Runner One"][0]; assert ra["q"] > "2000" and ra["qn"] == "5h limit", ra
+assert J("POST", "/runs", {"as": "Runner One"})[1]["e"] == "quota" and J("POST", "/runs", {"as": "Runner One"})[0] == 429
+assert J("POST", "/next", {"as": "Runner One"})[1].get("quota") == ra["q"] and J("POST", f"/tasks/{rt['id']}/claim", {"as": "Runner One"})[1]["e"] == "quota"
+assert "Runner One" not in [c["n"] for c in J("GET", "/route?skill=quotaskill")[1]["i"]]                                                         # routing skips it
+J("POST", "/agents", {"n": "Runner One", "quota_until": ""}); assert "q" not in [a for a in J("GET", "/agents")[1]["i"] if a["n"] == "Runner One"][0] and J("POST", "/runs", {"as": "Runner One"})[0] == 201
+# daily limits
+J("POST", "/settings", {"agent_limits": json.dumps({"Capped": {"jobs": 2}})}); assert J("POST", "/settings", {"agent_limits": "[1]"})[1]["e"] == "bad" and J("POST", "/settings", {"agent_limits": '{"x": {"nope": 1}}'})[1]["e"] == "bad"
+assert [J("POST", "/runs", {"as": "Capped", "runtime": "claude"})[0] for _ in range(3)] == [201, 201, 429]
+J("POST", "/settings", {"agent_limits": json.dumps({"*": {"usd": 1}})}); J("POST", "/cost", {"as": "Spender", "usd": 1.5}); assert J("POST", "/runs", {"as": "Spender"})[1]["e"] == "limit" and J("POST", "/runs", {"as": "Spender"})[1]["f"] == "usd"
+J("POST", "/settings", {"agent_limits": ""})
+assert len(J("GET", "/runs?agent=Capped")[1]["i"]) == 2 and J("GET", "/runs?st=quota")[1]["i"][0]["ag"] == "Runner One"
+# due dates: validated, listed, ordered, escalated
+st, d1 = J("POST", "/tasks", {"b": RB, "t": "due later", "st": "todo", "pr": 1, "lb": "duetest"}); st, d2 = J("POST", "/tasks", {"b": RB, "t": "due sooner", "st": "todo", "pr": 1, "lb": "duetest", "du": "2030-01-01"})
+assert J("PATCH", f"/tasks/{d1['id']}", {"du": "tomorrow"})[1]["e"] == "bad" and J("GET", f"/tasks/{d2['id']}")[1]["du"] == "2030-01-01"
+assert J("POST", "/next", {"as": "Dueman", "lb": "duetest"})[1]["id"] == d2["id"]                                                              # same priority: the task with a due date first
+J("PATCH", f"/tasks/{d1['id']}", {"du": "2020-01-01"}); assert d1["id"] in [t["id"] for t in J("GET", "/tasks?overdue=1&limit=500")[1]["i"]] and d2["id"] not in [t["id"] for t in J("GET", "/tasks?overdue=1&limit=500")[1]["i"]]
+assert any(i["k"] == "overdue" and i["sev"] == "high" and d1["id"] in i["ids"] for i in J("GET", f"/attention?b={RB}")[1]["i"])
+# approvals
+st, ap = J("POST", "/tasks", {"b": RB, "t": "deploy it", "as": "Worker", "st": "in_progress"}); J("GET", "/inbox?as=Sup%20Bot&ack=1"); J("GET", "/inbox?as=Worker&ack=1")
+a1 = J("POST", f"/tasks/{ap['id']}/approval", {"action": "deploy to production", "note": "v2", "to": "Sup Bot"}, tok="wtok")[1]; assert a1["kind"] == "approval" and a1["to"] == "Sup Bot", a1
+g = J("GET", f"/tasks/{ap['id']}")[1]; assert g["st"] == "blocked" and g["bl"].startswith("waiting for approval: deploy"), g
+assert any(n["ty"] == "approval.requested" and n["do"].startswith("decide_review") for n in J("GET", "/inbox?as=Sup%20Bot&ack=1")[1]["i"])
+assert J("PATCH", f"/tasks/{ap['id']}", {"st": "done"})[1]["e"] in ("review", "dod") and any(i["k"] == "approval-wait" for i in J("GET", f"/attention?b={RB}")[1]["i"])
+assert J("POST", f"/reviews/{a1['id']}/decide", {"decision": "approve"}, tok="wtok")[0] == 403                                                  # the asker cannot approve itself
+assert J("POST", f"/reviews/{a1['id']}/decide", {"decision": "approve"}, tok="stok")[1]["st"] == "approved"
+g = J("GET", f"/tasks/{ap['id']}")[1]; assert g["st"] == "in_progress" and "bl" not in g and any(n["ty"] == "approval.granted" for n in J("GET", "/inbox?as=Worker&ack=1")[1]["i"]), g
+a2 = J("POST", f"/tasks/{ap['id']}/approval", {"action": "delete the old bucket", "to": "Sup Bot"}, tok="wtok")[1]
+assert J("POST", f"/reviews/{a2['id']}/decide", {"decision": "changes"}, tok="stok")[1]["e"] == "missing"
+J("POST", f"/reviews/{a2['id']}/decide", {"decision": "changes", "note": "not before Friday"}, tok="stok"); g = J("GET", f"/tasks/{ap['id']}")[1]
+assert g["st"] == "blocked" and g["bl"] == "approval denied: not before Friday" and any(n["ty"] == "approval.denied" for n in J("GET", "/inbox?as=Worker&ack=1")[1]["i"]), g
+assert J("POST", f"/tasks/{ap['id']}/approval", {"to": "x"}, tok="wtok")[1]["e"] == "missing"
+# audit log
+au = J("GET", "/audit?limit=20")[1]; assert au["n"] > 0 and {"ts", "by", "ty"} <= set(au["i"][0]) and J("GET", "/audit", tok="wtok")[0] == 403
+assert all(x["ty"].startswith("run.") for x in J("GET", "/audit?type=run.&limit=10")[1]["i"]) and J("GET", "/audit?type=run.&limit=10")[1]["n"] >= 2
+assert all(x.get("e") == ap["id"] for x in J("GET", f"/audit?task={ap['id']}&limit=10")[1]["i"]) and J("GET", f"/audit?task={ap['id']}")[1]["n"] >= 2
+# the tools
+rs_ = mcp_as("wtok", "all", "run_start", {"runtime": "codex", "job": "m1"}); assert rs_["st"] == "running"
+assert mcp_as("wtok", "all", "run_end", {"id": rs_["id"], "st": "stopped", "out": "cancelled"})["st"] == "stopped" and mcp_as("wtok", "all", "runs", {"agent": "Worker"})["i"][0]["rt"] == "codex"
+assert mcp_as("wtok", "all", "request_approval", {"id": ap["id"], "action": "spend $50", "to": "Sup Bot"})["kind"] == "approval" and mcp_as("tok", "all", "audit", {"limit": 3})["n"] == 3 and mcp_as("wtok", "all", "audit", {})["e"] == "forbidden"
+if hasattr(server, "SEC_HEADERS"):                                                                                                       # hardened edition: media hosts widen the CSP, nothing else
+    assert J("POST", "/settings", {"media_hosts": "http://x"})[1]["e"] == "bad" and J("POST", "/settings", {"media_hosts": "https://media.example.com, https://cdn.example.org:8443"})[1]["media_hosts"]
+    server._media["t"] = 0; rq = urllib.request.urlopen(urllib.request.Request(U.replace("/api", "") + "/", headers={})); csp = rq.headers["Content-Security-Policy"]
+    assert "img-src 'self' data: https://media.example.com https://cdn.example.org:8443" in csp and "media-src 'self' https://media.example.com" in csp and "script-src 'self';" in csp, csp
+    J("POST", "/settings", {"media_hosts": ""})
+print("v20 selftest OK")
