@@ -64,6 +64,18 @@ def goto(page, hash_="", view="board", scope=None):
     page.click('#tabs [data-view="%s"]' % view)
 
 
+def click_until(page, click_sel, expect_sel, tries=4):
+    """Click, and click again if the page re-rendered under the pointer (live updates redraw lists) and nothing happened."""
+    for i in range(tries):
+        page.click(click_sel)
+        try:
+            page.wait_for_selector(expect_sel, timeout=3000)
+            return
+        except Exception:
+            if i == tries - 1:
+                raise
+
+
 def toast_text(page):
     page.wait_for_selector("#toast:not([hidden])")
     return page.inner_text("#toast")
@@ -230,8 +242,7 @@ def test_today_is_the_start_screen(page):
     page.goto("%s/?token=%s" % (URL, ADMIN))                                         # a fresh browser lands on Today
     page.wait_for_selector("#v-today .needrow")
     assert "blocked" in page.inner_text("#v-today").lower() and page.locator("#v-today .tile").count() >= 4
-    page.click("#v-today .needrow [data-open]")
-    page.wait_for_selector("#dlg.drawer[open]")                                      # tasks open in a side drawer
+    click_until(page, "#v-today .needrow [data-open]", "#dlg.drawer[open]")          # tasks open in a side drawer
     assert page.locator("#dlg").bounding_box()["x"] > 400
 
 
