@@ -348,8 +348,9 @@ def main():
                 ctx = browser.new_context(viewport={"width": 1360, "height": 900})
                 page = ctx.new_page()
                 page.set_default_timeout(10000)
-                errs = []
+                errs, logs = [], []
                 page.on("pageerror", lambda e: errs.append(str(e)))
+                page.on("console", lambda m: logs.append("%s: %s" % (m.type, m.text[:200])) if m.type in ("error", "warning") else None)
                 try:
                     fn(page)
                     assert not errs, "page errors: %s" % errs[:2]
@@ -358,6 +359,11 @@ def main():
                     failed.append(fn.__name__)
                     print("FAIL ", fn.__name__)
                     traceback.print_exc()
+                    print("      page errors:", errs[:5], "console:", logs[:6])
+                    try:
+                        print("      url:", page.url, "| view:", page.evaluate("localStorage.tb_view"), "| dialog open:", page.evaluate("document.getElementById('dlg').open"), "| toast:", page.evaluate("(document.getElementById('toast') || {}).textContent"))
+                    except Exception:
+                        pass
                     try:
                         page.screenshot(path=os.path.join(tmp, fn.__name__ + ".png"))
                         print("      screenshot:", os.path.join(tmp, fn.__name__ + ".png"))
