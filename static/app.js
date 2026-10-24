@@ -223,7 +223,7 @@ function card(t) {
     ${lbs.length ? `<div class="labels">${lbs.map(l => `<span class="lbl">${esc(lbShow(l))}</span>`).join("")}</div>` : ""}
     ${links.length || meta.length ? `<div class="m links">${links.join("")}${meta.join("")}</div>` : ""}
     ${cms ? `<div class="cms">${cms}</div>` : ""}
-    ${acts.length ? `<div class="acts">${acts.join("")}</div>` : ""}
+    ${acts.length ? `<div class="acts${own ? "" : " over"}">${acts.join("")}</div>` : ""}
     <div class="m">${t.channel ? `<span class="chip chan" title="Area" style="--h:${hue(t.channel.toLowerCase())}">${esc(t.channel)}</span>` : ""}${ag ? '<span class="chip agent">agent</span>' : ""}</div>
     <div class="foot">${t.assignee ? `<span class="avatar${ag ? " ag" : ""}" aria-hidden="true">${esc(initials(t.assignee))}</span><span class="who">${esc(t.assignee)}</span>` : '<span class="avatar noone" aria-hidden="true">–</span><span class="who muted">Unassigned</span>'}<span class="id">#${t.id}</span></div>
   </article>`;
@@ -1351,7 +1351,8 @@ async function adminExtras(e) {
 // ---- bulk actions ----
 function bulkBar() {
   const el = $("bulkbar");
-  if (view !== "board" || !picked.size) { el.hidden = true; return; }
+  if (view !== "board" || !picked.size) { el.hidden = true; document.body.classList.remove("bulk-on"); return; }
+  document.body.classList.add("bulk-on");
   const people = [...new Set(B.tasks.map(x => x.assignee).filter(Boolean))];
   el.hidden = false;
   el.innerHTML = `<b>${picked.size} selected</b>
