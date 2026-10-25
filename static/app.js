@@ -198,8 +198,8 @@ function card(t) {
   if (t.accept && (t.status === "done" || t.status === "review")) meta.push(t.verified_by ? `<span class="chip vok" title="Checked against the acceptance criteria by ${esc(t.verified_by)}">✓ verified</span>` : `<span class="chip vno" title="Reported complete, not yet checked by someone else">not verified</span>`);
   if (t.pipeline) { const ps = pipeOf(t); if (ps.length) meta.push(`<span class="chip" title="Pipeline stage">${t.stage > ps.length ? "pipeline done" : t.stage ? "stage " + t.stage + "/" + ps.length + " · " + esc(ps[t.stage - 1].name) : "pipeline not started"}</span>`); }
   if (t.type && t.type !== "task") meta.push(`<span class="chip ty ${esc(t.type)}">${esc(t.type)}</span>`);
-  if (t.parent) { const ep = B && B.tasks.find(y => y.id == t.parent); meta.push(`<span class="chip epic" title="Epic">epic: ${ep ? esc(ep.title.slice(0, 18)) : "#" + t.parent}</span>`); }
-  if (t.type === "epic" && B) { const ks = B.tasks.filter(y => y.parent == t.id); if (ks.length) meta.push(`<span class="chip" title="Epic progress">${ks.filter(y => y.status === "done").length}/${ks.length} done</span>`); }
+  if (t.parent) { const ep = B && B.tasks.find(y => y.id == t.parent); meta.push(`<span class="chip epic" title="Belongs to this ${ep ? esc(ep.type) : "epic"}">${ep ? esc(ep.type) : "epic"}: ${ep ? esc(ep.title.slice(0, 18)) : "#" + t.parent}</span>`); }
+  if ((t.type === "epic" || t.type === "story") && B) { const [dn_, tot_] = rollupOf(B.tasks, t.id); if (tot_) meta.push(`<span class="chip" title="Work items below it that are done">${dn_}/${tot_} done</span>`); }
   if (meth().sla && t.status !== "done" && t.status !== "declined" && t.created) {
     const sla = ({1: 4, 2: 24, 3: 72, 4: 168, ...(bcfg().sla_hours || {})})[t.priority] || 72, left = sla - (Date.now() - Date.parse(t.created.replace(" ", "T") + "Z")) / 3600000;
     meta.push(`<span class="chip sla ${left < 0 ? "bad" : left < sla * 0.25 ? "warn" : "ok"}" title="Response target ${sla}h">${left < 0 ? "SLA breached " + hrs(-left) : "SLA " + hrs(left) + " left"}</span>`);
@@ -319,6 +319,26 @@ function pipeBox(t) {
     : `<input id="pgn" placeholder="Note (required to send back)"><button type="button" class="mini primary" id="pgd">Pass on</button>${s.gate === "review" && cur > 1 ? '<button type="button" class="mini" id="pgr">Send back</button>' : ""}`;
   return `<div class="pipe"><label>Pipeline <span class="muted">(${done ? "finished" : cur ? "stage " + cur + " of " + ps.length : "not started"})</span></label><div class="stages">${strip}</div><div class="vf">${ctl}</div></div>`;
 }
+// ---- epic > story > task
+const LEAF = ["task", "bug", "spike", "chore"];
+const TYPE_TPL = {story: "As a …, I want …, so that …\n", bug: "Steps to reproduce:\n1. \n\nExpected:\n\nActual:\n", spike: "Question to answer:\n\nTime box:\n\nOutput (a decision or findings):\n", epic: "Outcome we want:\n\nHow we will know it worked:\n"};
+const kidsOf = (ts, id) => ts.filter(y => y.parent == id);
+function rollupOf(ts, id) {                       // [done, total] over the work items below it (declined work is not counted)
+  const out = [], walk = pid => kidsOf(ts, pid).forEach(k => { const sub = kidsOf(ts, k.id); if (sub.length) walk(k.id); else if (k.status !== "declined") out.push(k); });
+  walk(id); return [out.filter(k => k.status === "done").length, out.length];
+}
+function parentOpts(ts, bid, self, type, cur) {
+  const ok = x => x.board_id == bid && x.id != self && (type === "epic" ? false : type === "story" ? x.type === "epic" : x.type === "epic" || x.type === "story");
+  return '<option value="">none</option>' + ts.filter(ok).map(x => `<option value="${x.id}" ${x.id == cur ? "selected" : ""}>${esc(x.type)} #${x.id} ${esc(x.title)}</option>`).join("");
+}
+function kidsBox(t, ts) {
+  if (!t.id || (t.type !== "epic" && t.type !== "story")) return "";
+  const ks = kidsOf(ts, t.id), [d, n] = rollupOf(ts, t.id);
+  return `<div class="kidsbox"><label>${t.type === "epic" ? "Stories and tasks" : "Tasks"} under this <span class="muted">${n ? d + " of " + n + " done" : "none yet"}</span></label>
+    ${ks.length ? ks.map(k => `<div class="kidrow"><span class="chip ty ${esc(k.type || "task")}">${esc(k.type || "task")}</span><button type="button" class="link" data-open="${k.id}">#${k.id} ${esc(k.title)}</button><span class="muted">${esc(LBL[k.status] || k.status)}${k.assignee ? " · " + esc(k.assignee) : " · unassigned"}</span></div>`).join("") : ""}
+    <div class="vf"><button type="button" class="mini" id="addkid" data-pt="${t.id}" data-ty="${t.type === "epic" ? "story" : "task"}">+ Add ${t.type === "epic" ? "a story" : "a task"} under this</button>${t.type === "epic" ? `<button type="button" class="mini" id="addkid2" data-pt="${t.id}" data-ty="task">+ Add a task</button>` : ""}</div></div>`;
+}
+
 function colHtml(s, ts) {
   const c = ts.filter(t => t.status === s).sort((x, y) => x.priority - y.priority || x.id - y.id);
   const lim = meth().wip ? (bcfg().wip || {})[s] : 0, over = lim && c.length > lim;
@@ -1064,13 +1084,13 @@ function handoffDlg(id) {
     "", "Hand off");
 }
 
-function taskDlg(id, status, title, boardId, pri) {
+function taskDlg(id, status, title, boardId, pri, pre) {
   if (!B) return;
   if (!id && B.multi && !boardId) return dlg(`<h3>New task</h3><label>Which board?<select name="b">${B.boardIds.map(i => `<option value="${i}">${esc(BS[i].name)}</option>`).join("")}</select></label>`,
     async d => { setTimeout(() => taskDlg(0, status, title, +d.b), 60); }, "", "Continue");
   const sp = $("sprint").value;
   const t = (id && B.tasks.find(x => x.id == id)) ||
-    {status: status || "todo", priority: pri || 3, kind: "agent", title: title || "", sprint_id: sp > 0 ? +sp : ""};
+    {status: status || "todo", priority: pri || 3, kind: "agent", title: title || "", sprint_id: sp > 0 ? +sp : "", ...(pre || {})};
   const people = [...new Set(B.tasks.map(x => x.assignee).filter(Boolean))];
   const bid = id ? t.board_id : (boardId || B.id), bd = BS[bid] || B;
   if (!id && !t.sprint_id && $("sprint").value !== "none") {      // viewing "No sprint" keeps it sprintless; otherwise land where the team is working
@@ -1093,7 +1113,8 @@ function taskDlg(id, status, title, boardId, pri) {
     <div class="row2"><label>Sprint<select name="sprint_id"><option value="">none</option>${bd.sprints.map(s => `<option value="${s.id}" ${s.id == t.sprint_id ? "selected" : ""}>${esc(s.name)}</option>`).join("")}</select></label>
     <label>Area / project (optional)<input name="channel" list="chl" placeholder="e.g. backend, docs" value="${esc(t.channel || lastChannel())}"><datalist id="chl">${[...new Set([...CHANNELS, ...B.tasks.map(x => x.channel).filter(Boolean)])].map(c => `<option value="${esc(c)}">`).join("")}</datalist></label></div>
     <div class="row2"><label>Type<select name="type">${TYPES.map(x => `<option value="${x}" ${x === (t.type || "task") ? "selected" : ""}>${x}</option>`).join("")}</select></label>
-    <label>Epic<select name="parent"><option value="">none</option>${B.tasks.filter(x => x.type === "epic" && x.board_id == bid && x.id != id).map(x => `<option value="${x.id}" ${x.id == t.parent ? "selected" : ""}>#${x.id} ${esc(x.title)}</option>`).join("")}</select></label></div>
+    <label>Belongs to <span class="muted">(an epic, or a story)</span><select name="parent">${parentOpts(B.tasks, bid, id, t.type || "task", t.parent)}</select></label></div>
+    ${kidsBox(t, B.tasks)}
     <div class="row2"><label>Depends on (task ids, any board)<input name="depends" value="${esc(csv(t.depends).join(", "))}" placeholder="e.g. 12, 15"><input id="dpq" class="dpq" list="dpl" placeholder="Search a task on any board to add it" autocomplete="off"><datalist id="dpl"></datalist></label>
     <label>Points (estimate)<input type="number" name="points" min="0" max="1000" value="${t.points || ""}"></label></div>
     <div class="row2"><label>Due date<input type="date" name="due" value="${esc(t.due || "")}"></label><span></span></div>
@@ -1163,6 +1184,16 @@ function taskDlg(id, status, title, boardId, pri) {
         f.value = ids.join(", "); dq.value = ""; dirty = true;
       };
     }
+  }
+  {
+    const f_ = $("f"), ty_ = f_.querySelector("[name=type]"), pa_ = f_.querySelector("[name=parent]"), ds_ = f_.querySelector("[name=description]");
+    let tpl_ = "";
+    ty_.addEventListener("change", () => {
+      pa_.innerHTML = parentOpts(B.tasks, bid, id, ty_.value, pa_.value); if (ty_.value === "epic") pa_.value = "";
+      if (!id && ds_ && (ds_.value.trim() === "" || ds_.value === tpl_)) { tpl_ = TYPE_TPL[ty_.value] || ""; ds_.value = tpl_; }
+    });
+    if (!id && ds_ && !ds_.value.trim() && TYPE_TPL[t.type || "task"]) { ds_.value = tpl_ = TYPE_TPL[t.type]; }
+    f_.addEventListener("click", e => { const o = e.target.closest(".kidrow [data-open]"); if (o) { $("dlg").close(); dirty = false; openTask(+o.dataset.open); return; } const k = e.target.closest("[data-pt]"); if (k) { $("dlg").close(); dirty = false; taskDlg(0, "todo", "", bid, 3, {parent: +k.dataset.pt, type: k.dataset.ty, channel: t.channel}); } });
   }
   if (id) {
     api("GET", `/tasks/${id}/runs`).then(r => {

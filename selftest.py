@@ -394,7 +394,10 @@ assert cy["to"] == time.strftime("%Y-%m-%d", time.gmtime(time.time() + 42 * 8640
 # ---- epics / work item types
 st, ep = J("POST", "/tasks", {"b": S_, "t": "Big epic", "ty": "epic"}); assert ep["ty"] == "epic"
 st, ch = J("POST", "/tasks", {"b": S_, "t": "child story", "ty": "story", "pa": ep["id"]}); assert ch["pa"] == ep["id"]
-assert J("POST", "/tasks", {"b": S_, "t": "bad parent", "pa": ch["id"]})[1]["e"] == "bad"                     # parent must be an epic
+st, lf_ = J("POST", "/tasks", {"b": S_, "t": "a plain task"})
+assert J("POST", "/tasks", {"b": S_, "t": "bad parent", "pa": lf_["id"]})[1]["e"] == "bad"                      # a plain task cannot be a parent
+st, ep2_ = J("POST", "/tasks", {"b": K, "t": "other epic", "ty": "epic"}); st, sy2_ = J("POST", "/tasks", {"b": K, "t": "other story", "ty": "story", "pa": ep2_["id"]})
+assert J("POST", "/tasks", {"b": K, "t": "under a story", "pa": sy2_["id"]})[0] == 201                          # a story can have tasks
 assert J("POST", "/tasks", {"b": K, "t": "other board", "pa": ep["id"]})[1]["e"] == "bad"
 assert J("POST", "/tasks", {"b": S_, "t": "x", "ty": "wizard"})[1]["e"] == "bad"
 J("PATCH", f"/tasks/{ch['id']}", {"st": "done"})
@@ -1251,3 +1254,33 @@ assert fin["st"] == "done" and fin["sg"] == 4, fin
 assert J("GET", f"/tasks/{pid}/history")[1]["state"] in ("in_sync", "partial")
 assert J("GET", "/audit/verify")[1]["ok"]
 print("v27 before/after, drift, strict moves, pipelines OK")
+
+# v28 epic > story > task hierarchy, roll-up, "all done" notice, moves that carry the tree
+st, ep = J("POST", "/tasks", {"b": RB, "t": "epic H", "ty": "epic"})
+st, sy = J("POST", "/tasks", {"b": RB, "t": "story H", "ty": "story", "pa": ep["id"], "as": "Worker V"}); assert st == 201, sy
+mkc = lambda t, **k: J("POST", "/tasks", {"b": RB, "t": t, **k})[1]
+t1, t2, bg = mkc("task H1", pa=sy["id"]), mkc("task H2", pa=sy["id"]), mkc("bug H", ty="bug", pa=sy["id"])
+t3 = mkc("task H3", pa=ep["id"])
+assert all("e" not in x for x in (t1, t2, bg, t3))
+assert mkc("epic under epic", ty="epic", pa=ep["id"])["e"] == "bad" and mkc("story under story", ty="story", pa=sy["id"])["e"] == "bad"
+assert mkc("under a task", pa=t1["id"])["e"] == "bad" and mkc("epic with a parent", ty="epic", pa=ep["id"])["e"] == "bad"
+assert J("PATCH", f"/tasks/{sy['id']}", {"ty": "task"})[1]["e"] == "bad"                                 # it still has children
+assert J("PATCH", f"/tasks/{sy['id']}", {"pa": t1["id"]})[1]["e"] == "bad"                               # nothing goes under its own descendant
+assert J("PATCH", f"/tasks/{ep['id']}", {"pa": sy["id"]})[1]["e"] == "bad"
+assert J("GET", f"/tasks/{ep['id']}?ctx=1")[1]["prog"] == [0, 4] and J("GET", f"/tasks/{sy['id']}?ctx=1")[1]["prog"] == [0, 3]
+assert {k["ty"] for k in J("GET", f"/tasks/{sy['id']}?ctx=1")[1]["kids"]} == {"task", "bug"}
+for x in (t1, t2):
+    J("PATCH", f"/tasks/{x['id']}", {"st": "done"})
+assert J("GET", f"/tasks/{sy['id']}?ctx=1")[1]["prog"] == [2, 3] and not any("All " in c["c"] for c in J("GET", f"/tasks/{sy['id']}?ctx=1")[1].get("cc", []))
+J("PATCH", f"/tasks/{bg['id']}", {"st": "done"})
+assert any("All 3 items under this are done" in c["c"] for c in J("GET", f"/tasks/{sy['id']}?ctx=1")[1]["cc"])             # the story is told it is ready
+assert any(n["ty"] == "task.ready" and "story H" in n["m"] for n in J("GET", "/inbox?ack=0", tok=_wk)[1]["i"])
+J("PATCH", f"/tasks/{t3['id']}", {"st": "done"})
+assert any("All 4 items under this are done" in c["c"] for c in J("GET", f"/tasks/{ep['id']}?ctx=1")[1]["cc"]) and J("GET", f"/tasks/{ep['id']}?ctx=1")[1]["prog"] == [4, 4]
+J("PATCH", f"/tasks/{t1['id']}", {"st": "in_progress"}); J("PATCH", f"/tasks/{t1['id']}", {"st": "done"})
+assert len([c for c in J("GET", f"/tasks/{sy['id']}?ctx=1")[1]["cc"] if "All 3 items" in c["c"]]) == 1             # the notice is not repeated
+st, nb2 = J("POST", "/boards", {"n": "Tree target"}); NB2 = nb2["id"]
+assert J("POST", f"/tasks/{ep['id']}/move", {"board": NB2})[0] == 200
+mv = J("GET", f"/tasks/{t1['id']}")[1]
+assert mv["b"] == NB2 and mv["pa"] == sy["id"] and J("GET", f"/tasks/{sy['id']}")[1]["b"] == NB2 and J("GET", f"/tasks/{sy['id']}")[1]["pa"] == ep["id"], mv   # the whole tree moved and kept its links
+print("v28 hierarchy OK")

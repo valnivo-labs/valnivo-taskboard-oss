@@ -420,6 +420,25 @@ def test_pipeline_baton_and_strict_move_message(page):
         api("POST", "/settings", {"strict_moves": "0"})
 
 
+def test_story_holds_tasks_and_shows_progress(page):
+    b, _ = mkboard("Tree %d" % time.time())
+    ep = mktask(b, "tree epic", ty="epic")
+    sy = mktask(b, "tree story", ty="story", pa=ep)
+    done = mktask(b, "finished piece", pa=sy)
+    api("PATCH", "/tasks/%d" % done, {"st": "done"})
+    goto(page, scope="b:%d" % b)
+    page.wait_for_selector(".card[data-id='%d']:has-text('1/1 done')" % sy)
+    page.click(".card[data-id='%d'] .t" % sy)
+    page.click("#addkid")
+    page.wait_for_selector("#f [name=title]")
+    assert page.input_value("#f [name=parent]") == str(sy)
+    page.fill("#f [name=title]", "new piece under the story")
+    page.click("#dsave")
+    page.wait_for_selector(".card:has-text('new piece under the story')")
+    kid = [x for x in api("GET", "/tasks?b=%d&limit=50" % b)["i"] if x["t"] == "new piece under the story"][0]
+    assert kid["pa"] == sy and api("GET", "/tasks/%d?ctx=1" % sy)["prog"] == [1, 2]
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

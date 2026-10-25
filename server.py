@@ -797,6 +797,7 @@ def bulk_set_tasks(actor, body, full):
         notify_task(actor, old, rows("SELECT * FROM tasks WHERE id=?", (rid,))[0])
         if d.get("status") in ("done", "declined") and old["status"] not in ("done", "declined"):
             deps_released(actor, rid)
+            parent_ready(actor, rid)
         out.append({"id": rid, **delta} if not full else cdict("tasks", rows("SELECT * FROM tasks WHERE id=?", (rid,))[0], True))
     return {"n": len(out), "i": out} if not full else {"total": len(out), "items": out}
 
@@ -852,10 +853,10 @@ def crud(actor, method, table, rid, body, q, full):
             od = open_dep_ids(r["depends"])
             if od:
                 o["dpo"] = od
-            if r["type"] == "epic":
-                kids = rows("SELECT id, title, status FROM tasks WHERE parent=? ORDER BY id", (rid,))
-                o["kids"] = [{"id": k["id"], "t": k["title"], "st": k["status"]} for k in kids]
-                o["prog"] = [sum(1 for k in kids if k["status"] == "done"), len(kids)]
+            if r["type"] in ("epic", "story"):
+                kids = rows("SELECT id, title, status, type FROM tasks WHERE parent=? ORDER BY id", (rid,))
+                o["kids"] = [{"id": k["id"], "t": k["title"], "st": k["status"], "ty": k["type"]} for k in kids]
+                o["prog"] = rollup(rid)
             ats = atts_get(rid)["i"]
             if ats:
                 o["att"] = ats
@@ -874,8 +875,7 @@ def crud(actor, method, table, rid, body, q, full):
             if table == "tasks":
                 if d.get("status") == "declined" and not d.get("decline_reason"):
                     raise ApiError("missing", 400, "dr")
-                if d.get("parent"):
-                    check_parent(0, d["parent"], d["board_id"])
+                check_hier(0, d.get("type", "task"), d.get("parent"), d["board_id"])
                 _w = check_wip(d["board_id"], d.get("status", "backlog"), force=body.get("force"))
                 if str(d.get("assignee", "")).lower() == "auto":
                     cand = route_candidates("", d.get("labels", ""))
@@ -932,8 +932,8 @@ def crud(actor, method, table, rid, body, q, full):
                 _wip = None
                 if "status" in d and d["status"] != old["status"]:
                     _wip = check_wip(old["board_id"], d["status"], tid=rid, force=body.get("force"))
-                if "parent" in d:
-                    check_parent(rid, d["parent"], old["board_id"])
+                if "parent" in d or "type" in d:
+                    check_hier(rid, d.get("type", old["type"] or "task"), d["parent"] if "parent" in d else old["parent"], old["board_id"])
                 if d.get("status") in ("done", "declined"):
                     d["claimed_by"] = ""
                     d["claim_until"] = ""
@@ -986,6 +986,7 @@ def crud(actor, method, table, rid, body, q, full):
                 notify_task(actor, old, rows("SELECT * FROM tasks WHERE id=?", (rid,))[0])
                 if d.get("status") in ("done", "declined") and old["status"] not in ("done", "declined"):
                     deps_released(actor, rid)
+                    parent_ready(actor, rid)
             if full:
                 return cdict(table, rows(f"SELECT * FROM {table} WHERE id=?", (rid,))[0], True)
             res = {"id": rid, **{m[k]: (json.loads(v) if k == "commits" else v) for k, v in d.items() if k in m}}
@@ -1729,6 +1730,74 @@ def check_deps(tid, dep_csv):
             r = rows("SELECT depends FROM tasks WHERE id=?", (i,))
             if r:
                 stack += [int(x) for x in re.findall(r"\d+", r[0]["depends"] or "")]
+
+
+LEAF_TYPES = ("task", "bug", "spike", "chore")
+
+
+def check_hier(tid, ctype, parent, bid):
+    """Work nests as epic > story > task, bug, spike or chore. An epic has no parent, a story sits under an epic, a task sits under a story or an epic,
+    and only epics and stories can have children."""
+    if ctype == "epic" and parent:
+        raise ApiError("bad", 400, "pa")
+    if parent:
+        r = rows("SELECT id, board_id, type, parent FROM tasks WHERE id=?", (parent,))
+        if not r or r[0]["board_id"] != bid or (tid and parent == tid) or r[0]["type"] not in ("epic", "story"):
+            raise ApiError("bad", 400, "pa")
+        if (r[0]["type"] == "epic" and ctype == "epic") or (r[0]["type"] == "story" and ctype not in LEAF_TYPES):
+            raise ApiError("bad", 400, "pa")
+        up, seen = r[0]["parent"], set()
+        while up and up not in seen:                          # never under its own descendant
+            if up == tid:
+                raise ApiError("bad", 400, "pa")
+            seen.add(up)
+            nx = rows("SELECT parent FROM tasks WHERE id=?", (up,))
+            up = nx[0]["parent"] if nx else None
+    if tid and ctype not in ("epic", "story") and rows("SELECT id FROM tasks WHERE parent=? LIMIT 1", (tid,)):
+        raise ApiError("bad", 400, "ty")                      # it still has children, so it must stay an epic or a story
+
+
+def descendants(tid):
+    """Every task below `tid`, at any depth: [(id, type, status, parent)]."""
+    out, todo, seen = [], [tid], {tid}
+    while todo:
+        for r in rows("SELECT id, type, status, parent FROM tasks WHERE parent=? ORDER BY id", (todo.pop(),)):
+            if r["id"] not in seen:
+                seen.add(r["id"])
+                out.append((r["id"], r["type"], r["status"], r["parent"]))
+                todo.append(r["id"])
+    return out
+
+
+def rollup(tid):
+    """[done, total] over the work items below an epic or a story: the ones with nothing under them (declined work is not counted)."""
+    d = descendants(tid)
+    parents = {x[3] for x in d}
+    leaves = [x for x in d if x[0] not in parents and x[2] != "declined"]
+    return [sum(1 for x in leaves if x[2] == "done"), len(leaves)]
+
+
+def parent_ready(actor, tid):
+    """A task finished: when everything under a story or epic is done, say so on it and tell its assignee. Caller holds `lock`."""
+    seen = set()
+    up = rows("SELECT parent FROM tasks WHERE id=?", (tid,))
+    pid = up[0]["parent"] if up else None
+    while pid and pid not in seen:
+        seen.add(pid)
+        p = rows("SELECT * FROM tasks WHERE id=?", (pid,))
+        if not p:
+            break
+        p = p[0]
+        if p["status"] not in ("done", "declined"):
+            done, total = rollup(pid)
+            if total and done == total:
+                msg = "All %d items under this are done - ready to review and close." % total
+                last = rows("SELECT body FROM comments WHERE task_id=? ORDER BY id DESC LIMIT 1", (pid,))
+                if not last or last[0]["body"] != msg:
+                    cur = db.execute("INSERT INTO comments(task_id,actor,body) VALUES(?,?,?)", (pid, "system", msg))
+                    emit("system", "task.commented", pid, p["board_id"], {"cm_id": cur.lastrowid})
+                    notify(p["assignee"], "task.ready", actor, pid, p["board_id"], "#%d '%s': %s" % (pid, p["title"][:60], msg), {"ready": 1})
+        pid = p["parent"]
 
 
 def deps_released(actor, tid):
@@ -4019,8 +4088,8 @@ def move_task(actor, tid, body):
     warns = []
     with lock:
         ids = [tid]
-        if t["type"] == "epic":
-            ch = [x["id"] for x in rows("SELECT id FROM tasks WHERE parent=? AND board_id=?", (tid, src))]
+        if t["type"] in ("epic", "story"):
+            ch = [x[0] for x in descendants(tid) if rows("SELECT id FROM tasks WHERE id=? AND board_id=?", (x[0], src))]
             if kids:
                 ids += ch
             elif ch:
@@ -4046,7 +4115,7 @@ def move_task(actor, tid, body):
             ns = None if m_["status"] in ("done", "declined") else (sprint if sprint is not None else (act[0]["id"] if act else None))
             if m_["id"] == tid:
                 main_sprint = ns
-            parent = m_["parent"] if m_["id"] != tid and t["type"] == "epic" else None
+            parent = m_["parent"] if m_["id"] != tid and t["type"] in ("epic", "story") else None
             db.execute("UPDATE tasks SET board_id=?, sprint_id=?, parent=?, dod_done=?, nudge='', updated=CURRENT_TIMESTAMP, version=COALESCE(version,1)+1 WHERE id=?",
                        (dest, ns, parent, m_["dod_done"] if same_dod else "", m_["id"]))
             db.execute("UPDATE docs SET board_id=? WHERE scope='task' AND ref_id=?", (dest, m_["id"]))
@@ -4337,7 +4406,7 @@ GUIDES = {
              "Blocked? set_task st=blocked bl=why bb=[ids]; ask {to,q,due} when you need an answer; handoff when someone else continues. Tick dn items before done if the board has a definition of done.",
     "reviewer": "Check finished work against the card's acceptance criteria (task brief=1 shows ac) and record it with verify {id,ok,note}; you cannot verify work you did. briefing shows review.requested items with do='decide_review id=N'. Read the task with task brief=1 and its attachments, then decide_review {id,decision:approve|changes,note}. changes needs a note and sends the task back. Do not set done yourself while a review is open.",
     "supervisor": "briefing returns att (needs attention) and rk (sprints at risk). Use portfolio tm=<type> for several boards, attention for the list, risks, agent_stats for load. Escalations arrive as esc.* items. Unblock by reassigning (set_task as=…), answering asks, or freeze_env/unfreeze_env. Force closes only when the gate is wrong.",
-    "planner": "Shape work as tasks with ty (story/epic/bug), pa (epic), pt (points), dp (dependencies), lb. Use specs for decisions (search first, append instead of rewrite). board_flow / board_velocity / okr / board_sla show how the method is going; set_board changes method and limits. Use as='auto' with a skill label to route.",
+    "planner": "Shape work as epic > story > task: ty (epic/story/task/bug/spike/chore), pa (parent: a story or epic; stories sit under epics), pt (points), dp (dependencies), lb. Use specs for decisions (search first, append instead of rewrite). board_flow / board_velocity / okr / board_sla show how the method is going; set_board changes method and limits. Use as='auto' with a skill label to route.",
 }
 
 

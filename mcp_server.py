@@ -383,7 +383,7 @@ SHORT = {
     "inbox": "Notifications (unread). Reading marks them read (ack=0 to peek). wait<=30 long-polls. Prefer briefing.",
     "claim": "Claim task id (ttl min): you become assignee, todo->in_progress. 409 claimed if held.",
     "set_task": "Patch task id. Keys: t d st pr(1-4) as k s bl bb lb ch pu sha dp pt ty pa dn cr tg ver. ver=v you read (409 on conflict). dn=ticked checklist idx.",
-    "add_task": "Create task. Keys: b(board) t d st pr as('auto'=route) k(human|agent) s bl bb lb ch pu sha dp pt ty(story|bug|epic..) pa(epic id).",
+    "add_task": "Create task. Keys: b(board) t d st pr as('auto'=route) k(human|agent) s bl bb lb ch pu sha dp pt ty(epic|story|task|bug|spike|chore) pa(parent id: an epic, or a story under an epic).",
     "tasks": "List tasks (default 25, table form). Filters: b tm bs s st(csv|open) as(~contains) k lb ch q ready=1 ty parent; fields=t,st,pr; limit offset d=1.",
     "task": "One task. brief=1 (~60 tokens) | ctx=1 (docs, comments, attachments, reviews) | default full.",
     "comment": "Comment on task id (c); notifies the assignee and to=[names].",
