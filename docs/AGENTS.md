@@ -179,3 +179,14 @@ Each board follows a preset, or the global default (Admin → Budgets) when it n
 - **Rules:** `strict_moves` (status moves follow the allowed paths; 409 `move`), `holder_only` (403 `holder`), `accept_before_start` (a story, task or bug needs criteria before work starts; 409 `accept`), `claim_to_start` (use `claim`, not a status change; 409 `claim`), `verify_before_done` (409 `verify`: have someone else `verify` it first), `require_parent` (400 `parent`: put the task under a story or epic).
 - **Per task:** `rg=standard|strict` asks for more than the board. Anyone can raise it; only a supervisor can lower it (403). A deep brief lists the `rules` that apply to the task, so read them before acting.
 - **New stories** can start with the board's own pipeline (`set_policy pipeline=` lines, stage 1 not started until someone calls `stage start`).
+
+## Proof, safety and operations
+
+- **Checks and proof:** a criterion line `check: tests_green` / `check: required_fields pr,sha` / `check: output_field name` / `check: pr_linked` is tested when you `finish` (409 `guard` says which failed). Other lines are for a person: say how each was met with `evidence {id, n, note, ref}` or `finish met=[{n,note,ref}]`; `n` is the line number. With the rule `evidence_before_review`, finishing needs a note for every such line (409 `evidence`).
+- **Secrets:** keys, tokens and `password: ...` in text are replaced with `[redacted]` (the answer says how many); setting `secret_guard=block` refuses them (400 `secret`), `off` leaves text alone.
+- **Retries:** send `Idempotency-Key: <6-120 chars>` on a POST; the same key on the same call returns the first answer (header `Idempotent-Replay: 1`) for 24 hours.
+- **Leases:** `claim` returns `lt`. Send it back with `finish` and `heartbeat`; if someone else claimed the task since, you get 409 `fenced`.
+- **Limits:** at most 50 children under one story or epic and 200 below the top of a tree (board policy can change them), 429 `limit`.
+- **Proposals, lessons, waits:** `propose`, `lesson` (also `finish lesson=`) and `wait {id, kind, owner, reason}` need no permission. A supervisor decides proposals (`decide_proposal`) and promotes lessons (`decide_lesson`, after the cooling period). `waits` lists who is waiting for whom.
+- **Machines:** with `node_admission=manual` a new machine is pending until `admit_node`; a retired one is refused. With `watermarks_on=1` a machine reporting `disk_pct` above 90 (high) or 95 (critical) opens one task on the board named Ops (or `ops_board`). `snapshot` writes `board.json` and `board.html` next to the database.
+- **Chat:** set `intake_secret` and `intake_senders`, then `POST /api/intake` with `{sender, text, message_id}` and header `X-Intake-Signature: sha256=<hmac of the body>`. Commands: `new <title>`, `status <id>`, `note <id> <text>`, `done <id> [note]`, `assign <id> <name>`, `help`.

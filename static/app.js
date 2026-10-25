@@ -12,6 +12,14 @@ const ERR_TXT = {
   holder: f => "Only " + (f || "the holder") + " can change this task right now.",
   independent: () => "Someone other than the worker has to verify this.",
   accept: () => "This board wants acceptance criteria written before work starts.",
+  guard: f => "A check on this card is not met yet: " + f,
+  evidence: f => "Say how criterion " + f + " was met (add proof) before finishing.",
+  secret: () => "That looks like a password or key. Remove it and try again.",
+  fenced: () => "Someone else has taken this task since you claimed it.",
+  limit: f => "Too many items under one story or epic (" + f + ").",
+  retired: () => "This machine was retired.",
+  cooling: f => "Too soon to promote: this lesson is still cooling until " + f + ".",
+  sender: () => "That chat user is not mapped to anyone.",
   claim: () => "Claim the task to start it; on this board it cannot just be moved to In progress.",
   verify: () => "Someone other than the worker has to verify this before it can be done.",
   parent: () => "On this board every task belongs to a story or an epic: pick one in Belongs to.",
@@ -19,7 +27,7 @@ const ERR_TXT = {
 };
 // short event keys -> full task/sprint/board fields
 const KM = {
-  task: {du: "due", cs: "cost", tk: "tokens", b: "board_id", s: "sprint_id", t: "title", d: "description", st: "status", pr: "priority", as: "assignee", k: "kind", u: "updated", bl: "blocker", bb: "blocked_by", lb: "labels", ch: "channel", w: "watch", sh: "short_url", vid: "video_id", at: "publish_at", pu: "pr_url", sha: "sha", cm: "commits", dp: "depends", pt: "points", cb: "claimed_by", cu: "claim_until", v: "version", dn: "dod_done", pl: "pipeline", sg: "stage", po: "play", nd: "needs", mk: "makes", rg: "rigor", ac: "accept", vb: "verified_by", va: "verified_at", vn: "verified_note", ty: "type", pa: "parent", tg: "target", cr: "current"},
+  task: {du: "due", cs: "cost", tk: "tokens", b: "board_id", s: "sprint_id", t: "title", d: "description", st: "status", pr: "priority", as: "assignee", k: "kind", u: "updated", bl: "blocker", bb: "blocked_by", lb: "labels", ch: "channel", w: "watch", sh: "short_url", vid: "video_id", at: "publish_at", pu: "pr_url", sha: "sha", cm: "commits", dp: "depends", pt: "points", cb: "claimed_by", cu: "claim_until", v: "version", dn: "dod_done", pl: "pipeline", sg: "stage", po: "play", nd: "needs", mk: "makes", rg: "rigor", wt: "waiting", lt: "lease", ac: "accept", vb: "verified_by", va: "verified_at", vn: "verified_note", ty: "type", pa: "parent", tg: "target", cr: "current"},
   sprint: {b: "board_id", n: "name", g: "goal", from: "start", to: "end", st: "state"},
   board: {n: "name", d: "description", tm: "team"},
 };
@@ -200,6 +208,7 @@ function card(t) {
   if (od.length) meta.push(`<span class="chip dep" title="Waiting on open dependencies">⛓ ${od.map(i => "#" + i).join(" ")}</span>`);
   if (B && B.multi && BS[t.board_id]) meta.unshift(`<span class="chip bd" style="--h:${hue(BS[t.board_id].name.toLowerCase())}" title="Board">${esc(BS[t.board_id].name)}</span>`);
   if (t.accept && (t.status === "done" || t.status === "review")) meta.push(t.verified_by ? `<span class="chip vok" title="Checked against the acceptance criteria by ${esc(t.verified_by)}">✓ verified</span>` : `<span class="chip vno" title="Reported complete, not yet checked by someone else">not verified</span>`);
+  if (t.waiting) { try { const w = JSON.parse(t.waiting); meta.push(`<span class="chip vno" title="${esc(w.k)}: ${esc(w.r)}">waiting: ${esc(w.o)}</span>`); } catch (_) {} }
   if (t.pipeline) { const ps = pipeOf(t); if (ps.length) meta.push(`<span class="chip" title="Pipeline stage">${t.stage > ps.length ? "pipeline done" : t.stage ? "stage " + t.stage + "/" + ps.length + " · " + esc(ps[t.stage - 1].name) : "pipeline not started"}</span>`); }
   if (t.type && t.type !== "task") meta.push(`<span class="chip ty ${esc(t.type)}">${esc(t.type)}</span>`);
   if (t.parent) { const ep = B && B.tasks.find(y => y.id == t.parent); meta.push(`<span class="chip epic" title="Belongs to this ${ep ? esc(ep.type) : "epic"}">${ep ? esc(ep.type) : "epic"}: ${ep ? esc(ep.title.slice(0, 18)) : "#" + t.parent}</span>`); }
@@ -270,7 +279,7 @@ const meter = (used, max, unit) => { const p = max ? Math.min(100, Math.round(10
 const LIM = {jobs: "jobs today", usd: "USD today", secs: "seconds today"};
 function machinesHtml(nodes) {
   if (!nodes.length) return '<p class="muted">No machine has reported yet. A bridge reports itself when it has a taskboard token (see TASKBOARD.md in the bridge).</p>';
-  return `<div class="nodes">${nodes.map(n => `<div class="node ${n.state}"><div class="nh"><b>${esc(n.n)}</b><span class="badge ${n.state === "up" ? "green" : n.state === "stale" ? "amber" : "red"}">${n.state === "up" ? "Up" : n.state === "stale" ? "Quiet" : "Down"}</span></div>
+  return `<div class="nodes">${nodes.map(n => `<div class="node ${n.state}"><div class="nh"><b>${esc(n.n)}</b><span class="badge ${n.state === "up" ? "green" : n.state === "stale" || n.state === "pending" ? "amber" : "red"}">${n.state === "up" ? "Up" : n.state === "stale" ? "Quiet" : n.state === "pending" ? "Waiting to be admitted" : "Down"}</span></div>${n.state === "pending" ? `<div class="vf"><button type="button" class="mini primary" data-nodeact="admit" data-node="${esc(n.n)}">Admit</button><button type="button" class="mini" data-nodeact="retire" data-node="${esc(n.n)}">Refuse</button></div>` : ""}${n.disk_pct != null ? `<div class="kv"><span>Disk</span><b style="color:var(--${n.disk_pct >= 90 ? "bad" : "fg"})">${n.disk_pct}%${n.load1 != null ? " · load " + n.load1 : ""}</b></div>` : ""}
     <div class="muted">${esc(n.machine || "")}${n.version ? " · " + esc(n.version) : ""} · reported ${ageTxt(n.age)} ago</div>
     <div class="kv"><span>Agents</span><b>${(n.agents || []).map(esc).join(", ") || "—"}</b></div>
     <div class="kv"><span>Running now</span><b>${(n.running || []).length ? (n.running || []).map(r => esc(r.agent) + (r.task ? " #" + r.task : "")).join(", ") : "nothing"}</b></div>
@@ -304,6 +313,8 @@ async function renderSystem() {
         <div class="kv"><span>Finished tasks with acceptance criteria</span><b>${ac.done_with_criteria}</b></div>
         <div class="kv"><span>…checked by someone else</span><b>${ac.verified}${ac.done_with_criteria ? " (" + Math.round(100 * ac.verified / ac.done_with_criteria) + "%)" : ""}</b></div>
         <div class="kv"><span>Comments over 1,500 characters</span><b>${r.long_comments || 0}</b></div>
+        <div class="qlist">${(r.quality || []).map(x => `<span>${esc(x.about)}</span><span class="${x.n ? "nz" : "z"}">${x.n}</span>`).join("")}</div>
+        <div class="vf" style="margin-top:8px"><button type="button" class="mini" data-snap="1">Write the read-only snapshot now</button></div>
         ${r.chain ? `<div class="kv"><span>History chain</span><b style="color:var(--${r.chain.ok ? "ok" : "bad"})">${r.chain.ok ? "✓ intact · " + r.chain.n + " events" : "✗ broken at #" + r.chain.broken}</b></div>` : ""}
         <p class="muted hint">Reported cost is what agents said they spent, not a provider bill. A finished task is only "verified" when someone other than the worker checked it.</p></section>
       <section class="panel"><h2>Tokens spent talking to the board <span class="muted">${r.days === 1 ? "today" : "last " + r.days + " days"}</span></h2>${r.spend && r.spend.agents.length ? r.spend.agents.map(a => `<div class="sprow2"><span><b>${esc(a.n)}</b><br><small>${a.routes.map(x => esc(x.r) + " " + x.t).join(" · ")}</small></span><span class="num">${a.calls} calls</span><span class="num">${a.t >= 1000 ? (a.t / 1000).toFixed(1) + "k" : a.t} tokens</span></div>`).join("") : '<p class="muted">Nothing counted yet.</p>'}<p class="muted hint">Counted from what agents send and receive (bytes ÷ 4). The biggest routes are where a shorter answer or a "since" read saves the most.</p></section>
@@ -343,13 +354,14 @@ function kidsBox(t, ts) {
   return `<div class="kidsbox"><label>${t.type === "epic" ? "Stories and tasks" : "Tasks"} under this <span class="muted">${n ? d + " of " + n + " done" : "none yet"}</span></label>
     ${ks.length ? ks.map(k => `<div class="kidrow"><span class="chip ty ${esc(k.type || "task")}">${esc(k.type || "task")}</span><button type="button" class="link" data-open="${k.id}">#${k.id} ${esc(k.title)}</button><span class="muted">${esc(LBL[k.status] || k.status)}${k.assignee ? " · " + esc(k.assignee) : " · unassigned"}</span></div>`).join("") : ""}
     <div class="decs" id="decbox"></div><div class="vf"><input id="decin" placeholder="Record a decision (one sentence)"><button type="button" class="mini" id="decgo">Add decision</button></div>
-    <div class="vf"><select id="scp"><option value="standard">Build, test, docs, review</option><option value="bugfix">Reproduce, fix, regression test, note</option><option value="research">Question, findings, decision</option></select><button type="button" class="mini" id="scgo">Add these tasks</button></div>
+    <div class="vf"><select id="scp"><option value="standard">Build, test, docs, review</option><option value="bugfix">Reproduce, fix, regression test, note</option><option value="research">Question, findings, decision</option>${Object.keys((bcfg().policy || {}).scaffolds || {}).map(k => `<option value="${esc(k)}">${esc(k)} (saved)</option>`).join("")}</select><button type="button" class="mini" id="scgo">Add these tasks</button></div>
     <div class="vf"><button type="button" class="mini" id="addkid" data-pt="${t.id}" data-ty="${t.type === "epic" ? "story" : "task"}">+ Add ${t.type === "epic" ? "a story" : "a task"} under this</button>${t.type === "epic" ? `<button type="button" class="mini" id="addkid2" data-pt="${t.id}" data-ty="task">+ Add a task</button>` : ""}</div></div>`;
 }
 
 // ---- the way of working a board follows: loose, standard, strict or your own rules
 const RULE_TXT = {strict_moves: "Tasks only move along the allowed paths", holder_only: "Only the holder changes a task someone is holding", accept_before_start: "Acceptance criteria before work starts",
-  claim_to_start: "Work starts by claiming, not dragging", verify_before_done: "Someone else verifies before a task is done", require_parent: "Every task belongs to a story or epic"};
+  claim_to_start: "Work starts by claiming, not dragging", verify_before_done: "Someone else verifies before a task is done", require_parent: "Every task belongs to a story or epic",
+  evidence_before_review: "A note and proof for every criterion before review", self_assign_only: "Agents only assign work to themselves"};
 const PRESET_TXT = {loose: ["Loose", "Move work freely. Only the board's own checklist applies."], standard: ["Standard", "Clear paths and written acceptance, without getting in the way."],
   strict: ["Strict", "Paths, one holder, claims, an independent check, everything under a story."], custom: ["Custom", "Pick exactly the rules you want."]};
 const PRESET_RULES = {loose: [], standard: ["strict_moves", "accept_before_start"], strict: Object.keys(RULE_TXT), custom: []};
@@ -360,13 +372,36 @@ function policyBox(pol, dflt) {
   return `<fieldset class="fs"><legend>How strict this board is <span class="muted">(owner, admin or supervisor)</span></legend>
     <div class="pcards">${Object.entries(PRESET_TXT).map(([k, [n, a]]) => `<label class="pcard ${k === preset ? "on" : ""}"><input type="radio" name="rigor_preset" value="${k}" ${k === preset ? "checked" : ""}><b>${n}</b><span>${a}</span></label>`).join("")}</div>
     <div class="rulelist">${Object.entries(RULE_TXT).map(([k, t]) => `<label class="chk"><input type="checkbox" name="rule_${k}" ${on(k) ? "checked" : ""}> ${t}</label>`).join("")}</div>
+    <label>Saved task sets <span class="muted">(one per line: name: Build [task] | Test &lt;- Build | Docs [chore] | Ship &lt;- Test, Docs)</span><textarea name="pol_scaffolds" rows="2">${esc(Object.entries(pol.scaffolds || {}).map(([k, v]) => k + ": " + v.join(" | ")).join("\n"))}</textarea></label>
     <label>New stories start with this pipeline <span class="muted">(optional, one stage per line: name | holder | auto, review or human)</span><textarea name="pol_pipeline" rows="2">${esc(pipe)}</textarea></label></fieldset>`;
 }
 function policyFrom(d) {
   const preset = d.rigor_preset || "loose", base = new Set(PRESET_RULES[preset] || []), rules = {};
   for (const k of Object.keys(RULE_TXT)) { const on = d["rule_" + k] === "on"; if (preset === "custom" ? on || true : on !== base.has(k)) rules[k] = on; }
-  return {preset, rules, pipeline: (d.pol_pipeline || "").trim()};
+  const scaffolds = {}; (d.pol_scaffolds || "").split("\n").forEach(l => { const m = l.match(/^\s*([A-Za-z0-9._-]+)\s*:\s*(.+)$/); if (m) scaffolds[m[1]] = m[2].split("|").map(x => x.trim()).filter(Boolean); });
+  return {preset, rules, pipeline: (d.pol_pipeline || "").trim(), scaffolds};
 }
+
+const nowUtc = () => new Date().toISOString().slice(0, 19).replace("T", " ");
+
+// ---- small actions that live in panels (Today, System): proposals, lessons, waits, machines
+document.addEventListener("click", async e => {
+  const b = e.target.closest("[data-prop],[data-les],[data-nodeact],[data-snap],[data-waitclear]"); if (!b) return;
+  try {
+    if (b.dataset.nodeact) { await api("POST", `/nodes/${encodeURIComponent(b.dataset.node)}/${b.dataset.nodeact}`, {}); toast(b.dataset.nodeact === "admit" ? "Machine admitted" : "Machine retired"); return view === "system" ? renderSystem() : renderToday(); }
+    if (b.dataset.snap) { await api("POST", "/snapshot", {}); toast("Snapshot written"); return renderSystem(); }
+    if (b.dataset.prop) {
+      const [id, dec] = b.dataset.prop.split(":");
+      if (dec === "accept") { const r = await api("POST", `/proposals/${id}/decide`, {decision: "accept"}); toast(`Accepted as #${r.tk}`); return renderToday(); }
+      return dlg(`<h3>Decline this proposal</h3><label>Why not?<input name="note" required></label>`, async d => { await api("POST", `/proposals/${id}/decide`, {decision: "reject", note: d.note}); toast("Declined"); renderToday(); }, "", "Decline");
+    }
+    if (b.dataset.les) {
+      const [id, dec] = b.dataset.les.split(":");
+      if (dec === "promote") { await api("POST", `/lessons/${id}/decide`, {decision: "promote"}); toast("Added to the board rules"); return renderToday(); }
+      return dlg(`<h3>Decline this lesson</h3><label>Why not?<input name="note" required></label>`, async d => { await api("POST", `/lessons/${id}/decide`, {decision: "reject", note: d.note}); toast("Declined"); renderToday(); }, "", "Decline");
+    }
+  } catch (_) {}
+});
 
 function colHtml(s, ts) {
   const c = ts.filter(t => t.status === s).sort((x, y) => x.priority - y.priority || x.id - y.id);
@@ -630,6 +665,11 @@ async function renderAdmin() {
       <label>Mark a run as lost after (minutes without a sign of life, 0 = off)<input type="number" name="run_lost_min" min="0" max="1440" value="${esc(se.run_lost_min || 90)}"></label>
       <label>Monthly budget for all boards (USD, blank = none)<input type="number" step="any" min="0" name="budget_usd" value="${esc(se.budget_usd)}"></label>
       <label>Default way of working for boards that did not choose<select name="policy_default"><option value="" ${!se.policy_default ? "selected" : ""}>Loose</option><option value="standard" ${se.policy_default === "standard" ? "selected" : ""}>Standard</option><option value="strict" ${se.policy_default === "strict" ? "selected" : ""}>Strict</option></select></label>
+      <fieldset class="fs"><legend>Safety and automation</legend><div class="row2"><label>Passwords and keys in text<select name="secret_guard"><option value="" ${!se.secret_guard ? "selected" : ""}>Replace with [redacted]</option><option value="block" ${se.secret_guard === "block" ? "selected" : ""}>Refuse the write</option><option value="off" ${se.secret_guard === "off" ? "selected" : ""}>Leave alone</option></select></label><label>New machines that report<select name="node_admission"><option value="" ${!se.node_admission ? "selected" : ""}>Trusted at once</option><option value="manual" ${se.node_admission === "manual" ? "selected" : ""}>Wait until an admin admits them</option></select></label></div>
+      <div class="row2"><label>Open an ops task when a machine disk is nearly full<select name="watermarks_on"><option value="0" ${se.watermarks_on !== "1" ? "selected" : ""}>No</option><option value="1" ${se.watermarks_on === "1" ? "selected" : ""}>Yes (board named Ops, or the board id below)</option></select></label><label>Ops board id (optional)<input name="ops_board" value="${esc(se.ops_board || "")}"></label></div>
+      <div class="row2"><label>Lesson cooling period (hours)<input type="number" name="lesson_cooldown_h" min="0" value="${esc(se.lesson_cooldown_h || 24)}"></label><label>Raise a wait to the supervisors after (minutes, 0 = never)<input type="number" name="wait_escalate_min" min="0" value="${esc(se.wait_escalate_min || 120)}"></label></div>
+      <label>Chat commands: secret <span class="muted">(signs POST /api/intake)</span><input name="intake_secret" value="${esc(se.intake_secret || "")}" placeholder="long random text"></label>
+      <label>Chat commands: who is who <span class="muted">(JSON, e.g. {"slack:U123": {"as": "Kabil", "role": "admin"}})</span><textarea name="intake_senders" rows="2">${esc(se.intake_senders || "")}</textarea></label></fieldset>
       <label>Ask for an independent check when work with acceptance criteria goes to review<select name="auto_verify"><option value="1" ${se.auto_verify !== "0" ? "selected" : ""}>Yes, ask the best free agent</option><option value="0" ${se.auto_verify === "0" ? "selected" : ""}>No</option></select></label>
       <div class="row2"><label>Task moves<select name="strict_moves"><option value="0" ${se.strict_moves !== "1" ? "selected" : ""}>Any move</option><option value="1" ${se.strict_moves === "1" ? "selected" : ""}>Strict (follow the allowed paths)</option></select></label><label>Tasks someone is holding<select name="holder_only"><option value="0" ${se.holder_only !== "1" ? "selected" : ""}>Anyone with access can change</option><option value="1" ${se.holder_only === "1" ? "selected" : ""}>Only the holder, a supervisor or an admin</option></select></label></div>
       <label>Daily limits per agent <span class="muted">(JSON, per UTC day: jobs, usd, secs; "*" = everyone)</span><textarea name="agent_limits" rows="2" placeholder='{"*": {"jobs": 40}, "coder-agent": {"usd": 5}}'>${esc(se.agent_limits)}</textarea></label>
@@ -730,7 +770,7 @@ async function refreshDash() {
     return d;
   } catch (_) { return null; }
 }
-const kickDash = () => { clearTimeout(dashT); dashT = setTimeout(() => { if (view === "today") renderToday(); else if (view === "overview") renderOverview(); else if (view === "agents") renderAgents(); else if (view === "system") renderSystem(); else refreshDash(); }, 400); };
+const kickDash = () => { clearTimeout(dashT); dashT = setTimeout(() => { if (view === "today") renderToday(); else if (view === "overview") renderOverview(); else if (view === "agents") renderAgents(); else if (view === "system") renderSystem(); else refreshDash(); }, view === "today" || view === "system" ? 2000 : 400); };
 
 const CFD_ORDER = [["done", "#00805c"], ["review", "#7d58c2"], ["in_progress", "#ba5c33"], ["todo", "#326bae"], ["backlog", "#b2b6b5"]];
 function cfdSvg(cfd) {
@@ -903,12 +943,12 @@ async function renderAgents() {
       ${rb.n ? `<div class="kv"><span>Runs today</span><b>${rb.n}${rb.bad ? ` · <span style="color:var(--bad)">${rb.bad} failed</span>` : ""}</b></div>` : ""}
       ${cur ? `<div class="statusline">Doing <button type="button" class="link" data-open="${cur.id}"><span class="mono">#${cur.id}</span> ${esc(cur.title)}</button></div>` : ""}
       ${a.stx ? `<div class="statusline">${esc(a.stx)}${a.stk ? ` <span class="mono">#${a.stk}</span>` : ""}</div>` : ""}
-      <div class="kv"><span>Last seen</span><b>${a.seen ? esc(ago(a.seen)) + " ago" : "never"}</b></div>
+      ${a.rl ? `<div class="muted">${esc(a.rl)}${a.gl ? " · " + esc(a.gl) : ""}</div>` : ""}<div class="kv"><span>Last seen</span><b>${a.seen ? esc(ago(a.seen)) + " ago" : "never"}</b></div>
       <div class="kv"><span>Delivery</span><b>${a.hook ? "Webhook" + (a.hs ? " · signed" : "") : "Polls inbox"}</b></div>
       <div class="kv"><span>Open tasks</span><b>${open}${cap ? " of " + cap : ""}</b></div>
       ${cap ? `<div class="bar"><i class="${over ? "bad" : ""}" style="width:${Math.min(100, Math.round(100 * open / cap))}%"></i></div>` : ""}
       ${a.sk ? `<div class="skills">${a.sk.split(",").map(x => `<span class="chip">${esc(x)}</span>`).join("")}</div>` : ""}
-      <div class="btnrow"><button type="button" class="mini" data-inbox="${esc(a.n)}">Open inbox</button>${a.hook ? `<button type="button" class="mini" data-wake="${esc(a.n)}" title="Send a wake-up ping to its webhook">Wake</button>` : ""}<button type="button" class="mini" data-msg="${esc(a.n)}">Message</button><button type="button" class="mini" data-hook="${esc(a.n)}" data-url="${esc(a.hook || "")}" data-cap="${a.cap || ""}" data-skills="${esc(a.sk || "")}">Settings</button></div></article>`;
+      <div class="btnrow"><button type="button" class="mini" data-inbox="${esc(a.n)}">Open inbox</button>${a.hook ? `<button type="button" class="mini" data-wake="${esc(a.n)}" title="Send a wake-up ping to its webhook">Wake</button>` : ""}<button type="button" class="mini" data-msg="${esc(a.n)}">Message</button><button type="button" class="mini" data-hook="${esc(a.n)}" data-url="${esc(a.hook || "")}" data-cap="${a.cap || ""}" data-skills="${esc(a.sk || "")}" data-role="${esc(a.rl || "")}" data-goal="${esc(a.gl || "")}">Settings</button></div></article>`;
   }).join("");
   const locks = lk.i.length ? lk.i.map(l => `<div class="coord"><div><b class="mono">${esc(l.name)}</b><div class="muted">held by ${esc(l.owner)} until ${esc(l.until.slice(11, 16))} UTC${l.note ? " — " + esc(l.note) : ""}</div></div><button type="button" class="mini" data-unlock="${esc(l.name)}" data-owner="${esc(l.owner)}">Release</button></div>`).join("") : '<span class="muted">Nothing is locked.</span>';
   const asks = ak.i.length ? ak.i.map(x => `<div class="coord"><div><b>${esc(x.from)} → ${esc(x.to)}</b>${x.tk ? ` <span class="mono">#${x.tk}</span>` : ""}<div>${esc(x.q)}</div><div class="muted">answer by ${esc(x.due.slice(5, 16))} UTC${x.due < new Date().toISOString().slice(0, 19).replace("T", " ") ? ' · <b style="color:var(--bad)">overdue</b>' : ""}</div></div><button type="button" class="mini primary" data-answer="${x.id}" data-q="${esc(x.q)}" data-to="${esc(x.to)}">Answer</button></div>`).join("") : '<span class="muted">No open questions between agents.</span>';
@@ -930,12 +970,13 @@ async function showInbox(name) {
     `<p><button type="button" class="mini" data-ackall="${esc(name)}">Mark all read</button></p>`;
 }
 
-function hookDlg(name, url, cap, skills) {
+function hookDlg(name, url, cap, skills, role, goal) {
   dlg(`<h3>Agent webhook</h3><label>Agent name (exactly as used in Assignee)<input name="n" required value="${esc(name)}"></label>
     <label>Webhook URL (blank = inbox only)<input name="hook" placeholder="https://…" value="${esc(url)}"></label>
     <label>Signing secret (optional, HMAC-SHA256 in X-Taskboard-Signature)<input name="secret" placeholder="leave empty to keep current"></label>
     <label>Capacity per sprint (points, or tasks if you don't use points; 0 = unlimited)<input type="number" name="capacity" min="0" value="${esc(cap || "")}"></label>
-    <label>Skills (comma separated, e.g. frontend, qa) — used for automatic routing<input name="skills" value="${esc(skills || "")}"></label>`,
+    <label>Skills (comma separated, e.g. frontend, qa) — used for automatic routing<input name="skills" value="${esc(skills || "")}"></label>
+    <label>Role (what this agent is for)<input name="role" maxlength="80" value="${esc(role || "")}"></label><label>Goal (one sentence)<input name="goal" maxlength="240" value="${esc(goal || "")}"></label>`,
     async d => { if (!d.secret) delete d.secret; d.capacity = +d.capacity || 0; await api("POST", "/agents", d); renderAgents(); });
 }
 
@@ -1037,7 +1078,7 @@ async function boardSetDlg() {
       const wip = {}; for (const k of ["todo", "in_progress", "review"]) if (d["w_" + k]) wip[k] = +d["w_" + k];
       await api("PATCH", "/boards/" + B.id, {method: d.method, dod: d.dod, cfg: {wip, wip_mode: d.wip_mode, sprint_days: +d.sprint_days || 0, auto_rollover: d.auto_rollover === "on", replenish_below: +d.replenish_below || 0, sla_hours: {1: +d.sla1 || 0, 2: +d.sla2 || 0, 3: +d.sla3 || 0, 4: +d.sla4 || 0}, phases: d.phases, budget_usd: +d.budget_usd || 0, task_budget_usd: +d.task_budget_usd || 0}});
       const np = policyFrom(d), op = cfg.policy || {};
-      if (JSON.stringify(np) !== JSON.stringify({preset: op.preset || "loose", rules: op.rules || {}, pipeline: (op.pipeline || []).map(s => `${s.name} | ${s.holder} | ${s.gate}`).join("\n")})) await api("POST", "/boards/" + B.id + "/policy", np);
+      if (JSON.stringify(np) !== JSON.stringify({preset: op.preset || "loose", rules: op.rules || {}, pipeline: (op.pipeline || []).map(s => `${s.name} | ${s.holder} | ${s.gate}`).join("\n"), scaffolds: op.scaffolds || {}})) await api("POST", "/boards/" + B.id + "/policy", np);
       await loadBoard(); toast("Board settings saved");
     }, "", "Save settings");
   $("f").addEventListener("change", e => {
@@ -1162,7 +1203,8 @@ function taskDlg(id, status, title, boardId, pri, pre) {
     <div class="row2"><label>Due date<input type="date" name="due" value="${esc(t.due || "")}"></label><span></span></div>
     ${id ? '<div id="linksbox" class="linksbox"></div>' + codeBox(t) + '<div id="runsbox" class="codebox" hidden></div>' : ""}
     ${meth().group === "okr" ? `<div class="row2"><label>Target (key result)<input type="number" step="any" min="0" name="target" value="${t.target ?? ""}"></label><label>Current value<input type="number" step="any" min="0" name="current" value="${t.current ?? ""}"></label></div>` : ""}
-    ${id && (t.status === "review" || t.status === "done") ? `<div class="acc"><label>Independent check <span class="muted">(someone other than the worker, against the criteria above)</span></label>${t.verified_by ? `<div>✓ Verified by <b>${esc(t.verified_by)}</b> ${esc(ago(t.verified_at))} ago${t.verified_note ? " · " + esc(t.verified_note) : ""}</div>` : `<div class="muted">Not verified yet. ${t.accept ? "" : "This card has no acceptance criteria."}</div>`}${t.accept ? `<ul>${t.accept.split("\n").map(x => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}<div class="vf"><input id="vfn" placeholder="Note (required to send back)"><button type="button" class="mini primary" id="vfok">Verify</button><button type="button" class="mini" id="vfno">Send back</button></div></div>` : ""}
+    ${id && t.status !== "done" && t.status !== "declined" ? `<div class="waitbox"><label>Waiting for someone? <span class="muted">(they are asked; a long wait goes to the supervisors)</span></label>${(() => { let w = null; try { w = t.waiting ? JSON.parse(t.waiting) : null; } catch (_) {} return w ? `<div>Waiting for <b>${esc(w.o)}</b> (${esc(w.k)}) since ${esc(ago(w.s))} ago: ${esc(w.r)} <button type="button" class="mini" id="wclear">It is over</button></div>` : `<div class="vf"><select id="wk">${["input", "review", "human", "external", "dependency"].map(k => `<option>${k}</option>`).join("")}</select><input id="wo" placeholder="Who"><input id="wr" placeholder="What for"><button type="button" class="mini" id="wgo">I am waiting</button></div>`; })()}</div>` : ""}
+    ${id && (t.status === "review" || t.status === "done") ? `<div class="acc"><label>Independent check <span class="muted">(someone other than the worker, against the criteria above)</span></label>${t.verified_by ? `<div>✓ Verified by <b>${esc(t.verified_by)}</b> ${esc(ago(t.verified_at))} ago${t.verified_note ? " · " + esc(t.verified_note) : ""}</div>` : `<div class="muted">Not verified yet. ${t.accept ? "" : "This card has no acceptance criteria."}</div>`}${t.accept ? `<ul class="ev" id="acl">${t.accept.split("\n").map((x, i) => /^check:/i.test(x.trim()) ? `<li class="open">⚙ ${esc(x)} <small>(tested by the server)</small></li>` : `<li class="open" data-n="${i + 1}">○ ${esc(x)}</li>`).join("")}</ul><div class="vf" id="evform" hidden><select id="evn"></select><input id="evnote" placeholder="How it was met"><input id="evref" placeholder="Link or label (optional)"><button type="button" class="mini" id="evgo">Add proof</button></div>` : ""}<div class="vf"><input id="vfn" placeholder="Note (required to send back)"><button type="button" class="mini primary" id="vfok">Verify</button><button type="button" class="mini" id="vfno">Send back</button></div></div>` : ""}
     ${(bd.dod || "").trim() ? `<div class="dod"><label>Definition of done — every item before this task can be done</label>${bd.dod.split("\n").filter(x => x.trim()).map((x, i) => `<label class="chk"><input type="checkbox" name="dodi" value="${i}" ${csv(t.dod_done).includes(String(i)) ? "checked" : ""}> ${esc(x)}</label>`).join("")}</div>` : ""}
     <details class="more"><summary>More fields (labels, links, blockers, PR)</summary>
     <label>Rigor for this task <span class="muted">(ask for more discipline than the board; only a supervisor can lower it)</span><select name="rigor"><option value="" ${!t.rigor ? "selected" : ""}>same as the board</option><option value="standard" ${t.rigor === "standard" ? "selected" : ""}>standard</option><option value="strict" ${t.rigor === "strict" ? "selected" : ""}>strict</option></select></label>
@@ -1268,6 +1310,10 @@ function taskDlg(id, status, title, boardId, pri, pre) {
       const sps = $("f").querySelector("[name=sprint_id]"); if (sps) sps.disabled = mv;
     };
     $("handoff").onclick = () => { $("dlg").close(); dirty = false; handoffDlg(id); };
+    const loadEv = async () => { const ul = $("acl"); if (!ul) return; const r = await api("GET", `/tasks/${id}/evidence`).catch(() => null); if (!r) return; const by = Object.fromEntries(r.i.map(x => [x.n, x]));
+      ul.querySelectorAll("li[data-n]").forEach(li => { const x = by[li.dataset.n]; li.className = x ? "ok" : "open"; li.innerHTML = (x ? "✓ " : "○ ") + li.innerHTML.replace(/^[✓○] /, "").replace(/<small>.*$/, "") + (x ? ` <small>${esc(x.note || "met")}${x.ref ? " · " + esc(x.ref) : ""} (${esc(x.by)})</small>` : ""); });
+      const open = r.need.filter(n => !by[n.n]), ef = $("evform"); if (ef) { ef.hidden = !open.length; $("evn").innerHTML = open.map(n => `<option value="${n.n}">${n.n}. ${esc(n.c.slice(0, 40))}</option>`).join(""); } };
+    loadEv();
     let actLoaded = false;
     const loadAct = async () => {
       if (actLoaded) return; actLoaded = true;
@@ -1290,6 +1336,9 @@ function taskDlg(id, status, title, boardId, pri, pre) {
         if (t_.id === "faadd") { const n = $("fan").value.trim(); if (!n) return; await api("POST", `/tasks/${id}/attachments`, {name: n, url: $("fau").value.trim(), kind: $("fak").value}); loadFiles(); }
         else if (t_.dataset && t_.dataset.delatt) { await api("DELETE", "/attachments/" + t_.dataset.delatt); loadFiles(); }
         else if (t_.id === "pgs" || t_.id === "pgd" || t_.id === "pgr") { const n = ($("pgn") || {}).value ? $("pgn").value.trim() : ""; if (t_.id === "pgr" && !n) { toast("Say what needs fixing"); return; } await api("POST", `/tasks/${id}/stage`, {action: t_.id === "pgs" ? "start" : t_.id === "pgd" ? "done" : "reject", note: n}); toast("Done"); $("dlg").close(); dirty = false; loadBoard(); }
+        else if (t_.id === "evgo") { await api("POST", `/tasks/${id}/evidence`, {n: +$("evn").value, note: $("evnote").value.trim(), ref: $("evref").value.trim()}); $("evnote").value = ""; $("evref").value = ""; loadEv(); }
+        else if (t_.id === "wgo") { await api("POST", `/tasks/${id}/wait`, {kind: $("wk").value, owner: $("wo").value.trim(), reason: $("wr").value.trim()}); toast("Waiting recorded"); $("dlg").close(); dirty = false; loadBoard(); }
+        else if (t_.id === "wclear") { await api("POST", `/tasks/${id}/wait`, {clear: true}); toast("No longer waiting"); $("dlg").close(); dirty = false; loadBoard(); }
         else if (t_.id === "vfok" || t_.id === "vfno") { const n = $("vfn").value.trim(); if (t_.id === "vfno" && !n) { toast("Say what is missing"); return; } await api("POST", `/tasks/${id}/verify`, {ok: t_.id === "vfok", note: n}); toast(t_.id === "vfok" ? "Verified" : "Sent back"); $("dlg").close(); dirty = false; loadBoard(); }
         else if (t_.id === "rvreq") { const to = $("rvto").value.trim(); if (!to) return; await api("POST", `/tasks/${id}/review`, {reviewer: to, note: $("rvn").value.trim()}); loadReviews(); }
         else if (t_.dataset && t_.dataset.rvdec) { const note = document.querySelector(`.rvnote[data-rv="${t_.dataset.rv}"]`).value.trim(); await api("POST", `/reviews/${t_.dataset.rv}/decide`, {decision: t_.dataset.rvdec, note}); loadReviews(); }
@@ -1350,7 +1399,8 @@ function agentState(a, by) {
 async function renderToday() {
   const el = $("v-today"), qs0 = B && !B.multi ? "?b=" + B.id : B && B.scopeTeam ? "?tm=" + encodeURIComponent(B.scopeTeam) : "";
   const soft = p => p.catch(() => null);
-  const [d, ag, cost, nodes, quota, vq] = await Promise.all([refreshDash(), soft(api("GET", "/agents")), soft(api("GET", "/cost" + qs0)), soft(api("GET", "/nodes")), soft(api("GET", "/quota")), soft(api("GET", "/verify/queue"))]);
+  const [d, ag, cost, ex] = await Promise.all([refreshDash(), soft(api("GET", "/agents")), soft(api("GET", "/cost" + qs0)), soft(api("GET", "/today"))]);
+  const nodes = ex && {i: ex.nodes}, quota = ex && ex.quota, vq = ex && ex.vq, props = ex && ex.props, less = ex && ex.less, waits = ex && ex.waits;
   if (view !== "today" || !d) return;
   const needs = (d.attention || []).slice(0, 8), t = d.totals || {}, by = {};
   ((d.agents) || []).forEach(a => { by[a.as.toLowerCase()] = a.by; });
@@ -1373,6 +1423,9 @@ async function renderToday() {
       <section class="panel" aria-labelledby="spn"><h2 id="spn">Sprints</h2>
         ${sps.length ? sps.map(b => `<button type="button" class="sprow" data-board="${b.id}"><span><b>${esc(b.n)}</b> <span class="hl ${b.sp.hl}">${esc(HL[b.sp.hl] || b.sp.hl)}</span><br><span class="muted">${esc(b.sp.n)} · ${b.sp.p[0]}/${b.sp.p[1]} done</span></span><progress max="100" value="${b.sp.p[1] ? 100 * b.sp.p[0] / b.sp.p[1] : 0}"></progress></button>`).join("") : '<span class="muted">No active sprints.</span>'}</section>
     </div>
+    ${props && props.n ? `<section class="panel"><h2>Proposed work <span class="badge">${props.n}</span></h2>${props.i.slice(0, 6).map(x => `<div class="qrow"><div class="qtx"><b>${esc(x.t)}</b> <span class="chip ty ${esc(x.ty || "task")}">${esc(x.ty || "task")}</span><small>${esc(x.by)} · ${esc(ago(x.ts))} ago${x.why ? " · " + esc(x.why) : ""}</small></div><button type="button" class="mini primary" data-prop="${x.id}:accept">Accept</button><button type="button" class="mini" data-prop="${x.id}:reject">Decline</button></div>`).join("")}</section>` : ""}
+    ${less && less.n ? `<section class="panel"><h2>Lessons waiting <span class="badge">${less.n}</span></h2>${less.i.slice(0, 6).map(x => `<div class="qrow"><div class="qtx">${esc(x.c)}<small>${esc(x.by)} · ${esc(ago(x.ts))} ago${x.cool > nowUtc() ? " · cooling until " + esc(x.cool.slice(0, 16)) : ""}</small></div><button type="button" class="mini primary" data-les="${x.id}:promote" ${x.cool > nowUtc() ? "disabled" : ""}>Add to rules</button><button type="button" class="mini" data-les="${x.id}:reject">Decline</button></div>`).join("")}</section>` : ""}
+    ${waits && waits.n ? `<section class="panel"><h2>Waiting for someone <span class="badge">${waits.n}</span></h2>${waits.i.slice(0, 8).map(x => `<div class="qrow"><div class="qtx"><span class="mono">#${x.id}</span> ${esc(x.t)}<small>${esc(x.as || "unassigned")} waits for <b>${esc(x.o)}</b> (${esc(x.k)}) · ${esc(ago(x.s))} ago: ${esc(x.r)}</small></div><button type="button" class="mini" data-open="${x.id}">Open</button></div>`).join("")}</section>` : ""}
     ${vq && vq.n ? `<section class="panel" aria-labelledby="vqh"><h2 id="vqh">Waiting for an independent check <span class="badge">${vq.n}</span></h2>${vq.i.slice(0, 6).map(x => `<div class="needrow"><div class="needtxt"><div><span class="mono">#${x.id}</span> ${esc(x.t)}</div><div class="muted">${esc(LBL[x.st] || x.st)}${x.as ? " · done by " + esc(x.as) : ""} · should be checked by ${esc(x.vf || "someone else")}</div></div><div class="needact"><button type="button" class="mini primary" data-open="${x.id}">Open</button></div></div>`).join("")}</section>` : ""}
     ${(nodes && nodes.i.length) || (quota && (quota.agents.length || quota.subs.length)) ? `<section class="panel" aria-labelledby="mchn"><h2 id="mchn">Machines and limits <button type="button" class="link" data-go="system" style="margin-left:auto">System overview</button></h2>${machinesHtml(nodes ? nodes.i : [])}${quota && (quota.agents.length || quota.subs.length) ? `<div style="margin-top:14px">${limitsHtml(quota)}</div>` : ""}</section>` : ""}
     ${costPanel(cost)}</div>`;
@@ -1686,7 +1739,7 @@ ovEl.addEventListener("click", async e => {
 });
 agEl.addEventListener("click", async e => {
   const i = e.target.closest("[data-inbox]"); if (i) return showInbox(i.dataset.inbox);
-  const h = e.target.closest("[data-hook]"); if (h) return hookDlg(h.dataset.hook, h.dataset.url, h.dataset.cap, h.dataset.skills);
+  const h = e.target.closest("[data-hook]"); if (h) return hookDlg(h.dataset.hook, h.dataset.url, h.dataset.cap, h.dataset.skills, h.dataset.role, h.dataset.goal);
   const cq = e.target.closest("[data-clearq]"); if (cq) { try { await api("POST", "/agents", {n: cq.dataset.clearq, quota_until: ""}); toast("Quota cleared"); renderAgents(); } catch (_) {} return; }
   const af = e.target.closest("[data-agf]"); if (af) { agFilter = af.dataset.agf; return renderAgents(); }
   const mg = e.target.closest("[data-msg]"); if (mg) return msgDlg(mg.dataset.msg);

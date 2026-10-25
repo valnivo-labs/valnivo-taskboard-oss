@@ -477,6 +477,44 @@ def test_board_way_of_working_can_be_chosen(page):
     api("POST", "/boards/%d/policy" % b, {"preset": "loose"})
 
 
+def test_today_decides_proposals_and_shows_waits(page):
+    b, _ = mkboard("Proposals %d" % time.time())
+    pid = api("POST", "/proposals", {"b": b, "t": "Propose dark mode", "ty": "story", "why": "asked twice"}, tok=WORKER)["id"]
+    t = mktask(b, "waiting subject", **{"as": "Worker"})
+    api("POST", "/tasks/%d/wait" % t, {"kind": "human", "owner": "admin", "reason": "Which colour?"}, tok=WORKER)
+    goto(page, view="today")
+    page.wait_for_selector("[data-prop='%d:accept']" % pid)
+    assert page.is_visible("text=Waiting for someone")
+    page.click("[data-prop='%d:accept']" % pid)
+    page.wait_for_selector("#toast:has-text('Accepted as')")
+    assert api("GET", "/proposals?st=accepted")["i"][0]["id"] == pid
+
+
+def test_proof_can_be_added_to_a_criterion(page):
+    b, _ = mkboard("Proof %d" % time.time())
+    t = mktask(b, "needs proof", ac="First point\nSecond point\ncheck: pr_linked", st="review", **{"as": "Worker"})
+    goto(page, scope="b:%d" % b)
+    page.click(".card[data-id='%d'] .t" % t)
+    page.wait_for_selector("#evform:not([hidden])")
+    page.fill("#evnote", "ran it twice")
+    page.click("#evgo")
+    page.wait_for_selector("#acl li.ok")
+    ev = api("GET", "/tasks/%d/evidence" % t)
+    assert ev["i"][0]["note"] == "ran it twice" and len(ev["need"]) == 2, ev
+
+
+def test_a_new_machine_waits_for_admission(page):
+    api("POST", "/settings", {"node_admission": "manual"})
+    try:
+        api("POST", "/nodes", {"name": "pending-box", "machine": "test"}, tok=WORKER)
+        goto(page, view="system")
+        page.wait_for_selector("#v-system .node:has-text('pending-box') [data-nodeact='admit']")
+        page.click("#v-system .node:has-text('pending-box') [data-nodeact='admit']")
+        page.wait_for_selector("#v-system .node:has-text('pending-box'):has-text('Up')")
+    finally:
+        api("POST", "/settings", {"node_admission": "auto"})
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

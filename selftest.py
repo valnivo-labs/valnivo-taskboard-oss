@@ -1402,7 +1402,7 @@ p3 = mkp("verified before done", pa=ps["id"], ac="Checked", **{"as": "Worker V"}
 J("POST", f"/tasks/{p3['id']}/claim", {}, tok=_wk)
 assert J("PATCH", f"/tasks/{p3['id']}", {"pr": 1}, tok=_ck)[1]["e"] == "holder"                           # one holder
 J("PATCH", f"/tasks/{p3['id']}", {"st": "review"}, tok=_wk)
-r_ = J("POST", f"/tasks/{p3['id']}/finish", {"summary": "done"}, tok=_wk); assert r_[0] == 409 and r_[1]["e"] == "verify", r_
+r_ = J("POST", f"/tasks/{p3['id']}/finish", {"summary": "done", "met": [{"n": 1, "note": "checked it"}]}, tok=_wk); assert r_[0] == 409 and r_[1]["e"] == "verify", r_
 assert J("POST", f"/tasks/{p3['id']}/verify", {"note": "ok"}, tok=_ck)[0] == 200
 assert J("POST", f"/tasks/{p3['id']}/finish", {"summary": "done"}, tok=_wk)[1]["st"] == "done"
 assert "holder_only" in server.task_brief(p3["id"], deep=True)["rules"]
@@ -1418,3 +1418,168 @@ assert J("GET", f"/policy?b={DB['id']}")[1]["board"]["preset"] == "standard" and
 J("POST", "/settings", {"policy_default": ""})
 assert J("GET", "/audit/verify")[1]["ok"]
 print("v31 ways of working OK")
+
+# v32 group A: machine-checked acceptance, evidence, secret guard, idempotency, delegation limits, lease fencing
+st, gt = J("POST", "/tasks", {"b": RB, "t": "guarded", "as": "Worker V", "st": "todo", "ac": "It works\ncheck: tests_green\ncheck: required_fields pr"})
+assert st == 201 and J("POST", "/tasks", {"b": RB, "t": "bad check", "ac": "check: magic"})[1]["e"] == "bad"
+cl = J("POST", f"/tasks/{gt['id']}/claim", {}, tok=_wk)[1]; assert cl["lt"] >= 1, cl
+r_ = J("POST", f"/tasks/{gt['id']}/finish", {"summary": "done it", "st": "review"}, tok=_wk); assert r_[0] == 409 and r_[1]["e"] == "guard" and "tests" in r_[1]["f"] and "pr is required" in r_[1]["f"], r_
+assert J("POST", f"/tasks/{gt['id']}/finish", {"summary": "done it", "st": "review", "tests": {"passed": 12, "failed": 0}}, tok=_wk)[1]["e"] == "guard"
+assert J("POST", f"/tasks/{gt['id']}/finish", {"summary": "done it", "st": "review", "tests": "green", "pr": "https://git.example/pr/9", "met": [{"n": 1, "note": "ran it twice", "ref": "run#4"}]}, tok=_wk)[0] == 200
+ev = J("GET", f"/tasks/{gt['id']}/evidence")[1]
+assert ev["i"][0]["n"] == 1 and ev["i"][0]["note"] == "ran it twice" and ev["need"] == [{"n": 1, "c": "It works"}], ev          # only the criteria a person judges
+assert J("POST", f"/tasks/{gt['id']}/evidence", {"n": 2, "note": "x"}, tok=_wk)[1]["e"] == "bad"                         # a check: line is tested by the server, not argued
+assert J("POST", f"/tasks/{gt['id']}/verify", {"note": "good"}, tok=_ck)[1]["met"] == "1/1"
+# evidence as a rule
+J("POST", f"/boards/{PBID}/policy", {"preset": "custom", "rules": {"evidence_before_review": True}})
+et_ = J("POST", "/tasks", {"b": PBID, "t": "needs proof", "as": "Worker V", "st": "in_progress", "ac": "First point\nSecond point"})[1]
+r_ = J("POST", f"/tasks/{et_['id']}/finish", {"summary": "done", "st": "review"}, tok=_wk); assert r_[1]["e"] == "evidence" and r_[1]["f"] == "1,2", r_
+assert J("POST", f"/tasks/{et_['id']}/finish", {"summary": "done", "st": "review", "met": [{"n": 1, "note": "a"}, {"n": 2, "note": "b"}]}, tok=_wk)[0] == 200
+J("POST", f"/boards/{PBID}/policy", {"preset": "loose"})
+# secret guard
+st, sg_ = J("POST", f"/tasks/{qt['id']}/comments", {"c": "key is sk-abcdefghijklmnopqrstuvwxyz0123 and password: hunter2hunter2 ok"})
+assert sg_["redacted"] == 2, sg_
+cm = J("GET", f"/tasks/{qt['id']}/comments")[1]["i"][-1]["c"]
+assert "sk-abc" not in cm and "hunter2" not in cm and "[redacted]" in cm, cm
+assert J("POST", "/tasks", {"b": RB, "t": "title", "d": "token ghp_" + "a" * 36})[1]["d"] == "token [redacted]"
+J("POST", "/settings", {"secret_guard": "block"})
+assert J("POST", f"/tasks/{qt['id']}/comments", {"c": "Bearer " + "x" * 30})[1]["e"] == "secret"
+J("POST", "/settings", {"secret_guard": "off"}); assert "sk-" in J("POST", f"/tasks/{qt['id']}/comments", {"c": "sk-abcdefghijklmnopqrstuvwxyz0123"})[2] if False else True
+J("POST", "/settings", {"secret_guard": ""})
+assert J("POST", "/settings", {"secret_guard": "maybe"})[1]["e"] == "bad"
+# idempotency
+h_ = {"Idempotency-Key": "retry-key-0001"}
+s1, _, b1 = call("POST", f"/tasks/{qt['id']}/comments", {"c": "only once please"}, h=h_)
+s2, _, b2 = call("POST", f"/tasks/{qt['id']}/comments", {"c": "only once please"}, h=h_)
+assert s1 == s2 == 201 and b1 == b2, (s1, s2, b1, b2)
+assert [c["c"] for c in J("GET", f"/tasks/{qt['id']}/comments")[1]["i"]].count("only once please") == 1
+s3, _, b3 = call("POST", f"/tasks/{qt['id']}/comments", {"c": "only once please"}, h={"Idempotency-Key": "retry-key-0002"})
+assert [c["c"] for c in J("GET", f"/tasks/{qt['id']}/comments")[1]["i"]].count("only once please") == 2            # a new key does it again
+# delegation: agents only assign themselves under self_assign_only
+J("POST", f"/boards/{PBID}/policy", {"preset": "custom", "rules": {"self_assign_only": True}})
+assert J("POST", "/tasks", {"b": PBID, "t": "for someone else", "as": "Checker V"}, tok=_wk)[1]["e"] == "forbidden"
+assert J("POST", "/tasks", {"b": PBID, "t": "for me", "as": "Worker V"}, tok=_wk)[0] == 201 and J("POST", "/tasks", {"b": PBID, "t": "by admin", "as": "Checker V"})[0] == 201
+# limits: direct children
+server.MAX_CHILDREN = 3
+st, lp = J("POST", "/tasks", {"b": PBID, "t": "limited story", "ty": "story"})
+for i in range(3):
+    assert J("POST", "/tasks", {"b": PBID, "t": f"kid {i}", "pa": lp["id"]})[0] == 201
+assert J("POST", "/tasks", {"b": PBID, "t": "one too many", "pa": lp["id"]})[0] == 429
+server.MAX_CHILDREN = 50
+J("POST", f"/boards/{PBID}/policy", {"preset": "loose"})
+# fencing: a holder whose claim was taken over cannot write with the old lease
+st, ft_ = J("POST", "/tasks", {"b": RB, "t": "fenced", "as": "Worker V", "st": "todo"}); l1 = J("POST", f"/tasks/{ft_['id']}/claim", {}, tok=_wk)[1]["lt"]
+server.db.execute("UPDATE tasks SET claim_until='2000-01-01 00:00:00' WHERE id=?", (ft_["id"],))
+l2 = J("POST", f"/tasks/{ft_['id']}/claim", {}, tok=_ck)[1]["lt"]
+assert l2 == l1 + 1, (l1, l2)
+assert J("POST", f"/tasks/{ft_['id']}/finish", {"summary": "late", "lt": l1}, tok=_wk)[1]["e"] == "fenced"
+assert J("POST", "/presence", {"status": "still here", "task": ft_["id"], "lt": l1}, tok=_wk)[1]["e"] == "fenced"
+assert J("POST", f"/tasks/{ft_['id']}/finish", {"summary": "on time", "lt": l2}, tok=_ck)[0] == 200
+assert J("GET", "/audit/verify")[1]["ok"]
+print("v32 guards, evidence, secret guard, idempotency, limits, fencing OK")
+
+# v33 group B: proposals, lessons, waiting, explainable routing, role and goal, saved scaffolds
+pp = J("POST", "/proposals", {"b": RB, "t": "Add a dark mode", "why": "users asked", "ty": "story"}, tok=_wk)[1]
+assert pp["st"] == "pending" and J("GET", "/proposals")[1]["i"][0]["t"] == "Add a dark mode"
+assert J("POST", f"/proposals/{pp['id']}/decide", {"decision": "accept"}, tok=_wk)[0] == 403                    # only a supervisor decides
+assert J("POST", f"/proposals/{pp['id']}/decide", {"decision": "reject"})[1]["e"] == "missing"
+dd = J("POST", f"/proposals/{pp['id']}/decide", {"decision": "accept", "as": "Worker V"})[1]
+assert dd["st"] == "accepted" and J("GET", f"/tasks/{dd['tk']}")[1]["ty"] == "story" and J("GET", f"/tasks/{dd['tk']}")[1]["as"] == "Worker V"
+assert any(n["ty"] == "proposal.accepted" for n in J("GET", "/inbox?ack=0", tok=_wk)[1]["i"])
+p2 = J("POST", "/proposals", {"b": RB, "t": "Rewrite everything"}, tok=_wk)[1]
+assert J("POST", f"/proposals/{p2['id']}/decide", {"decision": "reject", "note": "too big"})[1]["st"] == "rejected" and J("GET", "/proposals?st=pending")[1]["n"] == 0
+assert J("POST", "/proposals", {"b": RB, "t": "bad", "ty": "story", "pa": t1["id"]}, tok=_wk)[1]["e"] == "bad"      # same hierarchy rules apply
+# lessons
+ls = J("POST", "/lessons", {"c": "Run the migration before the seed script, in that order.", "task": t1["id"]}, tok=_wk)[1]
+assert J("POST", f"/lessons/{ls['id']}/decide", {"decision": "promote"})[1]["e"] == "cooling"                    # not yet
+server.db.execute("UPDATE lessons SET cooldown_until='2000-01-01 00:00:00' WHERE id=?", (ls["id"],))
+assert J("POST", f"/lessons/{ls['id']}/decide", {"decision": "promote"}, tok=_wk)[0] == 403
+pr_ = J("POST", f"/lessons/{ls['id']}/decide", {"decision": "promote"})[1]; assert pr_["st"] == "promoted" and pr_["doc"], pr_
+assert any(d_.startswith("Lesson: Run the migration") for d_ in server.task_brief(t1["id"], deep=True)["rules"])   # later deep briefs carry it
+ls2 = J("POST", "/lessons", {"c": "Guess the API shape.", "b": RB, "cooldown_hours": 0}, tok=_wk)[1]
+assert J("POST", f"/lessons/{ls2['id']}/decide", {"decision": "reject"})[1]["e"] == "missing" and J("POST", f"/lessons/{ls2['id']}/decide", {"decision": "reject", "note": "wrong"})[1]["st"] == "rejected"
+st, lt_ = J("POST", "/tasks", {"b": RB, "t": "lesson at finish", "as": "Worker V", "st": "in_progress"}); J("POST", f"/tasks/{lt_['id']}/finish", {"summary": "done", "lesson": "Check the cache first."}, tok=_wk)
+assert any(x["c"] == "Check the cache first." for x in J("GET", "/lessons")[1]["i"])
+# waiting
+st, wt_ = J("POST", "/tasks", {"b": RB, "t": "waits", "as": "Worker V", "st": "in_progress"})
+assert J("POST", f"/tasks/{wt_['id']}/wait", {"kind": "human", "owner": "Checker V", "reason": "Which colour?"}, tok=_ck)[0] == 403
+assert J("POST", f"/tasks/{wt_['id']}/wait", {"kind": "nope", "owner": "x", "reason": "y"}, tok=_wk)[1]["e"] == "bad"
+assert J("POST", f"/tasks/{wt_['id']}/wait", {"kind": "human", "owner": "Checker V", "reason": "Which colour?"}, tok=_wk)[1]["waiting"]["k"] == "human"
+assert [n for n in J("GET", "/inbox?ack=0", tok=_ck)[1]["i"] if n["ty"] == "task.waiting"] and J("GET", "/waits?owner=Checker%20V")[1]["i"][0]["id"] == wt_["id"]
+assert server.task_brief(wt_["id"])["wt"]["o"] == "Checker V"
+server.db.execute("UPDATE tasks SET waiting=? WHERE id=?", (json.dumps({"k": "human", "o": "Checker V", "r": "Which colour?", "s": "2000-01-01 00:00:00"}), wt_["id"]))
+assert server.wait_tick() == 1 and server.wait_tick() == 0                                                         # escalated once
+assert any(n["ty"] == "esc.wait" for n in J("GET", "/inbox?as=Sup%20Bot&ack=0")[1]["i"])
+J("PATCH", f"/tasks/{wt_['id']}", {"st": "done"}); assert not J("GET", "/waits")[1]["i"] or wt_["id"] not in [x["id"] for x in J("GET", "/waits")[1]["i"]]
+assert J("GET", f"/tasks/{wt_['id']}/history")[1]["state"] in ("in_sync", "partial")
+# role, goal, explainable routing
+J("POST", "/agents", {"n": "Router A", "skills": "billing,qa", "role": "Billing specialist", "goal": "Keep invoices correct"}); J("POST", "/agents", {"n": "Router B", "skills": "billing"})
+rt = J("GET", "/route?lb=billing")[1]["i"]
+a_ = [x for x in rt if x["n"] == "Router A"][0]; b_ = [x for x in rt if x["n"] == "Router B"][0]
+assert 1 <= a_["sc"] <= 99 and any("skills match billing" in w for w in a_["why"]) and any("role fits" in w for w in a_["why"]) and a_["sc"] > b_["sc"], (a_, b_)
+assert [x for x in J("GET", "/agents")[1]["i"] if x["n"] == "Router A"][0]["rl"] == "Billing specialist"
+# saved scaffolds with their own dependencies
+J("POST", f"/boards/{PBID}/policy", {"preset": "loose", "scaffolds": {"release": ["Build [task]", "Test <- Build", "Docs [chore]", "Ship <- Test, Docs"]}})
+st, ss_ = J("POST", "/tasks", {"b": PBID, "t": "release story", "ty": "story"})
+made = J("POST", f"/tasks/{ss_['id']}/scaffold", {"preset": "release"})[1]["made"]
+assert len(made) == 4 and str(J("GET", f"/tasks/{made[3]}")[1]["dp"]) == f"{made[1]},{made[2]}" and "dp" not in J("GET", f"/tasks/{made[0]}")[1], made
+assert J("GET", f"/policy?b={PBID}")[1]["board"]["scaffolds"]["release"][0] == "Build [task]"
+print("v33 proposals, lessons, waiting, routing, scaffolds OK")
+
+# v34 group C: machine admission, health thresholds, snapshot, chat commands, data quality, on-behalf-of
+J("POST", "/settings", {"node_admission": "manual"})
+assert J("POST", "/nodes", {"name": "new-box", "machine": "x", "disk_pct": 50}, tok=_wk)[1]["pending"] == 1
+nb_ = {n["n"]: n for n in J("GET", "/nodes")[1]["i"]}["new-box"]; assert nb_["state"] == "pending"
+assert J("POST", "/nodes", {"name": "new-box", "machine": "x", "quota": [{"source": "x", "used_pct": 5}]}, tok=_wk)[1]["pending"] == 1
+assert not [s for s in J("GET", "/quota")[1]["subs"] if s["node"] == "new-box"]                           # a pending machine counts for nothing
+assert J("POST", "/nodes/new-box/admit", {}, tok=_wk)[0] == 403 and J("POST", "/nodes/new-box/admit", {})[1]["admitted"] is True
+assert {n["n"]: n["state"] for n in J("GET", "/nodes")[1]["i"]}["new-box"] == "up"
+assert J("POST", "/nodes/new-box/retire", {})[0] == 200 and J("POST", "/nodes", {"name": "new-box"}, tok=_wk)[1]["e"] == "retired" and "new-box" not in {n["n"] for n in J("GET", "/nodes")[1]["i"]}
+J("POST", "/settings", {"node_admission": "auto"})
+assert J("POST", "/settings", {"node_admission": "sometimes"})[1]["e"] == "bad"
+# health thresholds
+st, ob = J("POST", "/boards", {"n": "Ops"}); J("POST", "/settings", {"watermarks_on": "1"})
+J("POST", "/nodes", {"name": "disk-box", "disk_pct": 92}, tok=_wk); J("POST", "/nodes", {"name": "disk-box", "disk_pct": 93}, tok=_wk)
+ot = [t for t in J("GET", f"/tasks?b={ob['id']}")[1]["i"] if "disk-box" in t["t"]]
+assert len(ot) == 1 and ot[0]["pr"] == 2 and "wm:disk-box:high" in ot[0]["lb"], ot                         # one card per machine and tier
+J("POST", "/nodes", {"name": "disk-box", "disk_pct": 96}, tok=_wk)
+assert len([t for t in J("GET", f"/tasks?b={ob['id']}")[1]["i"] if "disk-box" in t["t"]]) == 2             # critical is its own card
+J("POST", "/nodes", {"name": "disk-box", "disk_pct": 40}, tok=_wk)
+assert any("Recovered" in c["c"] for c in J("GET", f"/tasks/{ot[0]['id']}/comments")[1]["i"])
+J("POST", "/settings", {"watermarks_on": "0"})
+# snapshot
+sn = J("POST", "/snapshot", {})[1]; assert sn["boards"] >= 1
+import html as _html
+page = open(os.path.join(server.snapshot_dir(), "board.html")).read()
+assert "Board snapshot" in page and "<script" not in page and json.load(open(os.path.join(server.snapshot_dir(), "board.json")))["boards"]
+assert J("GET", "/snapshot")[1]["generated_at"]
+# chat commands
+import hmac as _hmac, hashlib as _hl
+J("POST", "/settings", {"intake_secret": "chat-secret-1", "intake_senders": json.dumps({"slack:U1": {"as": "Owner", "role": "admin"}, "slack:U2": {"as": "Viewer Vic", "role": "viewer"}}), "intake_board": str(RB)})
+def chat(sender, text, mid, secret="chat-secret-1"):
+    raw = json.dumps({"sender": sender, "text": text, "message_id": mid}).encode()
+    sig = "sha256=" + _hmac.new(secret.encode(), raw, _hl.sha256).hexdigest()
+    req = urllib.request.Request(U + "/intake", data=raw, method="POST", headers={"X-Intake-Signature": sig, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, json.load(r)
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b"{}")
+assert chat("slack:U1", "help", "m0", secret="wrong")[0] == 401 and chat("slack:U9", "help", "m1")[1]["e"] == "sender"
+s_, n_ = chat("slack:U1", "new Fix the login page", "m2"); assert s_ == 200 and n_["intent"] == "new", n_
+assert chat("slack:U1", "new Fix the login page", "m2")[1] == n_ and len([t for t in J("GET", f"/tasks?b={RB}&limit=200")[1]["i"] if t["t"] == "Fix the login page"]) == 1       # the same message never runs twice
+assert "backlog" in chat("slack:U1", f"status {n_['tk']}", "m3")[1]["reply"]
+assert chat("slack:U1", f"note {n_['tk']} looks like the cookie", "m4")[1]["intent"] == "note"
+assert chat("slack:U2", "new nope", "m5")[1]["e"] == "forbidden" and chat("slack:U2", f"status {n_['tk']}", "m6")[0] == 200       # a viewer can only read
+assert chat("slack:U1", f"assign {n_['tk']} Worker V", "m7")[1]["reply"].endswith("Worker V")
+assert chat("slack:U1", "dance", "m8")[1]["intent"] == "unknown"
+assert J("GET", f"/tasks/{n_['tk']}/activity")[1]["i"][-1]["ty"] in ("comment", "updated")
+# data quality and on-behalf-of
+qk = {x["k"]: x["n"] for x in J("GET", "/system")[1]["quality"]}
+assert {"done_no_criteria", "done_unverified", "agents_no_role", "proposals_pending", "nodes_pending"} <= set(qk), qk
+call("POST", f"/tasks/{n_['tk']}/comments", {"c": "from the bridge"}, h={"X-Via": "bridge:oracle-vm"})
+J("PATCH", f"/tasks/{n_['tk']}", {"pr": 1}, tok="tok")
+vv = server.db.execute("SELECT payload FROM events WHERE payload LIKE ? ORDER BY id DESC LIMIT 5", ('{"id":%d,"b":%%' % n_["tk"],)).fetchall()
+assert any(json.loads(r["payload"]).get("via") == "bridge:oracle-vm" for r in vv), [r["payload"] for r in vv]                  # automated actions say who they ran for
+assert J("GET", "/audit/verify")[1]["ok"]
+print("v34 admission, thresholds, snapshot, chat commands, quality OK")

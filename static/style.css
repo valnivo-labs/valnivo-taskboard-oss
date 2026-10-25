@@ -520,3 +520,9 @@ button.sprow progress{flex:none;height:8px;width:100%}
 .pcard{border:1px solid var(--bd);border-radius:12px;padding:10px 12px;display:flex!important;flex-direction:column!important;gap:3px;cursor:pointer;background:var(--surface);position:relative}
 .pcard input{position:absolute;top:10px;right:10px}.pcard b{color:var(--fg);font-size:13px}.pcard span{font-weight:400;font-size:12px;color:var(--mut);padding-right:18px}.pcard.on{border-color:var(--pri);box-shadow:0 0 0 1px var(--pri)}
 .rulelist{display:grid;grid-template-columns:1fr 1fr;gap:4px 14px;margin-bottom:8px}@media(max-width:640px){.rulelist{grid-template-columns:1fr}}
+
+/* proofs, waits, proposals, lessons */
+.ev{display:flex;flex-direction:column;gap:3px;font-size:13px;margin:4px 0}.ev li{list-style:none;margin-left:-18px}.ev .ok{color:var(--ok)}.ev .open{color:var(--mut)}.ev small{color:var(--mut)}
+.waitbox{border:1px solid var(--bd2);border-radius:12px;padding:12px 14px;display:flex;flex-direction:column;gap:8px;background:var(--subtle)}.waitbox .vf{display:flex;gap:8px;flex-wrap:wrap}.waitbox .vf>*{flex:1;min-width:120px}
+.qrow{display:flex;gap:10px;align-items:center;padding:8px 0;border-top:1px solid var(--bd2)}.qrow:first-of-type{border-top:0}.qrow .qtx{flex:1;min-width:0}.qrow .qtx small{color:var(--mut);display:block}
+.qlist{display:grid;grid-template-columns:1fr auto;gap:4px 14px;font-size:13px}.qlist .z{color:var(--mut)}.qlist .nz{font-weight:600}
