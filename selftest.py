@@ -1601,3 +1601,14 @@ assert J("POST", "/tasks", {"b": RB, "t": "no", "ch": "X"}, tok=wv)[0] == 403 an
 J("POST", "/settings", {"witness_names": ""})
 assert J("GET", "/events/feed?limit=1", tok=wv)[0] == 403
 print("v36 witness token OK")
+
+# v37 the witness reports its state; silent or bad state tells the supervisors once
+J("POST", "/settings", {"witness_names": "assure-witness"})
+assert J("POST", "/assure/report", {"events": 5, "findings": 0, "head": "ab", "ok": True}, tok=wv)[0] == 200
+assert J("POST", "/assure/report", {"events": 5}, tok=ov)[0] == 403 and J("POST", "/assure/report", {"events": "x"}, tok=wv)[0] == 400
+sy = J("GET", "/system?days=1")[1]["assure"]; assert sy["events"] == 5 and not sy["silent"] and not sy["bad"], sy
+assert J("POST", "/assure/report", {"events": 6, "findings": 2}, tok=wv)[0] == 200 and J("GET", "/system?days=1")[1]["assure"]["bad"]
+assert J("POST", "/tasks", {"b": RB, "t": "no", "ch": "X"}, tok=wv)[0] == 403
+J("POST", "/settings", {"witness_names": ""})
+assert J("POST", "/assure/report", {"events": 5}, tok=wv)[0] == 403
+print("v37 assure status OK")

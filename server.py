@@ -326,6 +326,7 @@ def nudge_tick(board_id=None, actor="system"):
         try:
             risk_alerts()
             housekeeping(actor)
+            assure_tick(actor)
         except Exception:
             pass
     return {"set": n_set, "cleared": n_clr, "unblocked": n_ub}
@@ -2281,7 +2282,7 @@ def system_get(q, role):
     long_c = db.execute("SELECT COUNT(*) FROM comments WHERE ts>=? AND LENGTH(body)>1500", (since,)).fetchone()[0]
     out = {"days": days, "nodes": nodes_list()["i"], "quota": quota_view(), "series": series, "spend": usage_history(days), "long_comments": long_c, "quality": quality_list(),
            "runs": {"total": len(runs), "by": sorted(by.values(), key=lambda e: -e["n"]), "with_cost": with_cost},
-           "accept": {"done_with_criteria": ac["n"] or 0, "verified": int(ac["v"] or 0)}, "receipts": rec}
+           "accept": {"done_with_criteria": ac["n"] or 0, "verified": int(ac["v"] or 0)}, "receipts": rec, "assure": assure_view()}
     if _priv(role):
         c = audit_verify(role)
         out["chain"] = {"ok": c["ok"], "n": c["n"], **({"broken": c["broken"]} if not c["ok"] else {})}
@@ -4505,6 +4506,58 @@ def today_extras(q, actor, role):
     return {"props": proposals_list(q), "less": lessons_list(q), "waits": waits_list(q), "nodes": nodes_list()["i"], "quota": quota_view(), "vq": verify_queue(q, actor, role)}
 
 
+def _witness(actor):
+    return (actor or "").lower() in {x.strip().lower() for x in get_setting("witness_names").split(",") if x.strip()}
+
+
+def assure_report(actor, role, body):
+    """The outside witness says how far it has got. Only the named witness (or an admin) may; the token itself stays a viewer."""
+    if role != "admin" and not _witness(actor):
+        raise ApiError("forbidden", 403)
+    keep = {k: body[k] for k in ("events", "head", "findings", "checkpoints", "signed", "last_checkpoint", "ok", "version") if k in body}
+    if not isinstance(keep.get("events", 0), int) or not isinstance(keep.get("findings", 0), int):
+        raise ApiError("bad", 400, "events")
+    keep = {k: (v[:80] if isinstance(v, str) else v) for k, v in keep.items()}
+    keep["at"] = time.time()
+    with lock:
+        set_setting("assure_status", json.dumps(keep, separators=(",", ":")))
+        assure_tick(actor)
+    return {"ok": 1}
+
+
+def assure_view():
+    try:
+        d = json.loads(get_setting("assure_status") or "null")
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        return None
+    d["age"] = int(max(0, time.time() - float(d.get("at") or 0)))
+    d["silent"] = d["age"] > 6 * 3600
+    d["bad"] = bool(d.get("findings")) or d.get("ok") is False
+    return d
+
+
+def assure_tick(actor):
+    """Tell the supervisors once when the witness goes silent for six hours or reports a finding or a broken chain, and once when it recovers."""
+    v = assure_view()
+    if not v:
+        return
+    state = "silent" if v["silent"] else "findings" if v["bad"] else ""
+    if state == get_setting("assure_alerted", ""):
+        return
+    set_setting("assure_alerted", state or "ok")
+    if state == "silent":
+        msg = "The outside witness (Assure) has not reported for %d hours" % (v["age"] // 3600)
+    elif state == "findings":
+        msg = "The outside witness (Assure) reports %s" % ("a broken chain" if v.get("ok") is False else "%d finding(s) to look at" % v["findings"])
+    else:
+        msg = ""
+    if msg:
+        escalate("assure", actor, None, None, msg)
+        post_async(get_setting("alert_url"), msg)
+
+
 def events_feed(q, role, actor=""):
     """Raw audit events with their chain hashes, for an independent witness: since=<id> (exclusive), limit (default 500, max 1000), or ids=1,2,3."""
     if not _priv(role) and (actor or "").lower() not in {x.strip().lower() for x in get_setting("witness_names").split(",") if x.strip()}:
@@ -6541,6 +6594,8 @@ class H(BaseHTTPRequestHandler):
                 bid = qint(q, "b") or qint(q, "board_id")
                 res = nudge_tick(bid, actor=actor or "agent")
                 return self.send_json(200, {"ok": True, **res, "h": NUDGE_HOURS})
+            if path == "/api/assure/report" and method == "POST":
+                return self.send_json(200, assure_report(actor, self.role, self.read_body()))
             if self.role == "viewer" and method != "GET":
                 return self.err("forbidden", 403)
             self.scope_check(method, path, q)
