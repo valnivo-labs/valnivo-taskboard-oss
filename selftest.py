@@ -1583,3 +1583,11 @@ vv = server.db.execute("SELECT payload FROM events WHERE payload LIKE ? ORDER BY
 assert any(json.loads(r["payload"]).get("via") == "bridge:oracle-vm" for r in vv), [r["payload"] for r in vv]                  # automated actions say who they ran for
 assert J("GET", "/audit/verify")[1]["ok"]
 print("v34 admission, thresholds, snapshot, chat commands, quality OK")
+
+# v35 raw event feed for an outside witness
+fd = J("GET", "/events/feed?since=0&limit=3")[1]
+assert len(fd["i"]) == 3 and fd["last"] == fd["i"][-1]["id"] and {"id", "ts", "actor", "type", "payload", "h", "hp"} <= set(fd["i"][0]), fd
+nx = J("GET", f"/events/feed?since={fd['last']}&limit=2")[1]; assert nx["i"][0]["id"] > fd["last"]
+assert [e["id"] for e in J("GET", f"/events/feed?ids={fd['i'][2]['id']},{fd['i'][0]['id']}")[1]["i"]] == [fd["i"][0]["id"], fd["i"][2]["id"]]
+assert J("GET", "/events/feed", tok=_wk)[0] == 403
+print("v35 event feed OK")

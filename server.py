@@ -4505,6 +4505,18 @@ def today_extras(q, actor, role):
     return {"props": proposals_list(q), "less": lessons_list(q), "waits": waits_list(q), "nodes": nodes_list()["i"], "quota": quota_view(), "vq": verify_queue(q, actor, role)}
 
 
+def events_feed(q, role):
+    """Raw audit events with their chain hashes, for an independent witness: since=<id> (exclusive), limit (default 500, max 1000), or ids=1,2,3."""
+    if not _priv(role):
+        raise ApiError("forbidden", 403)
+    ids = [int(x) for x in re.findall(r"\d+", _qv(q, "ids") or "")][:500]
+    if ids:
+        rs = rows("SELECT id, ts, actor, type, payload, h, hp FROM events WHERE id IN (%s) ORDER BY id" % ",".join("?" * len(ids)), ids)
+    else:
+        rs = rows("SELECT id, ts, actor, type, payload, h, hp FROM events WHERE id>? ORDER BY id LIMIT ?", (qint(q, "since", 0) or 0, max(1, min(qint(q, "limit", 500) or 500, 1000))))
+    return {"i": [dict(r) for r in rs], "last": rs[-1]["id"] if rs else 0}
+
+
 def route_candidates(skill="", labels="", bid=None):
     want = {x.strip().lower() for x in (str(skill) + "," + str(labels)).split(",") if x.strip()}
     sil = silent_agents()
@@ -6841,6 +6853,8 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, node_admit(actor, self.role, unquote(mnd.group(1)), mnd.group(2)))
             if path == "/api/snapshot" and method in ("GET", "POST") and _priv(self.role):
                 return self.send_json(200, snapshot_write() if method == "POST" else {"generated_at": json.load(open(os.path.join(snapshot_dir(), "board.json")))["generated_at"] if os.path.exists(os.path.join(snapshot_dir(), "board.json")) else None, "dir": snapshot_dir()})
+            if path == "/api/events/feed" and method == "GET":
+                return self.send_json(200, events_feed(q, self.role))
             if path == "/api/verify/queue" and method == "GET":
                 return self.send_json(200, verify_queue(q, actor, self.role))
             if path == "/api/faq" and method == "GET":
