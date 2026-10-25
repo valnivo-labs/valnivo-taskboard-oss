@@ -151,3 +151,9 @@ Add `https://<your host>/api/mcp?key=<agent token>` as an MCP server (add `&tool
 - **Timeline:** `timeline {id}` returns items (each with `src`: `recorded` = the board saw it, `reported` = someone said so), batons (who held it), lanes (runs per agent) and a graph of related tasks.
 - **History chain:** `audit_verify` (supervisor/admin) says whether any past event was changed or removed. Setting `holder_only=1` limits changes to a held task to its holder, supervisors and admins; comments stay open to everyone.
 - **Machines and limits:** a machine that runs agents reports itself with `node_report {name, machine, agents, running, dispatch, quota}`; `nodes` lists them (up within 3 minutes of the last report, quiet within 15, else down); `quota` shows quota hits and daily limits; `system {days}` is the overview.
+
+## Pipelines, strict moves and history replay
+
+- **Pipeline:** `pl` on a task = one stage per line, `name | holder | gate`. Gates: `auto` (the holder passes the baton on), `review` (the holder can also send it back one stage, with a note) and `human` (the task waits in review for that person's `decide_review`; approve moves on, changes sends it back). `stage {id, action: start|done|reject, note}`. Only the stage holder (or a supervisor/admin) moves it. After the last stage the task is done, through the board's done gate.
+- **Strict moves:** with `strict_moves=1`, status changes follow backlog→todo/in_progress, todo→in_progress/blocked, in_progress→review/done/blocked, review→in_progress/done/blocked, blocked→todo/in_progress, done→in_progress/todo, declined→backlog/todo/in_progress. Anything else answers 409 `move`; `force=1` from a supervisor or admin overrides.
+- **History:** events carry `p`, the earlier value of each changed field. `history {id}` replays them and says `in_sync`, `partial` or `drift`.

@@ -7,9 +7,15 @@ const SUG_LB = ["bug", "feature", "chore", "docs", "gate", "next", "blocked-exte
 const LB_DISP = {nudge: "Nudge"};
 const lbShow = l => LB_DISP[l] || l;
 const BASE = (location.pathname.match(/^(\/taskboard(?=\/|$))/) || ["", ""])[1];
+const ERR_TXT = {
+  move: f => "That move is not allowed" + (f.includes(">") ? " (" + f.split(">")[0].replace("_", " ") + " → " + f.split(">")[1].replace("_", " ") + ")" : "") + ". An admin can override it with force.",
+  holder: f => "Only " + (f || "the holder") + " can change this task right now.",
+  independent: () => "Someone other than the worker has to verify this.",
+  gate: () => "This stage waits for a person to decide it (Review tab).",
+};
 // short event keys -> full task/sprint/board fields
 const KM = {
-  task: {du: "due", cs: "cost", tk: "tokens", b: "board_id", s: "sprint_id", t: "title", d: "description", st: "status", pr: "priority", as: "assignee", k: "kind", u: "updated", bl: "blocker", bb: "blocked_by", lb: "labels", ch: "channel", w: "watch", sh: "short_url", vid: "video_id", at: "publish_at", pu: "pr_url", sha: "sha", cm: "commits", dp: "depends", pt: "points", cb: "claimed_by", cu: "claim_until", v: "version", dn: "dod_done", ac: "accept", vb: "verified_by", va: "verified_at", vn: "verified_note", ty: "type", pa: "parent", tg: "target", cr: "current"},
+  task: {du: "due", cs: "cost", tk: "tokens", b: "board_id", s: "sprint_id", t: "title", d: "description", st: "status", pr: "priority", as: "assignee", k: "kind", u: "updated", bl: "blocker", bb: "blocked_by", lb: "labels", ch: "channel", w: "watch", sh: "short_url", vid: "video_id", at: "publish_at", pu: "pr_url", sha: "sha", cm: "commits", dp: "depends", pt: "points", cb: "claimed_by", cu: "claim_until", v: "version", dn: "dod_done", pl: "pipeline", sg: "stage", ac: "accept", vb: "verified_by", va: "verified_at", vn: "verified_note", ty: "type", pa: "parent", tg: "target", cr: "current"},
   sprint: {b: "board_id", n: "name", g: "goal", from: "start", to: "end", st: "state"},
   board: {n: "name", d: "description", tm: "team"},
 };
@@ -53,7 +59,7 @@ async function api(m, p, b) {
     if (!r.ok) {
       if (m === "GET" && r.status >= 500 && i < 3) { await sleep(300 * 3 ** i); continue; }
       if (j.e === "auth") { localStorage.removeItem("tb_token"); toast("Auth failed — reload and enter a valid token"); }
-      else toast("Error: " + j.e + (j.f ? " (" + j.f + ")" : ""));
+      else toast(ERR_TXT[j.e] ? ERR_TXT[j.e](j.f || "") : "Error: " + j.e + (j.f ? " (" + j.f + ")" : ""));
       throw j;
     }
     return j;
@@ -190,6 +196,7 @@ function card(t) {
   if (od.length) meta.push(`<span class="chip dep" title="Waiting on open dependencies">⛓ ${od.map(i => "#" + i).join(" ")}</span>`);
   if (B && B.multi && BS[t.board_id]) meta.unshift(`<span class="chip bd" style="--h:${hue(BS[t.board_id].name.toLowerCase())}" title="Board">${esc(BS[t.board_id].name)}</span>`);
   if (t.accept && (t.status === "done" || t.status === "review")) meta.push(t.verified_by ? `<span class="chip vok" title="Checked against the acceptance criteria by ${esc(t.verified_by)}">✓ verified</span>` : `<span class="chip vno" title="Reported complete, not yet checked by someone else">not verified</span>`);
+  if (t.pipeline) { const ps = pipeOf(t); if (ps.length) meta.push(`<span class="chip" title="Pipeline stage">${t.stage > ps.length ? "pipeline done" : t.stage ? "stage " + t.stage + "/" + ps.length + " · " + esc(ps[t.stage - 1].name) : "pipeline not started"}</span>`); }
   if (t.type && t.type !== "task") meta.push(`<span class="chip ty ${esc(t.type)}">${esc(t.type)}</span>`);
   if (t.parent) { const ep = B && B.tasks.find(y => y.id == t.parent); meta.push(`<span class="chip epic" title="Epic">epic: ${ep ? esc(ep.title.slice(0, 18)) : "#" + t.parent}</span>`); }
   if (t.type === "epic" && B) { const ks = B.tasks.filter(y => y.parent == t.id); if (ks.length) meta.push(`<span class="chip" title="Epic progress">${ks.filter(y => y.status === "done").length}/${ks.length} done</span>`); }
@@ -299,6 +306,19 @@ async function renderSystem() {
 }
 $("v-system").addEventListener("click", e => { const b = e.target.closest("[data-days]"); if (b) { sysDays = +b.dataset.days; localStorage.tb_sysdays = sysDays; renderSystem(); } });
 
+const pipeOf = t => { try { return t.pipeline ? JSON.parse(t.pipeline) : []; } catch (_) { return []; } };
+const pipeText = t => pipeOf(t).map(s => `${s.name} | ${s.holder} | ${s.gate}`).join("\n");
+const GATE_TXT = {auto: "holder passes it on", review: "holder can send it back", human: "a person decides"};
+function pipeBox(t) {
+  const ps = pipeOf(t); if (!ps.length) return "";
+  const cur = t.stage || 0, done = cur > ps.length, mine = (t.assignee || "").toLowerCase();
+  const strip = ps.map((s, i) => `<div class="stg ${i + 1 === cur ? "on" : i + 1 < cur ? "past" : ""}"><b>${i + 1}. ${esc(s.name)}</b><small>${esc(s.holder)}</small><span class="g" title="${GATE_TXT[s.gate]}">${s.gate === "human" ? "human gate" : s.gate}</span></div>`).join('<span class="muted">→</span>');
+  const s = ps[cur - 1];
+  const ctl = !cur ? '<button type="button" class="mini primary" id="pgs">Start the pipeline</button>' : done ? '<span class="muted">All stages passed.</span>'
+    : s.gate === "human" ? `<span class="muted">Waiting for ${esc(s.holder)} to decide (Review tab).</span>`
+    : `<input id="pgn" placeholder="Note (required to send back)"><button type="button" class="mini primary" id="pgd">Pass on</button>${s.gate === "review" && cur > 1 ? '<button type="button" class="mini" id="pgr">Send back</button>' : ""}`;
+  return `<div class="pipe"><label>Pipeline <span class="muted">(${done ? "finished" : cur ? "stage " + cur + " of " + ps.length : "not started"})</span></label><div class="stages">${strip}</div><div class="vf">${ctl}</div></div>`;
+}
 function colHtml(s, ts) {
   const c = ts.filter(t => t.status === s).sort((x, y) => x.priority - y.priority || x.id - y.id);
   const lim = meth().wip ? (bcfg().wip || {})[s] : 0, over = lim && c.length > lim;
@@ -560,6 +580,7 @@ async function renderAdmin() {
       <div class="row2"><label>Wake sleeping agents after (minutes, 0 = off)<input type="number" name="wake_after_min" min="0" max="1440" value="${esc(se.wake_after_min || 10)}"></label><label>Close a task when its PR merges<select name="git_autodone"><option value="1" ${se.git_autodone !== "0" ? "selected" : ""}>Yes (if the gate allows)</option><option value="0" ${se.git_autodone === "0" ? "selected" : ""}>No, only comment</option></select></label></div>
       <label>Mark a run as lost after (minutes without a sign of life, 0 = off)<input type="number" name="run_lost_min" min="0" max="1440" value="${esc(se.run_lost_min || 90)}"></label>
       <label>Monthly budget for all boards (USD, blank = none)<input type="number" step="any" min="0" name="budget_usd" value="${esc(se.budget_usd)}"></label>
+      <div class="row2"><label>Task moves<select name="strict_moves"><option value="0" ${se.strict_moves !== "1" ? "selected" : ""}>Any move</option><option value="1" ${se.strict_moves === "1" ? "selected" : ""}>Strict (follow the allowed paths)</option></select></label><label>Tasks someone is holding<select name="holder_only"><option value="0" ${se.holder_only !== "1" ? "selected" : ""}>Anyone with access can change</option><option value="1" ${se.holder_only === "1" ? "selected" : ""}>Only the holder, a supervisor or an admin</option></select></label></div>
       <label>Daily limits per agent <span class="muted">(JSON, per UTC day: jobs, usd, secs; "*" = everyone)</span><textarea name="agent_limits" rows="2" placeholder='{"*": {"jobs": 40}, "coder-agent": {"usd": 5}}'>${esc(se.agent_limits)}</textarea></label>
       <label>Sites allowed to show images, video and audio <span class="muted">(https addresses, comma separated; only needed when the server restricts content)</span><input name="media_hosts" value="${esc(se.media_hosts)}" placeholder="https://media.example.com"></label>
       <label>Model prices <span class="muted">(JSON, USD per million tokens [input, output], used when an agent reports tokens without a cost)</span><textarea name="prices" rows="2" placeholder='{"my-model": [3, 15]}'>${esc(se.prices)}</textarea></label>
@@ -1061,6 +1082,8 @@ function taskDlg(id, status, title, boardId, pri) {
     <div class="tp" data-p="details">
     <label>Title<input name="title" required value="${esc(t.title)}"></label>
     <label>Description<textarea name="description">${esc(t.description)}</textarea></label>
+    ${pipeBox(t)}
+    <label>Pipeline <span class="muted">(optional: one stage per line as name | holder | auto, review or human; the baton moves holder to holder)</span><textarea name="pipeline" rows="3" placeholder="Build | coder-agent | auto&#10;Check | checker-agent | review&#10;Sign off | owner | human">${esc(pipeText(t))}</textarea></label>
     <label>Acceptance criteria <span class="muted">(what "done" means, one per line)</span><textarea name="accept" rows="3" placeholder="Tests pass&#10;Docs updated">${esc(t.accept || "")}</textarea></label>
     <div class="row2"><label>Assignee (agent or person — they get notified)<input name="assignee" list="ppl" value="${esc(t.assignee)}"><datalist id="ppl">${people.map(p => `<option value="${esc(p)}">`).join("")}</datalist></label>
     <label>Kind<select name="kind">${opt(["agent", "human"], t.kind)}</select></label></div>
@@ -1168,8 +1191,8 @@ function taskDlg(id, status, title, boardId, pri) {
     let actLoaded = false;
     const loadAct = async () => {
       if (actLoaded) return; actLoaded = true;
-      const r = await api("GET", `/tasks/${id}/timeline`);
-      $("actl").innerHTML = timelineHtml(r);
+      const [r, h] = await Promise.all([api("GET", `/tasks/${id}/timeline`), api("GET", `/tasks/${id}/history`).catch(() => null)]);
+      $("actl").innerHTML = timelineHtml(r) + (h ? `<div class="hist ${h.state === "drift" ? "bad" : h.state === "in_sync" ? "ok" : "muted"}">${h.state === "in_sync" ? "✓ The card matches its recorded history." : h.state === "partial" ? "The card has values older than its recorded history (" + h.unknown.join(", ") + ")." : "✗ The card disagrees with its history: " + h.diff.map(x => x.k).join(", ")}</div>` : "");
     };
     const loadFiles = async () => {
       const r = await api("GET", `/tasks/${id}/attachments`);
@@ -1186,6 +1209,7 @@ function taskDlg(id, status, title, boardId, pri) {
       try {
         if (t_.id === "faadd") { const n = $("fan").value.trim(); if (!n) return; await api("POST", `/tasks/${id}/attachments`, {name: n, url: $("fau").value.trim(), kind: $("fak").value}); loadFiles(); }
         else if (t_.dataset && t_.dataset.delatt) { await api("DELETE", "/attachments/" + t_.dataset.delatt); loadFiles(); }
+        else if (t_.id === "pgs" || t_.id === "pgd" || t_.id === "pgr") { const n = ($("pgn") || {}).value ? $("pgn").value.trim() : ""; if (t_.id === "pgr" && !n) { toast("Say what needs fixing"); return; } await api("POST", `/tasks/${id}/stage`, {action: t_.id === "pgs" ? "start" : t_.id === "pgd" ? "done" : "reject", note: n}); toast("Done"); $("dlg").close(); dirty = false; loadBoard(); }
         else if (t_.id === "vfok" || t_.id === "vfno") { const n = $("vfn").value.trim(); if (t_.id === "vfno" && !n) { toast("Say what is missing"); return; } await api("POST", `/tasks/${id}/verify`, {ok: t_.id === "vfok", note: n}); toast(t_.id === "vfok" ? "Verified" : "Sent back"); $("dlg").close(); dirty = false; loadBoard(); }
         else if (t_.id === "rvreq") { const to = $("rvto").value.trim(); if (!to) return; await api("POST", `/tasks/${id}/review`, {reviewer: to, note: $("rvn").value.trim()}); loadReviews(); }
         else if (t_.dataset && t_.dataset.rvdec) { const note = document.querySelector(`.rvnote[data-rv="${t_.dataset.rv}"]`).value.trim(); await api("POST", `/reviews/${t_.dataset.rv}/decide`, {decision: t_.dataset.rvdec, note}); loadReviews(); }

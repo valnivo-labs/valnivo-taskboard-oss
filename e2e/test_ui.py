@@ -398,6 +398,28 @@ def test_task_timeline_and_independent_check(page):
     assert "who held it" in page.inner_text("#actl").lower()
 
 
+def test_pipeline_baton_and_strict_move_message(page):
+    b, _ = mkboard("Pipeline %d" % time.time())
+    t = mktask(b, "pipeline subject", pl="Build | admin | auto\nCheck | someone-else | review")
+    api("POST", "/tasks/%d/stage" % t, {"action": "start"})
+    goto(page, scope="b:%d" % b)
+    page.click(".card[data-id='%d'] .t" % t)
+    page.wait_for_selector("#pgd")
+    page.click("#pgd")
+    page.wait_for_selector("#toast:has-text('Done')")
+    task = api("GET", "/tasks/%d" % t)
+    assert task["sg"] == 2 and task["as"] == "someone-else", task
+    api("POST", "/settings", {"strict_moves": "1"})
+    try:
+        goto(page, scope="b:%d" % b)
+        page.click(".card[data-id='%d'] .t" % t)
+        page.select_option("#f [name=status]", "done")
+        page.click("#dsave")
+        page.wait_for_selector("#toast:has-text('not allowed')")
+    finally:
+        api("POST", "/settings", {"strict_moves": "0"})
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

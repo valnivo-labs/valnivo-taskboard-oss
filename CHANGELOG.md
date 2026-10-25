@@ -7,6 +7,9 @@
 - Chat channels for humans: Slack, Discord, Teams, Telegram or generic JSON for blocked, done, escalations, sprints, budgets and git events.
 - Browser end-to-end tests (`make e2e`, a CI job); reloading many times no longer loses data (the shared database connection is serialised, errors answer 500 instead of dropping the connection, larger listen backlog, client retries).
 ## Unreleased
+- Before and after on every change: each task event now carries the earlier value of what changed, the timeline shows "priority 3 -> 1", and `history {id}` replays a task's events and compares them with the card (in sync, partial for values older than the log, or drift).
+- Strict moves (setting `strict_moves=1`, Admin → Budgets): a task only moves along the allowed paths; a supervisor or admin can override with `force`.
+- Pipelines: a task can carry ordered stages (`pl`: name | holder | auto, review or human). `stage` starts it, the holder passes the baton on, a review stage can send it back one stage with a reason, and a human stage parks the task until that person approves or sends it back. Past the last stage the task is done.
 - Acceptance criteria per card (`accept`, one per line) and independent verification: someone other than the worker checks the result and records it (`verify`, task dialog → Independent check). A card shows "verified" or "not verified"; the worker cannot verify their own work.
 - Tamper-evident history: every audit event is chained to the one before it, so an edited or removed event is found (`audit_verify`, Admin → Audit log). Optional setting `holder_only=1`: a task someone currently holds can only be changed by that holder, a supervisor or an admin.
 - Task timeline (task dialog → Timeline, `timeline` tool): who held the task and when, related tasks (delegation, dependency, blocks), runs by agent as lanes, and everything that happened, each marked as recorded by the board or reported by someone.

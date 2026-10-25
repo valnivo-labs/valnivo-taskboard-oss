@@ -191,7 +191,7 @@ st, r = J("POST", f"/tasks/{H['id']}/handoff", {"to": "Dev C", "summary": "API d
 n = J("GET", "/inbox?as=Dev%20C")[1]["i"]; assert [x["ty"] for x in n] == ["task.handoff"] and "write tests" in n[0]["m"], n
 assert any(x["ty"] == "task.unassigned" for x in J("GET", "/inbox?as=Dev%20A")[1]["i"])
 act = J("GET", f"/tasks/{H['id']}/activity")[1]["i"]
-assert [a["ty"] for a in act][0] == "created" and any("assignee -> Dev C" in a["m"] for a in act) and act[-1]["ty"] == "comment", act
+assert [a["ty"] for a in act][0] == "created" and any("assignee Dev A -> Dev C" in a["m"] for a in act) and act[-1]["ty"] == "comment", act
 assert J("POST", f"/tasks/{H['id']}/handoff", {"to": "Owner", "summary": "needs you"})[1]["e"] == "owner_fmt"
 
 # ---- supervisor escalations
@@ -1194,3 +1194,60 @@ assert sy["days"] == 7 and len(sy["series"]) == 7 and sy["runs"]["total"] >= 1 a
 assert any(r["by"] == "Worker V" for r in sy["receipts"]) and len(J("GET", "/system?days=30")[1]["series"]) == 30 and "chain" not in J("GET", "/system", tok=_ck)[1]
 J("POST", "/settings", {"agent_limits": ""})
 print("v26 nodes, quota, system overview OK")
+
+# v27 before/after history, replay and drift check, strict moves, pipelines with human gates
+st, ht = J("POST", "/tasks", {"b": RB, "t": "history subject", "pr": 3, "st": "todo", "as": "Worker V"})
+J("PATCH", f"/tasks/{ht['id']}", {"pr": 1})
+J("PATCH", f"/tasks/{ht['id']}", {"st": "in_progress", "as": "Checker V"})
+evs = [json.loads(e["payload"]) for e in server.db.execute("SELECT payload FROM events WHERE type='task.updated' AND payload LIKE ? ORDER BY id", ('{"id":%d,"b":%%' % ht["id"],)).fetchall()]
+assert evs[0]["p"] == {"pr": 3} and evs[1]["p"] == {"st": "todo", "as": "Worker V"}, evs               # the earlier value rides on every change
+assert any("priority 3 -> 1" in x["m"] for x in J("GET", f"/tasks/{ht['id']}/activity")[1]["i"])
+assert J("GET", f"/tasks/{ht['id']}/history")[1]["state"] == "in_sync"
+server.db.execute("UPDATE tasks SET priority=4 WHERE id=?", (ht["id"],))                              # a change that bypassed the log
+hs = J("GET", f"/tasks/{ht['id']}/history")[1]
+assert hs["state"] == "drift" and hs["diff"][0]["k"] == "pr" and hs["diff"][0]["log"] == 1, hs
+server.db.execute("UPDATE tasks SET priority=1 WHERE id=?", (ht["id"],))
+assert J("GET", f"/tasks/{ht['id']}/history")[1]["state"] == "in_sync"
+server.db.execute("DELETE FROM task_state WHERE task_id=?", (ht["id"],)); J("PATCH", f"/tasks/{ht['id']}", {"pr": 2})             # state is rebuilt from the log when missing
+assert [json.loads(e["payload"]) for e in server.db.execute("SELECT payload FROM events WHERE type='task.updated' AND payload LIKE ? ORDER BY id DESC LIMIT 1", ('{"id":%d,"b":%%' % ht["id"],)).fetchall()][0]["p"] == {"pr": 1}
+assert J("GET", "/audit/verify")[1]["ok"]
+# strict moves
+st, sm = J("POST", "/tasks", {"b": RB, "t": "strict subject", "st": "backlog", "as": "Worker V"})
+J("POST", "/settings", {"strict_moves": "1"})
+r_ = J("PATCH", f"/tasks/{sm['id']}", {"st": "done"}, tok=_wk); assert r_[0] == 409 and r_[1]["f"] == "backlog>done", r_
+assert J("PATCH", f"/tasks/{sm['id']}", {"st": "done"}, tok=_wk)[0] == 409 and J("PATCH", f"/tasks/{sm['id']}", {"st": "todo"}, tok=_wk)[0] == 200
+assert J("PATCH", f"/tasks/{sm['id']}", {"st": "done", "force": 1})[0] == 200                          # an admin can override
+assert J("PATCH", f"/tasks/{sm['id']}", {"st": "declined"}, tok=_wk)[0] == 409                        # done only reopens
+J("POST", "/settings", {"strict_moves": "0"})
+assert J("PATCH", f"/tasks/{sm['id']}", {"st": "review"}, tok=_wk)[0] == 200                           # off again: any move works
+# pipelines
+_bk = J("POST", "/tokens", {"n": "Boss V", "role": "agent"})[1]["token"]
+st, pt = J("POST", "/tasks", {"b": RB, "t": "pipeline subject", "st": "backlog", "pl": "Build | Worker V | auto\nCheck | Checker V | review\nSign off | Boss V | human"})
+assert st == 201 and [x["gate"] for x in json.loads(pt["pl"])] == ["auto", "review", "human"], pt
+assert J("POST", "/tasks", {"b": RB, "t": "x", "pl": "A | B | nope"})[1]["e"] == "bad"
+pid = pt["id"]
+assert J("POST", f"/tasks/{pid}/stage", {"action": "done"}, tok=_wk)[0] == 400                          # not started yet
+s0 = J("POST", f"/tasks/{pid}/stage", {"action": "start"}, tok=_wk)[1]
+assert (s0["as"], s0["st"], s0["sg"]) == ("Worker V", "todo", 1), s0
+assert J("POST", f"/tasks/{pid}/stage", {"action": "start"}, tok=_wk)[0] == 400                          # it cannot be started twice
+assert J("POST", f"/tasks/{pid}/stage", {"action": "done"}, tok=_ck)[0] == 403                          # only the holder passes the baton
+assert J("POST", f"/tasks/{pid}/stage", {"action": "done"}, tok=_wk)[1]["as"] == "Checker V"
+assert J("POST", f"/tasks/{pid}/stage", {"action": "reject"}, tok=_ck)[1]["e"] == "bad"                # sending back needs a reason
+assert J("POST", f"/tasks/{pid}/stage", {"action": "reject", "note": "tests missing"}, tok=_ck)[1]["as"] == "Worker V"
+J("POST", f"/tasks/{pid}/stage", {"action": "done"}, tok=_wk)
+g = J("POST", f"/tasks/{pid}/stage", {"action": "done"}, tok=_ck)[1]
+assert (g["as"], g["st"], g["sg"]) == ("Boss V", "review", 3), g                                       # parked at the human gate
+assert J("POST", f"/tasks/{pid}/stage", {"action": "done"}, tok=_bk)[1]["e"] == "gate"                 # a human gate only moves on a decision
+pend = [x for x in J("GET", "/reviews?to=Boss%20V", tok=_bk)[1]["i"] if x["tk"] == pid]
+assert pend, J("GET", "/reviews?to=Boss%20V", tok=_bk)[1]
+assert J("POST", f"/reviews/{pend[0]['id']}/decide", {"decision": "approve"}, tok=_wk)[0] == 403
+back = J("POST", f"/reviews/{pend[0]['id']}/decide", {"decision": "changes", "note": "not yet"}, tok=_bk)[1]
+assert J("GET", f"/tasks/{pid}", tok=_bk)[1]["sg"] == 2 and J("GET", f"/tasks/{pid}", tok=_bk)[1]["as"] == "Checker V"   # a "changes" decision sends it back one stage
+J("POST", f"/tasks/{pid}/stage", {"action": "done"}, tok=_ck)
+pend = [x for x in J("GET", "/reviews?to=Boss%20V", tok=_bk)[1]["i"] if x["tk"] == pid]
+J("POST", f"/reviews/{pend[0]['id']}/decide", {"decision": "approve", "note": "ship it"}, tok=_bk)
+fin = J("GET", f"/tasks/{pid}", tok=_bk)[1]
+assert fin["st"] == "done" and fin["sg"] == 4, fin
+assert J("GET", f"/tasks/{pid}/history")[1]["state"] in ("in_sync", "partial")
+assert J("GET", "/audit/verify")[1]["ok"]
+print("v27 before/after, drift, strict moves, pipelines OK")

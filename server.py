@@ -160,12 +160,14 @@ for _t, _c, _d in (("tasks", "blocker", "TEXT DEFAULT ''"), ("tasks", "blocked_b
                    ("reviews", "kind", "TEXT DEFAULT 'review'"),
                    ("tasks", "accept", "TEXT DEFAULT ''"), ("tasks", "verified_by", "TEXT DEFAULT ''"), ("tasks", "verified_at", "TEXT DEFAULT ''"), ("tasks", "verified_note", "TEXT DEFAULT ''"),
                    ("events", "h", "TEXT DEFAULT ''"), ("events", "hp", "TEXT DEFAULT ''"),
+                   ("tasks", "pipeline", "TEXT DEFAULT ''"), ("tasks", "stage", "INTEGER DEFAULT 0"),
                    ("agents", "wake_at", "TEXT DEFAULT ''"), ("agents", "wake_n", "INTEGER DEFAULT 0")):
     if _c not in [r[1] for r in db.execute(f"PRAGMA table_info({_t})")]:
         db.execute(f"ALTER TABLE {_t} ADD COLUMN {_c} {_d}")
 if "woken" not in [r[1] for r in db.execute("PRAGMA table_info(notifications)")]:
     db.execute("ALTER TABLE notifications ADD COLUMN woken INTEGER DEFAULT 0")
     db.execute("UPDATE notifications SET woken=1")      # items that predate the marker never trigger a wake ping
+db.execute("CREATE TABLE IF NOT EXISTS task_state(task_id INTEGER NOT NULL, k TEXT NOT NULL, v TEXT, PRIMARY KEY(task_id, k))")
 db.execute("CREATE TABLE IF NOT EXISTS nodes(name TEXT PRIMARY KEY COLLATE NOCASE, data TEXT DEFAULT '{}', ts TEXT DEFAULT CURRENT_TIMESTAMP)")
 db.execute("CREATE TABLE IF NOT EXISTS hook_sent(agent TEXT COLLATE NOCASE, h TEXT, ts TEXT, PRIMARY KEY(agent, h))")
 
@@ -191,7 +193,7 @@ FIELDS = {
     "boards": ["name", "description", "team", "dod", "method", "cfg"],
     "docs": ["scope", "ref_id", "title", "body", "url"],
     "sprints": ["board_id", "name", "goal", "start", "end", "state"],
-    "tasks": ["board_id", "sprint_id", "title", "description", "status", "priority", "assignee", "kind", "blocker", "blocked_by", "labels", "channel", "watch", "short_url", "video_id", "publish_at", "pr_url", "sha", "commits", "decline_reason", "nudge", "depends", "points", "dod_done", "type", "parent", "target", "current", "due", "accept"],
+    "tasks": ["board_id", "sprint_id", "title", "description", "status", "priority", "assignee", "kind", "blocker", "blocked_by", "labels", "channel", "watch", "short_url", "video_id", "publish_at", "pr_url", "sha", "commits", "decline_reason", "nudge", "depends", "points", "dod_done", "type", "parent", "target", "current", "due", "accept", "pipeline"],
 }
 REQUIRED = {"docs": ["scope", "ref_id", "title"], "boards": ["name"], "sprints": ["board_id"], "tasks": ["board_id", "title"]}
 # db column -> short key (compact mode). Input accepts short or long keys.
@@ -201,7 +203,7 @@ CK = {
     "sprints": {"id": "id", "board_id": "b", "name": "n", "goal": "g", "start": "from", "end": "to", "state": "st", "committed": "cmt"},
     "tasks": {"id": "id", "board_id": "b", "sprint_id": "s", "title": "t", "description": "d", "status": "st",
               "priority": "pr", "assignee": "as", "kind": "k", "updated": "u", "blocker": "bl", "blocked_by": "bb", "labels": "lb", "channel": "ch",
-              "watch": "w", "short_url": "sh", "video_id": "vid", "publish_at": "at", "pr_url": "pu", "sha": "sha", "commits": "cm", "decline_reason": "dr", "nudge": "nu", "depends": "dp", "points": "pt", "dod_done": "dn", "claimed_by": "cb", "claim_until": "cu", "version": "v", "type": "ty", "parent": "pa", "target": "tg", "current": "cr", "cost": "cs", "tokens": "tk", "due": "du", "accept": "ac", "verified_by": "vb", "verified_at": "va", "verified_note": "vn"},
+              "watch": "w", "short_url": "sh", "video_id": "vid", "publish_at": "at", "pr_url": "pu", "sha": "sha", "commits": "cm", "decline_reason": "dr", "nudge": "nu", "depends": "dp", "points": "pt", "dod_done": "dn", "claimed_by": "cb", "claim_until": "cu", "version": "v", "type": "ty", "parent": "pa", "target": "tg", "current": "cr", "cost": "cs", "tokens": "tk", "due": "du", "accept": "ac", "verified_by": "vb", "verified_at": "va", "verified_note": "vn", "pipeline": "pl", "stage": "sg"},
 }
 IN = {t: {**{v: k for k, v in m.items()}, **{k: k for k in m}} for t, m in CK.items()}
 
@@ -333,6 +335,40 @@ def last_event():
     return db.execute("SELECT COALESCE(MAX(id),0) FROM events").fetchone()[0]
 
 
+STATE_SKIP = frozenset({"u", "v", "id", "b", "d", "nu", "cs", "tk"})     # bookkeeping and long text: not part of the replayed state
+
+
+def _task_state(eid):
+    """What each field of task `eid` was after its last change, rebuilt from the event log the first time it is needed."""
+    rs = db.execute("SELECT k, v FROM task_state WHERE task_id=?", (eid,)).fetchall()
+    if rs:
+        return {r["k"]: json.loads(r["v"]) for r in rs}
+    st = {}
+    for e in db.execute("SELECT payload FROM events WHERE type LIKE 'task.%' AND payload LIKE ? ORDER BY id", ('{"id":%d,"b":%%' % eid,)).fetchall():
+        try:
+            d = json.loads(e["payload"]).get("d") or {}
+        except ValueError:
+            continue
+        st.update({k: v for k, v in d.items() if k not in STATE_SKIP})
+    return st
+
+
+def _before_after(typ, eid, delta):
+    """-> the earlier value of every changed field whose earlier value is known (the `p` of an event), and remember the new values."""
+    if not (typ.startswith("task.") and eid and isinstance(delta, dict)):
+        return None
+    if typ == "task.created":
+        db.execute("DELETE FROM task_state WHERE task_id=?", (eid,))
+        cur = {}
+    else:
+        cur = _task_state(eid)
+    p = {k: cur[k] for k in delta if k not in STATE_SKIP and k in cur and cur[k] != delta[k]}
+    for k, v in delta.items():
+        if k not in STATE_SKIP:
+            db.execute("INSERT OR REPLACE INTO task_state(task_id,k,v) VALUES(?,?,?)", (eid, k, json.dumps(v, separators=(",", ":"))))
+    return p or None
+
+
 chain_lock = threading.RLock()
 
 
@@ -374,6 +410,9 @@ def emit(actor, typ, eid, board, delta):
     if delta is not None:
         data["d"] = delta
     with chain_lock:
+        p = _before_after(typ, eid, delta)
+        if p:
+            data["p"] = p
         cur = db.execute("INSERT INTO events(actor,type,payload) VALUES(?,?,?)",
                          (actor, typ, json.dumps(data, separators=(",", ":"))))
         _chain(cur.lastrowid)
@@ -469,7 +508,7 @@ def cdict(table, r, full, skip=()):
     if full:
         return r
     m = CK[table]
-    return {m[k]: v for k, v in r.items() if k in m and k not in skip and v is not None and v != "" and v != [] and not (k in ("points", "target", "current", "cost", "tokens") and not v)}
+    return {m[k]: v for k, v in r.items() if k in m and k not in skip and v is not None and v != "" and v != [] and not (k in ("points", "target", "current", "cost", "tokens", "stage") and not v)}
 
 
 def validate(table, body, partial):
@@ -535,6 +574,8 @@ def validate(table, body, partial):
         dv = out["dod_done"]
         ids = dv if isinstance(dv, list) else re.findall(r"\d+", str(dv or ""))
         out["dod_done"] = ",".join(str(i) for i in sorted({int(x) for x in ids}))[:200]
+    if "pipeline" in out:
+        out["pipeline"] = pipeline_clean(out["pipeline"])
     if "accept" in out:
         out["accept"] = "\n".join(ln.strip() for ln in str(out["accept"] or "").splitlines() if ln.strip())[:2000]
     if "dod" in out:
@@ -1328,6 +1369,145 @@ def task_verify(actor, role, tid, body):
     return {"id": tid, "verified": ok, "by": me}
 
 
+def _norm(v):
+    if v is None or v == [] or v == "":
+        return ""
+    if isinstance(v, (list, tuple)):
+        return ",".join(str(x) for x in v)
+    return str(v).strip()
+
+
+def task_history(tid):
+    """Replay the task's event log and compare it with the stored card. in_sync = every replayed field matches and nothing on the card is unexplained;
+    partial = the card has values the log never recorded (older tasks); drift = the card disagrees with its own history."""
+    r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+    if not r:
+        raise ApiError("nf", 404)
+    cur = cdict("tasks", r[0], False)
+    fold, n = {}, 0
+    for e in rows("SELECT ts, actor, type, payload FROM events WHERE type LIKE 'task.%' AND payload LIKE ? ORDER BY id", ('{"id":%d,"b":%%' % tid,)):
+        try:
+            d = json.loads(e["payload"]).get("d") or {}
+        except ValueError:
+            continue
+        n += 1
+        fold.update({k: v for k, v in d.items() if k not in STATE_SKIP})
+    diff = [{"k": k, "log": fold[k], "card": cur.get(k)} for k in fold if _norm(fold[k]) != _norm(cur.get(k))]
+    unknown = sorted(k for k, v in cur.items() if k not in STATE_SKIP and k not in fold and _norm(v) not in ("", "0", "task", "3", "1"))
+    return {"id": tid, "events": n, "state": "drift" if diff else "partial" if unknown else "in_sync", "diff": diff, "unknown": unknown}
+
+
+# ---- strict state moves (setting strict_moves=1)
+MOVES = {"backlog": {"todo", "in_progress", "declined"}, "todo": {"backlog", "in_progress", "blocked", "declined"},
+         "in_progress": {"todo", "review", "blocked", "done", "declined"}, "review": {"in_progress", "done", "blocked", "declined"},
+         "blocked": {"todo", "in_progress", "declined"}, "done": {"in_progress", "todo"}, "declined": {"backlog", "todo", "in_progress"}}
+
+
+def check_move(role, tid, body):
+    """With strict_moves=1 a task only moves along MOVES. A supervisor or admin can override with force=1."""
+    new = body.get("st") or body.get("status")
+    if not new or get_setting("strict_moves", "0") != "1":
+        return
+    r = rows("SELECT status FROM tasks WHERE id=?", (tid,))
+    if not r or r[0]["status"] == new or new not in MOVES:
+        return
+    if new not in MOVES.get(r[0]["status"], set()) and not (_priv(role) and body.get("force")):
+        raise ApiError("move", 409, "%s>%s" % (r[0]["status"], new))
+
+
+# ---- pipelines: ordered stages, each with a holder and a gate (auto = holder passes it on, review = holder can also send it back, human = a person approves)
+GATES = ("auto", "review", "human")
+
+
+def pipeline_clean(v):
+    if isinstance(v, str):
+        try:
+            v = json.loads(v) if v.strip().startswith("[") else [dict(zip(("name", "holder", "gate"), [x.strip() for x in ln.split("|")])) for ln in v.splitlines() if ln.strip()]
+        except ValueError:
+            raise ApiError("bad", 400, "pl")
+    if v in (None, "", []):
+        return ""
+    if not isinstance(v, list) or len(v) > 10:
+        raise ApiError("bad", 400, "pl")
+    out = []
+    for s in v:
+        if not isinstance(s, dict):
+            raise ApiError("bad", 400, "pl")
+        name, holder, gate = " ".join(str(s.get("name") or "").split())[:40], " ".join(str(s.get("holder") or "").split())[:60], str(s.get("gate") or "auto").strip().lower() or "auto"
+        if not name or not holder or gate not in GATES:
+            raise ApiError("bad", 400, "pl")
+        out.append({"name": name, "holder": holder, "gate": gate})
+    return json.dumps(out, separators=(",", ":"))
+
+
+def _stages(t):
+    try:
+        return json.loads(t["pipeline"]) if t["pipeline"] else []
+    except ValueError:
+        return []
+
+
+def _stage_enter(actor, t, idx, why):
+    """Put the baton in stage `idx` (or finish the task past the last one). Caller holds `lock`."""
+    tid, bid, ss = t["id"], t["board_id"], _stages(t)
+    if idx >= len(ss):
+        check_done_gate(tid, bid, t["dod_done"])
+        db.execute("UPDATE tasks SET status='done', stage=?, updated=CURRENT_TIMESTAMP, version=COALESCE(version,1)+1 WHERE id=?", (len(ss) + 1, tid))
+        emit(actor, "task.updated", tid, bid, {"st": "done", "sg": len(ss) + 1})
+        return {"id": tid, "st": "done", "sg": len(ss) + 1}
+    s = ss[idx]
+    st = "review" if s["gate"] == "human" else ("todo" if idx > (t["stage"] or 0) - 1 else "in_progress")
+    db.execute("UPDATE tasks SET assignee=?, status=?, stage=?, claimed_by='', claim_until='', nudge='', updated=CURRENT_TIMESTAMP, version=COALESCE(version,1)+1 WHERE id=?", (s["holder"], st, idx + 1, tid))
+    emit(actor, "task.updated", tid, bid, {"as": s["holder"], "st": st, "sg": idx + 1})
+    db.execute("INSERT INTO comments(task_id,actor,body) VALUES(?,?,?)", (tid, actor, "Stage %d/%d \"%s\" -> %s%s" % (idx + 1, len(ss), s["name"], s["holder"], (": " + why) if why else "")))
+    if s["gate"] == "human":
+        db.execute("INSERT INTO reviews(task_id, requester, reviewer, kind, note) VALUES(?,?,?,?,?)", (tid, actor, s["holder"], "gate", ("stage \"%s\" needs your decision. %s" % (s["name"], why)).strip()[:300]))
+        notify(s["holder"], "approval.requested", actor, tid, bid, "#%d '%s': stage \"%s\" needs your approval" % (tid, t["title"][:60], s["name"]), {"st": st})
+    else:
+        notify(s["holder"], "task.handoff", actor, tid, bid, "#%d '%s': stage \"%s\" is yours%s" % (tid, t["title"][:60], s["name"], (" - " + why[:120]) if why else ""), {"st": st})
+    return {"id": tid, "st": st, "sg": idx + 1, "as": s["holder"]}
+
+
+def task_stage(actor, role, tid, body):
+    """start: begin the pipeline at stage 1. done: the holder passes the baton on. reject: send it back one stage (needs a reason; allowed on review and human stages)."""
+    action = str(body.get("action") or body.get("a") or "").lower()
+    note = " ".join(str(body.get("note") or "").split())[:300]
+    with lock:
+        r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+        if not r:
+            raise ApiError("nf", 404)
+        t = r[0]
+        ss = _stages(t)
+        if not ss:
+            raise ApiError("bad", 400, "pl")
+        if action == "start":
+            if t["status"] not in ("backlog", "todo") or (t["stage"] or 0):
+                raise ApiError("bad", 400, "st")
+            return _stage_enter(actor, t, 0, note)
+        idx = (t["stage"] or 0) - 1
+        if idx < 0 or idx >= len(ss) or t["status"] in ("done", "declined"):
+            raise ApiError("bad", 400, "st")
+        s = ss[idx]
+        me = " ".join(str(body.get("as") or actor or "").split())
+        if me.lower() != (t["assignee"] or "").lower() and not _priv(role):
+            raise ApiError("holder", 403, t["assignee"] or "")
+        if s["gate"] == "human":
+            raise ApiError("gate", 409, "approval")            # a human gate only moves on an approval decision
+        if action == "done":
+            return _stage_enter(actor, t, idx + 1, note)
+        if action == "reject":
+            if s["gate"] != "review" or idx == 0 or not note:
+                raise ApiError("bad", 400, "note" if s["gate"] == "review" and idx else "pl")
+            return _stage_enter(actor, dict(t, status="in_progress"), idx - 1, note)
+    raise ApiError("bad", 400, "action")
+
+
+def _gate_decided(actor, t, approved, note):
+    """A human gate was decided: approve = the baton moves on, changes = it goes back one stage. Caller holds `lock`."""
+    idx = (t["stage"] or 0) - 1
+    return _stage_enter(actor, t, idx + 1, note) if approved else _stage_enter(actor, dict(t, status="in_progress"), max(0, idx - 1), note or "sent back")
+
+
 def task_decline(actor, tid, body):
     """Refuse a task with a written reason. Anyone may decline (human or agent); the reason is logged as a comment
     and `to` (agent names, e.g. the requester) is notified in addition to the assignee."""
@@ -1595,7 +1775,7 @@ def task_handoff(actor, tid, body):
     return {"id": tid, "as": to, "st": st}
 
 
-_ACT_LABEL = {"vb": "verified by", "ac": "acceptance criteria", "st": "status", "as": "assignee", "pr": "priority", "s": "sprint", "bl": "blocker", "bb": "blocked by", "dr": "decline reason", "pu": "PR", "sha": "deployed sha", "dp": "depends on", "pt": "points", "t": "title", "lb": "labels", "ch": "channel", "k": "kind"}
+_ACT_LABEL = {"vb": "verified by", "ac": "acceptance criteria", "sg": "stage", "pl": "pipeline", "st": "status", "as": "assignee", "pr": "priority", "s": "sprint", "bl": "blocker", "bb": "blocked by", "dr": "decline reason", "pu": "PR", "sha": "deployed sha", "dp": "depends on", "pt": "points", "t": "title", "lb": "labels", "ch": "channel", "k": "kind"}
 
 
 NODE_KEYS = ("machine", "version", "agents", "running", "caps", "dispatch", "quota", "up", "taskboard", "worktrees", "note")
@@ -1762,9 +1942,10 @@ def task_activity(tid):
         if e["type"] == "task.commented":
             continue
         try:
-            d = (json.loads(e["payload"]).get("d") or {})
+            pl_ = json.loads(e["payload"])
+            d, p_ = (pl_.get("d") or {}), (pl_.get("p") or {})
         except Exception:
-            d = {}
+            d, p_ = {}, {}
         if e["type"] == "task.created":
             msg = "created" + (" [%s]" % d["st"] if d.get("st") else "")
         else:
@@ -1775,7 +1956,7 @@ def task_activity(tid):
                 if k == "cm":
                     parts.append("commits linked")
                 elif k in _ACT_LABEL:
-                    parts.append("%s -> %s" % (_ACT_LABEL[k], v if v not in ("", None, []) else "cleared"))
+                    parts.append("%s%s -> %s" % (_ACT_LABEL[k], (" " + str(p_[k])) if k in p_ and p_[k] not in ("", None, []) else "", v if v not in ("", None, []) else "cleared"))
             if not parts:
                 continue
             msg = ", ".join(parts)
@@ -3264,6 +3445,10 @@ def review_decide(actor, role, rid, body):
         st = "approved" if dec == "approve" else "changes"
         db.execute("UPDATE reviews SET status=?, decision_note=?, decided=? WHERE id=?", (st, note, now_s(), rid))
         t = rows("SELECT * FROM tasks WHERE id=?", (r["task_id"],))[0]
+        if r["kind"] == "gate":
+            _gate_decided(me, t, st == "approved", note)
+            db.execute("INSERT INTO comments(task_id,actor,body) VALUES(?,?,?)", (t["id"], me, ("Gate approved" if st == "approved" else "Gate sent back") + (": " + note if note else "")))
+            return {"id": rid, "st": st}
         db.execute("INSERT INTO comments(task_id,actor,body) VALUES(?,?,?)", (t["id"], me, (("Approval granted" if st == "approved" else "Approval denied") if r["kind"] == "approval" else ("Review approved" if st == "approved" else "Changes requested")) + (": " + note if note else "")))
         if r["kind"] == "approval":
             if st == "approved":
@@ -4103,6 +4288,7 @@ def next_task(actor, body):
 def task_finish(actor, role, tid, body):
     """Attach outputs, comment, record PR/sha, then close, send to review, or hand off - one call."""
     check_holder(actor, role, tid)
+    check_move(role, tid, {"st": body.get("st") or ("done" if not (body.get("review") or body.get("to")) else None), "force": body.get("force")})
     t = rows("SELECT * FROM tasks WHERE id=?", (tid,))
     if not t:
         raise ApiError("nf", 404)
@@ -4529,7 +4715,7 @@ def token_delete(tid):
     return {"id": tid, "x": 1}
 
 
-SETTING_KEYS = ("digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd", "agent_limits", "run_lost_min", "holder_only", "media_hosts")
+SETTING_KEYS = ("digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd", "agent_limits", "run_lost_min", "holder_only", "strict_moves", "media_hosts")
 
 
 def get_setting(k, default=""):
@@ -5380,6 +5566,11 @@ class H(BaseHTTPRequestHandler):
             mst = re.fullmatch(r"/api/sprints/(\d+)/stats", path)
             if mst and method == "GET":
                 return self.send_json(200, sprint_stats(int(mst.group(1))))
+            msg_ = re.fullmatch(r"/api/tasks/(\d+)/(stage|history)", path)
+            if msg_ and method == "POST" and msg_.group(2) == "stage":
+                return self.send_json(200, task_stage(actor, self.role, int(msg_.group(1)), self.read_body()))
+            if msg_ and method == "GET" and msg_.group(2) == "history":
+                return self.send_json(200, task_history(int(msg_.group(1))))
             mvf = re.fullmatch(r"/api/tasks/(\d+)/verify", path)
             if mvf and method == "POST":
                 return self.send_json(200, task_verify(actor, self.role, int(mvf.group(1)), self.read_body()))
@@ -5462,6 +5653,8 @@ class H(BaseHTTPRequestHandler):
                     return
             if m.group(1) == "tasks" and rid and method in ("PATCH", "PUT", "DELETE"):
                 check_holder(actor, self.role, rid)
+                if method != "DELETE" and isinstance(body, dict):
+                    check_move(self.role, rid, body)
             res = crud(actor, method, m.group(1), rid, body, q, full)
             self.send_json(201 if method == "POST" else 200, res, etag)
         except ApiError as e:
