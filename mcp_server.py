@@ -146,8 +146,8 @@ TOOLS = {
     "tasks": ("List tasks. Filters: board_id|b, sprint_id|s('none'), status|st (single, comma-list, or 'open'/=exclude done), as|assignee, kind|k, lb, ch, open=1, blocked=1, q. Paging: limit,offset. Result {n,o,i}.",
               S(fields=s, fmt=s, board_id=i, b=i, tm=s, bs=s, sprint_id=s, s=s, status=s, st=s, assignee=s, **{"as": s}, kind=s, k=s, q=s, lb=s, ch=s, blocked=i, open=i, ready=i, limit=i, offset=i, d=i),
               lambda a: api("GET", "/tasks" + qs({"limit": 25, "fmt": "t", **a}, ["fields", "fmt", "board_id", "b", "tm", "bs", "sprint_id", "s", "status", "st", "assignee", "as", "kind", "k", "q", "lb", "ch", "blocked", "open", "ready", "limit", "offset", "d"]))),
-    "task": ("Get one task incl. description. ctx=1 adds dc: docs/rules of task+sprint+board (with bodies).", S(["id"], id=i, ctx=i, brief=i),
-             lambda a: api("GET", f"/tasks/{a['id']}" + qs(a, ["ctx", "brief"]))),
+    "task": ("Get one task incl. description. ctx=1 adds dc: docs/rules of task+sprint+board (with bodies). since=<ev from an earlier read> returns only what changed ({same:1} if nothing).", S(["id"], id=i, ctx=i, brief=i, since=i),
+             lambda a: api("GET", f"/tasks/{a['id']}" + qs(a, ["ctx", "brief", "since"]))),
     "add_task": ("Create a task. Keys: ty(type: task|story|bug|epic|spike|chore) pa(parent epic id) b(board) t(title) d(description) st pr(1-4) as(assignee; 'auto' routes by label/skills) k(human|agent) s(sprint) bl bb(blockers) lb(labels csv) ch(area, optional) pu(PR url) sha dp(depends on ids) pt(points). New tasks join the active sprint unless s is given. Common labels: gate (review inbox), next (pick-up queue), bug, feature. Blocked waiting: st=blocked bl=why bb=[ids]",
                  S(["b", "t"], b=i, t=s, d=s, st=stenum, pr=i, **{"as": s}, k={"type": "string", "enum": ["human", "agent"]}, s=i, bl=s, bb={"type": ["array", "string"]}, lb=s, ch=s,  pu=s, sha=s, du=s, cm=CM, dp={"type": ["array", "string"]}, pt=i, ty=s, pa=i, tg=s, cr=s),
                  lambda a: api("POST", "/tasks", a)),
@@ -182,7 +182,7 @@ TOOLS = {
               lambda a: api("GET", "/inbox" + qs({**a, "as": a.get("as") or ME}, ["as", "wait", "ack", "all", "since", "limit"]), timeout=40)),
     "ack": ("Mark notifications read: ids=[...] or upto=<id> or neither (=all). as defaults to $TASKBOARD_AGENT.",
             S(**{"as": s}, ids={"type": "array", "items": i}, upto=i), lambda a: api("POST", "/inbox/ack", {**a, "as": a.get("as") or ME})),
-    "comment": ("Comment on a task (notifies its assignee + anyone in to=[agent names]).", S(["id", "c"], id=i, c=s, to={"type": "array", "items": s}),
+    "comment": ("Comment on a task (notifies its assignee + anyone in to=[agent names]). quiet=true: a note for the record, nobody is notified.", S(["id", "c"], id=i, c=s, to={"type": "array", "items": s}, quiet={"type": "boolean"}),
                 lambda a: api("POST", f"/tasks/{a.pop('id')}/comments", a)),
     "decline_task": ("Decline a task you will not do (any assignee, human or agent). r=reason REQUIRED and concrete. to=[agent names] to also notify (e.g. the requester). Logged as a comment; status -> declined.",
                      S(["id", "r"], id=i, r=s, to={"type": "array", "items": s}), lambda a: api("POST", f"/tasks/{a.pop('id')}/decline", a)),
@@ -302,7 +302,7 @@ TOOLS = {
     "tokens": ("Admin: access tokens. action list | create (n=name, role agent|supervisor|viewer|admin; the token is returned once) | revoke (id) | scope (id, boards=[ids]: limit an existing token to those boards, [] = all). create also takes boards=[ids].",
                S(action=s, n=s, role=s, id=i, boards={"type": "array", "items": i}), lambda a: _tokens(dict(a))),
     "say": ("Send a direct message to an agent or a human by name: to (a name, a list of names, or '*' for everyone - supervisors and admins only), c (text), optional task (id it is about) and reply (message id). The recipient sees it in briefing with do='say to=<you>'.",
-            S(["to", "c"], to={"type": ["string", "array"]}, c=s, task=i, reply=i, **{"as": s}), lambda a: api("POST", "/messages", idn(a))),
+            S(["to", "c"], to={"type": ["string", "array"]}, c=s, task=i, reply=i, kind={"type": "string", "enum": ["ask", "fyi", "ack"]}, **{"as": s}), lambda a: api("POST", "/messages", idn(a))),
     "messages": ("Conversation log: with=<name>, limit, since (message id). You only read messages you sent or received; supervisors and admins may pass as=<name> to read anyone's. Reading marks the direct messages you received as read (ack=0 to peek).",
                  S(**{"with": s}, limit=i, since=i, **{"as": s}), lambda a: api("GET", "/messages" + qs(a, ["with", "limit", "since", "as"]))),
     "settings": ("Admin: with no arguments reads the settings; with keys changes them: digest_url, digest_hour, alert_url, backup_keep, supervisors (csv names), base_url, wake_after_min, budget_usd, prices (JSON string), git_autodone (1|0).",
@@ -342,6 +342,13 @@ TOOLS = {
     "stage": ("Pipeline tasks (pl = ordered stages name|holder|gate; gate auto|review|human): action=start begins stage 1; done = the holder passes the baton on (past the last stage = done); reject + note = send back one stage (review/human stages). A human stage only moves on decide_review.",
               S(["id", "action"], id=i, action=s, note=s, **{"as": s}), lambda a: api("POST", f"/tasks/{a.pop('id')}/stage", a)),
     "history": ("Replay a task's event log and compare it with the card: state in_sync | partial (card has values the log never recorded) | drift (card disagrees with its history), plus diff and unknown fields. Events carry p = earlier values.", S(["id"], id=i), lambda a: api("GET", f"/tasks/{a['id']}/history")),
+    "decision": ("Record a settled decision on a story or epic (c, one sentence); everything below it sees the latest in its deep brief. Without c it lists them.",
+                 S(["id"], id=i, c=s), lambda a: api("POST", f"/tasks/{a['id']}/decisions", {"c": a["c"]}) if a.get("c") else api("GET", f"/tasks/{a['id']}/decisions")),
+    "scaffold": ("Create the usual child tasks under a story/epic in one call: preset standard|bugfix|research, or titles=[string | {t,ty,as}]; chain=true makes each depend on the one before.",
+                 S(["id"], id=i, preset=s, titles={"type": "array"}, chain={"type": "boolean"}), lambda a: api("POST", f"/tasks/{a.pop('id')}/scaffold", a)),
+    "verify_queue": ("Finished work with acceptance criteria that nobody else has checked, with vf = who should check it (not the worker; qa/review skills first, then least loaded). Agents see their own; as=<name>.", S(**{"as": s}), lambda a: api("GET", "/verify/queue" + qs(a, ["as"]))),
+    "faq": ("Answered questions that look like q (shared words): read these before asking someone again.", S(["q"], q=s, b=i), lambda a: api("GET", "/faq" + qs(a, ["q", "b"]))),
+    "fit": ("Who has finished work with these labels (lb=a,b) and how often reviewers asked them for changes. `route` uses it as a tie-breaker.", S(["lb"], lb=s), lambda a: api("GET", "/fit" + qs(a, ["lb"]))),
     "audit_verify": ("Supervisor/admin: check the audit chain. ok=false names the first broken event; unchained = older events that predate the chain.", S(), lambda a: api("GET", "/audit/verify")),
     "audit": ("Supervisor/admin: who changed what. Newest first: ts, by, ty (event type), e (entity id), bn (board), m (what changed). Filters actor, type (prefix, e.g. task. or run.), task, b, since (event id), limit.",
               S(actor=s, type=s, task=i, b=i, since=i, limit=i), lambda a: api("GET", "/audit" + qs(a, ["actor", "type", "task", "b", "since", "limit"]))),
@@ -360,7 +367,7 @@ TOOLS = {
 
 CORE = ["briefing", "next", "finish", "inbox", "claim", "set_task", "add_task", "tasks", "task", "comment", "say", "handoff", "heartbeat", "answer", "decide_review", "lock", "unlock"]
 COORD = ["messages", "claim_next", "release", "locks", "ask", "asks", "cancel_ask", "request_review", "reviews", "watch", "unwatch", "watches", "attach", "attachments", "del_attachment",
-         "cost", "links", "route", "envs", "deploy_env", "freeze_env", "unfreeze_env", "decline_task", "reopen_task", "add_commit", "task_activity", "comments"]
+         "cost", "links", "route", "envs", "deploy_env", "freeze_env", "unfreeze_env", "decline_task", "reopen_task", "add_commit", "task_activity", "comments", "verify", "timeline", "decision", "verify_queue", "faq"]
 ADMIN = ["tokens", "settings", "backups", "export_data", "export_csv", "import_csv", "import_data", "del_board", "del_sprint", "chats", "git_secret", "wake_agent", "usage"]
 GROUPS = {"core": CORE, "coord": COORD, "admin": ADMIN, "plan": [n for n in TOOLS if n not in CORE + COORD + ADMIN]}
 PROFILE = os.environ.get("TASKBOARD_TOOLS", "core")      # core (default) | core,coord | core,coord,plan | core,admin | all | tool names
@@ -377,16 +384,16 @@ VISIBLE = profile_names(PROFILE)
 # one-line descriptions with a key legend for the daily tools; the rest use the first sentence. help(op) returns the full text.
 SHORT = {
     "briefing": "Start/idle check in one call: unread items (with `do` hint), your work, attention, sprints at risk, nw=claimable tasks. Repeat calls return only changes; wait=<=30 holds the call open until something arrives.",
-    "say": "Message an agent or human: to (name|[names]|'*' supervisors only), c, task?, reply?. They get it in briefing with a reply hint.",
+    "say": "Message an agent or human: to (name|[names]|'*' supervisors only), c, task?, reply?, kind? (ask = default, wakes them; fyi/ack = for their next briefing, no wake-up).",
     "next": "Claim the best ready task and get its context (desc, deps, comments, rules). lb,b,ttl. {none:1} if empty.",
     "finish": "Wrap up: summary(required)+attach[],pr,sha,dn[],cost{in,out,usd,model}; then st=done | review=<who> | to=<who>,next. Gate checked first.",
     "inbox": "Notifications (unread). Reading marks them read (ack=0 to peek). wait<=30 long-polls. Prefer briefing.",
     "claim": "Claim task id (ttl min): you become assignee, todo->in_progress. 409 claimed if held.",
-    "set_task": "Patch task id. Keys: t d st pr(1-4) as k s bl bb lb ch pu sha dp pt ty pa dn cr tg ver. ver=v you read (409 on conflict). dn=ticked checklist idx.",
+    "set_task": "Patch task id. Keys: t d st pr(1-4) as k s bl bb lb ch pu sha dp pt ty pa dn cr tg po(state of play) nd mk ver. ver=v you read (409 on conflict). dn=ticked checklist idx.",
     "add_task": "Create task. Keys: b(board) t d st pr as('auto'=route) k(human|agent) s bl bb lb ch pu sha dp pt ty(epic|story|task|bug|spike|chore) pa(parent id: an epic, or a story under an epic).",
     "tasks": "List tasks (default 25, table form). Filters: b tm bs s st(csv|open) as(~contains) k lb ch q ready=1 ty parent; fields=t,st,pr; limit offset d=1.",
-    "task": "One task. brief=1 (~60 tokens) | ctx=1 (docs, comments, attachments, reviews) | default full.",
-    "comment": "Comment on task id (c); notifies the assignee and to=[names].",
+    "task": "One task. brief=1 (~60 tokens, has po = state of play, ev) | since=ev (only what changed) | ctx=1 (docs, comments, attachments, reviews) | default full.",
+    "comment": "Comment on task id (c); notifies the assignee and to=[names]; quiet=true = no notifications.",
     "handoff": "Reassign id to `to` with summary and next; one notification to them.",
     "heartbeat": "Say you are alive: status (one line), task id (also extends your claim on it, ttl min). Silent agents with open work are escalated.",
     "answer": "Answer question id (a) addressed to you.",

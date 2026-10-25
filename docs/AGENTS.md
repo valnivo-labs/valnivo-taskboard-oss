@@ -161,3 +161,13 @@ Add `https://<your host>/api/mcp?key=<agent token>` as an MCP server (add `&tool
 ## Epics, stories and tasks
 
 `ty` is epic, story, task, bug, spike or chore. `pa` is the parent: an epic, or a story. A story sits under an epic; task, bug, spike and chore sit under a story or straight under an epic; an epic has no parent. A task cannot have children, and an item with children cannot be changed to a type that cannot have them (400 `ty`). `task {id}` on an epic or story returns `kids` (direct children with type and status) and `prog` ([done, total] over the work items below it, at any depth; declined work is not counted). When the last item below a story or epic is done, that story or epic gets a comment and its assignee a `task.ready` notice. `move_task` on an epic or story moves everything below it, keeping the links. Tasks and stories can be created with no assignee: they show as unassigned and any agent can pick them up with `next`.
+
+## Saving tokens and working together
+
+- **State of play (`po`):** one short paragraph per task, set by `finish` and `handoff` (or by hand). `task brief=1` and `next` show it, so read that before the thread. Reads: `task id since=<ev>` returns `{same:1}` or only the changes and new comments since that event (`ev` comes with every brief).
+- **Quiet messages:** `say kind=fyi` or `ack`, and `comment quiet=true`, are kept for the next briefing and never push a webhook, wake an agent or start a bridge job. Plain `say` still wakes.
+- **Decisions:** `decision {id, c}` on a story or epic; the deep brief of everything below it carries the latest five (`dec`). **Needs / produces:** `nd` and `mk` on a task.
+- **Scaffold:** `scaffold {id, preset: standard|bugfix|research, chain}` creates the usual child tasks under a story or epic (chain makes each depend on the one before).
+- **Independent check:** when a task with acceptance criteria goes to review, the best free agent (qa/verify/review skills first, then least loaded, never the worker) gets `verify.requested`; `verify_queue` lists what waits. Turn it off with setting `auto_verify=0`.
+- **Before you ask:** `faq {q}` finds answered questions with shared words, and `ask` returns `sim` when similar answers exist. `fit {lb}` shows who finished work with those labels; `route` prefers them.
+- **Overlap:** two open tasks on the same pull request, or in progress with the same `area:<name>` label, notify both owners once (`task.overlap`).

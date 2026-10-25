@@ -15,7 +15,7 @@ const ERR_TXT = {
 };
 // short event keys -> full task/sprint/board fields
 const KM = {
-  task: {du: "due", cs: "cost", tk: "tokens", b: "board_id", s: "sprint_id", t: "title", d: "description", st: "status", pr: "priority", as: "assignee", k: "kind", u: "updated", bl: "blocker", bb: "blocked_by", lb: "labels", ch: "channel", w: "watch", sh: "short_url", vid: "video_id", at: "publish_at", pu: "pr_url", sha: "sha", cm: "commits", dp: "depends", pt: "points", cb: "claimed_by", cu: "claim_until", v: "version", dn: "dod_done", pl: "pipeline", sg: "stage", ac: "accept", vb: "verified_by", va: "verified_at", vn: "verified_note", ty: "type", pa: "parent", tg: "target", cr: "current"},
+  task: {du: "due", cs: "cost", tk: "tokens", b: "board_id", s: "sprint_id", t: "title", d: "description", st: "status", pr: "priority", as: "assignee", k: "kind", u: "updated", bl: "blocker", bb: "blocked_by", lb: "labels", ch: "channel", w: "watch", sh: "short_url", vid: "video_id", at: "publish_at", pu: "pr_url", sha: "sha", cm: "commits", dp: "depends", pt: "points", cb: "claimed_by", cu: "claim_until", v: "version", dn: "dod_done", pl: "pipeline", sg: "stage", po: "play", nd: "needs", mk: "makes", ac: "accept", vb: "verified_by", va: "verified_at", vn: "verified_note", ty: "type", pa: "parent", tg: "target", cr: "current"},
   sprint: {b: "board_id", n: "name", g: "goal", from: "start", to: "end", st: "state"},
   board: {n: "name", d: "description", tm: "team"},
 };
@@ -299,8 +299,10 @@ async function renderSystem() {
         <div class="kv"><span>Runs that reported cost or tokens</span><b>${cov == null ? "—" : cov + "%"}</b></div>
         <div class="kv"><span>Finished tasks with acceptance criteria</span><b>${ac.done_with_criteria}</b></div>
         <div class="kv"><span>…checked by someone else</span><b>${ac.verified}${ac.done_with_criteria ? " (" + Math.round(100 * ac.verified / ac.done_with_criteria) + "%)" : ""}</b></div>
+        <div class="kv"><span>Comments over 1,500 characters</span><b>${r.long_comments || 0}</b></div>
         ${r.chain ? `<div class="kv"><span>History chain</span><b style="color:var(--${r.chain.ok ? "ok" : "bad"})">${r.chain.ok ? "✓ intact · " + r.chain.n + " events" : "✗ broken at #" + r.chain.broken}</b></div>` : ""}
         <p class="muted hint">Reported cost is what agents said they spent, not a provider bill. A finished task is only "verified" when someone other than the worker checked it.</p></section>
+      <section class="panel"><h2>Tokens spent talking to the board <span class="muted">${r.days === 1 ? "today" : "last " + r.days + " days"}</span></h2>${r.spend && r.spend.agents.length ? r.spend.agents.map(a => `<div class="sprow2"><span><b>${esc(a.n)}</b><br><small>${a.routes.map(x => esc(x.r) + " " + x.t).join(" · ")}</small></span><span class="num">${a.calls} calls</span><span class="num">${a.t >= 1000 ? (a.t / 1000).toFixed(1) + "k" : a.t} tokens</span></div>`).join("") : '<p class="muted">Nothing counted yet.</p>'}<p class="muted hint">Counted from what agents send and receive (bytes ÷ 4). The biggest routes are where a shorter answer or a "since" read saves the most.</p></section>
       <section class="panel"><h2>Last activity by who</h2>${r.receipts.length ? r.receipts.map(x => `<div class="kv"><span>${esc(x.by)}</span><b>${ageTxt(x.age)} ago</b></div>`).join("") : '<p class="muted">Nothing yet.</p>'}</section>
     </div></div>`;
 }
@@ -336,6 +338,8 @@ function kidsBox(t, ts) {
   const ks = kidsOf(ts, t.id), [d, n] = rollupOf(ts, t.id);
   return `<div class="kidsbox"><label>${t.type === "epic" ? "Stories and tasks" : "Tasks"} under this <span class="muted">${n ? d + " of " + n + " done" : "none yet"}</span></label>
     ${ks.length ? ks.map(k => `<div class="kidrow"><span class="chip ty ${esc(k.type || "task")}">${esc(k.type || "task")}</span><button type="button" class="link" data-open="${k.id}">#${k.id} ${esc(k.title)}</button><span class="muted">${esc(LBL[k.status] || k.status)}${k.assignee ? " · " + esc(k.assignee) : " · unassigned"}</span></div>`).join("") : ""}
+    <div class="decs" id="decbox"></div><div class="vf"><input id="decin" placeholder="Record a decision (one sentence)"><button type="button" class="mini" id="decgo">Add decision</button></div>
+    <div class="vf"><select id="scp"><option value="standard">Build, test, docs, review</option><option value="bugfix">Reproduce, fix, regression test, note</option><option value="research">Question, findings, decision</option></select><button type="button" class="mini" id="scgo">Add these tasks</button></div>
     <div class="vf"><button type="button" class="mini" id="addkid" data-pt="${t.id}" data-ty="${t.type === "epic" ? "story" : "task"}">+ Add ${t.type === "epic" ? "a story" : "a task"} under this</button>${t.type === "epic" ? `<button type="button" class="mini" id="addkid2" data-pt="${t.id}" data-ty="task">+ Add a task</button>` : ""}</div></div>`;
 }
 
@@ -600,6 +604,7 @@ async function renderAdmin() {
       <div class="row2"><label>Wake sleeping agents after (minutes, 0 = off)<input type="number" name="wake_after_min" min="0" max="1440" value="${esc(se.wake_after_min || 10)}"></label><label>Close a task when its PR merges<select name="git_autodone"><option value="1" ${se.git_autodone !== "0" ? "selected" : ""}>Yes (if the gate allows)</option><option value="0" ${se.git_autodone === "0" ? "selected" : ""}>No, only comment</option></select></label></div>
       <label>Mark a run as lost after (minutes without a sign of life, 0 = off)<input type="number" name="run_lost_min" min="0" max="1440" value="${esc(se.run_lost_min || 90)}"></label>
       <label>Monthly budget for all boards (USD, blank = none)<input type="number" step="any" min="0" name="budget_usd" value="${esc(se.budget_usd)}"></label>
+      <label>Ask for an independent check when work with acceptance criteria goes to review<select name="auto_verify"><option value="1" ${se.auto_verify !== "0" ? "selected" : ""}>Yes, ask the best free agent</option><option value="0" ${se.auto_verify === "0" ? "selected" : ""}>No</option></select></label>
       <div class="row2"><label>Task moves<select name="strict_moves"><option value="0" ${se.strict_moves !== "1" ? "selected" : ""}>Any move</option><option value="1" ${se.strict_moves === "1" ? "selected" : ""}>Strict (follow the allowed paths)</option></select></label><label>Tasks someone is holding<select name="holder_only"><option value="0" ${se.holder_only !== "1" ? "selected" : ""}>Anyone with access can change</option><option value="1" ${se.holder_only === "1" ? "selected" : ""}>Only the holder, a supervisor or an admin</option></select></label></div>
       <label>Daily limits per agent <span class="muted">(JSON, per UTC day: jobs, usd, secs; "*" = everyone)</span><textarea name="agent_limits" rows="2" placeholder='{"*": {"jobs": 40}, "coder-agent": {"usd": 5}}'>${esc(se.agent_limits)}</textarea></label>
       <label>Sites allowed to show images, video and audio <span class="muted">(https addresses, comma separated; only needed when the server restricts content)</span><input name="media_hosts" value="${esc(se.media_hosts)}" placeholder="https://media.example.com"></label>
@@ -1102,6 +1107,7 @@ function taskDlg(id, status, title, boardId, pri, pre) {
     <div class="tp" data-p="details">
     <label>Title<input name="title" required value="${esc(t.title)}"></label>
     <label>Description<textarea name="description">${esc(t.description)}</textarea></label>
+    <label>State of play <span class="muted">(where it stands and what is next, a few lines; the next agent reads this instead of the whole thread)</span><textarea name="play" rows="2" maxlength="600">${esc(t.play || "")}</textarea></label>
     ${pipeBox(t)}
     <label>Pipeline <span class="muted">(optional: one stage per line as name | holder | auto, review or human; the baton moves holder to holder)</span><textarea name="pipeline" rows="3" placeholder="Build | coder-agent | auto&#10;Check | checker-agent | review&#10;Sign off | owner | human">${esc(pipeText(t))}</textarea></label>
     <label>Acceptance criteria <span class="muted">(what "done" means, one per line)</span><textarea name="accept" rows="3" placeholder="Tests pass&#10;Docs updated">${esc(t.accept || "")}</textarea></label>
@@ -1123,6 +1129,7 @@ function taskDlg(id, status, title, boardId, pri, pre) {
     ${id && (t.status === "review" || t.status === "done") ? `<div class="acc"><label>Independent check <span class="muted">(someone other than the worker, against the criteria above)</span></label>${t.verified_by ? `<div>✓ Verified by <b>${esc(t.verified_by)}</b> ${esc(ago(t.verified_at))} ago${t.verified_note ? " · " + esc(t.verified_note) : ""}</div>` : `<div class="muted">Not verified yet. ${t.accept ? "" : "This card has no acceptance criteria."}</div>`}${t.accept ? `<ul>${t.accept.split("\n").map(x => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}<div class="vf"><input id="vfn" placeholder="Note (required to send back)"><button type="button" class="mini primary" id="vfok">Verify</button><button type="button" class="mini" id="vfno">Send back</button></div></div>` : ""}
     ${(bd.dod || "").trim() ? `<div class="dod"><label>Definition of done — every item before this task can be done</label>${bd.dod.split("\n").filter(x => x.trim()).map((x, i) => `<label class="chk"><input type="checkbox" name="dodi" value="${i}" ${csv(t.dod_done).includes(String(i)) ? "checked" : ""}> ${esc(x)}</label>`).join("")}</div>` : ""}
     <details class="more"><summary>More fields (labels, links, blockers, PR)</summary>
+    <div class="row2"><label>Needs <span class="muted">(inputs, one per line)</span><textarea name="needs" rows="2">${esc(t.needs || "")}</textarea></label><label>Produces <span class="muted">(outputs, one per line)</span><textarea name="makes" rows="2">${esc(t.makes || "")}</textarea></label></div>
     <label>Labels (comma)<input name="labels" list="lbl" value="${esc(csv(t.labels).map(lbShow).join(", "))}"><datalist id="lbl">${SUG_LB.map(l => `<option value="${esc(lbShow(l))}">`).join("")}</datalist></label>
     <div class="row2"><label>PR URL<input name="pr_url" value="${esc(t.pr_url)}"></label><label>SHA / deployed.txt<input name="sha" value="${esc(t.sha)}"></label></div>
     <label>Blocker note<input name="blocker" value="${esc(t.blocker)}"></label>
@@ -1130,7 +1137,7 @@ function taskDlg(id, status, title, boardId, pri, pre) {
     <label>Decline reason (required when declined)<input name="decline_reason" value="${esc(t.decline_reason)}"></label></details>
     </div>
     ${id ? '<div class="tp" data-p="activity" hidden><div id="actl" class="feed2"><span class="muted">Loading…</span></div></div>' : ""}
-    ${id ? '<div class="tp" data-p="comments" hidden><div class="cmts" id="cmts"><span class="muted">Loading…</span></div><div class="cmtform"><input id="cin" placeholder="Write a comment — the assignee is notified"><button type="button" id="cgo">Send</button></div></div>' : ""}
+    ${id ? '<div class="tp" data-p="comments" hidden><div class="cmts" id="cmts"><span class="muted">Loading…</span></div><div class="cmtform"><input id="cin" placeholder="Write a comment — the assignee is notified"><label class="qn"><input type="checkbox" id="cq"> note only</label><button type="button" id="cgo">Send</button></div></div>' : ""}
     ${id ? '<div class="tp" data-p="files" hidden><div id="filesbox"><span class="muted">Loading…</span></div></div><div class="tp" data-p="review" hidden><div id="rvbox"><span class="muted">Loading…</span></div></div>' : ""}`,
     async d => {
       d.sprint_id = d.sprint_id ? +d.sprint_id : null;
@@ -1193,7 +1200,12 @@ function taskDlg(id, status, title, boardId, pri, pre) {
       if (!id && ds_ && (ds_.value.trim() === "" || ds_.value === tpl_)) { tpl_ = TYPE_TPL[ty_.value] || ""; ds_.value = tpl_; }
     });
     if (!id && ds_ && !ds_.value.trim() && TYPE_TPL[t.type || "task"]) { ds_.value = tpl_ = TYPE_TPL[t.type]; }
-    f_.addEventListener("click", e => { const o = e.target.closest(".kidrow [data-open]"); if (o) { $("dlg").close(); dirty = false; openTask(+o.dataset.open); return; } const k = e.target.closest("[data-pt]"); if (k) { $("dlg").close(); dirty = false; taskDlg(0, "todo", "", bid, 3, {parent: +k.dataset.pt, type: k.dataset.ty, channel: t.channel}); } });
+    const loadDec = () => { const b = $("decbox"); if (!b) return; api("GET", `/tasks/${id}/decisions`).then(r => { b.innerHTML = r.i.length ? r.i.map(x => `<div class="decrow"><small>${esc(x.by || "")} · ${esc(ago(x.ts))} ago</small><span>${esc(x.c)}</span></div>`).join("") : '<span class="muted">No decisions recorded.</span>'; }).catch(() => {}); };
+    if (id) loadDec();
+    f_.addEventListener("click", async e => {
+      if (e.target.id === "decgo") { const v = $("decin").value.trim(); if (v) { await api("POST", `/tasks/${id}/decisions`, {c: v}); $("decin").value = ""; loadDec(); } return; }
+      if (e.target.id === "scgo") { await api("POST", `/tasks/${id}/scaffold`, {preset: $("scp").value, chain: true}); toast("Tasks added"); $("dlg").close(); dirty = false; loadBoard(); return; }
+      const o = e.target.closest(".kidrow [data-open]"); if (o) { $("dlg").close(); dirty = false; openTask(+o.dataset.open); return; } const k = e.target.closest("[data-pt]"); if (k) { $("dlg").close(); dirty = false; taskDlg(0, "todo", "", bid, 3, {parent: +k.dataset.pt, type: k.dataset.ty, channel: t.channel}); } });
   }
   if (id) {
     api("GET", `/tasks/${id}/runs`).then(r => {
@@ -1262,7 +1274,7 @@ function taskDlg(id, status, title, boardId, pri, pre) {
     load().catch(() => {});
     const send = async () => {
       const v = $("cin").value.trim(); if (!v) return;
-      await api("POST", `/tasks/${id}/comments`, {c: v}); $("cin").value = ""; load();
+      await api("POST", `/tasks/${id}/comments`, {c: v, quiet: $("cq").checked}); $("cin").value = ""; load();
     };
     $("cgo").onclick = send;
     $("cin").onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); send(); } };
@@ -1301,7 +1313,7 @@ function agentState(a, by) {
 async function renderToday() {
   const el = $("v-today"), qs0 = B && !B.multi ? "?b=" + B.id : B && B.scopeTeam ? "?tm=" + encodeURIComponent(B.scopeTeam) : "";
   const soft = p => p.catch(() => null);
-  const [d, ag, cost, nodes, quota] = await Promise.all([refreshDash(), soft(api("GET", "/agents")), soft(api("GET", "/cost" + qs0)), soft(api("GET", "/nodes")), soft(api("GET", "/quota"))]);
+  const [d, ag, cost, nodes, quota, vq] = await Promise.all([refreshDash(), soft(api("GET", "/agents")), soft(api("GET", "/cost" + qs0)), soft(api("GET", "/nodes")), soft(api("GET", "/quota")), soft(api("GET", "/verify/queue"))]);
   if (view !== "today" || !d) return;
   const needs = (d.attention || []).slice(0, 8), t = d.totals || {}, by = {};
   ((d.agents) || []).forEach(a => { by[a.as.toLowerCase()] = a.by; });
@@ -1324,6 +1336,7 @@ async function renderToday() {
       <section class="panel" aria-labelledby="spn"><h2 id="spn">Sprints</h2>
         ${sps.length ? sps.map(b => `<button type="button" class="sprow" data-board="${b.id}"><span><b>${esc(b.n)}</b> <span class="hl ${b.sp.hl}">${esc(HL[b.sp.hl] || b.sp.hl)}</span><br><span class="muted">${esc(b.sp.n)} · ${b.sp.p[0]}/${b.sp.p[1]} done</span></span><progress max="100" value="${b.sp.p[1] ? 100 * b.sp.p[0] / b.sp.p[1] : 0}"></progress></button>`).join("") : '<span class="muted">No active sprints.</span>'}</section>
     </div>
+    ${vq && vq.n ? `<section class="panel" aria-labelledby="vqh"><h2 id="vqh">Waiting for an independent check <span class="badge">${vq.n}</span></h2>${vq.i.slice(0, 6).map(x => `<div class="needrow"><div class="needtxt"><div><span class="mono">#${x.id}</span> ${esc(x.t)}</div><div class="muted">${esc(LBL[x.st] || x.st)}${x.as ? " · done by " + esc(x.as) : ""} · should be checked by ${esc(x.vf || "someone else")}</div></div><div class="needact"><button type="button" class="mini primary" data-open="${x.id}">Open</button></div></div>`).join("")}</section>` : ""}
     ${(nodes && nodes.i.length) || (quota && (quota.agents.length || quota.subs.length)) ? `<section class="panel" aria-labelledby="mchn"><h2 id="mchn">Machines and limits <button type="button" class="link" data-go="system" style="margin-left:auto">System overview</button></h2>${machinesHtml(nodes ? nodes.i : [])}${quota && (quota.agents.length || quota.subs.length) ? `<div style="margin-top:14px">${limitsHtml(quota)}</div>` : ""}</section>` : ""}
     ${costPanel(cost)}</div>`;
 }

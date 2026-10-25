@@ -1284,3 +1284,89 @@ assert J("POST", f"/tasks/{ep['id']}/move", {"board": NB2})[0] == 200
 mv = J("GET", f"/tasks/{t1['id']}")[1]
 assert mv["b"] == NB2 and mv["pa"] == sy["id"] and J("GET", f"/tasks/{sy['id']}")[1]["b"] == NB2 and J("GET", f"/tasks/{sy['id']}")[1]["pa"] == ep["id"], mv   # the whole tree moved and kept its links
 print("v28 hierarchy OK")
+
+# v29 state of play, since-reads, quiet messages, decisions, scaffolds
+st, sp = J("POST", "/tasks", {"b": RB, "t": "play subject", "as": "Worker V"})
+J("POST", f"/tasks/{sp['id']}/claim", {}, tok=_wk)
+J("POST", f"/tasks/{sp['id']}/finish", {"summary": "Endpoint done, tests missing for the empty case.", "review": "Checker V"}, tok=_wk)
+bf = J("GET", f"/tasks/{sp['id']}?brief=1")[1]
+assert bf["po"].startswith("Endpoint done") and bf["ev"] > 0, bf                                         # the next reader gets the state of play, not the thread
+J("POST", f"/tasks/{sp['id']}/handoff", {"to": "Checker V", "summary": "Reviewed, one fix left", "next": "fix the empty case"}, tok=_wk)
+assert J("GET", f"/tasks/{sp['id']}?brief=1")[1]["po"] == "Reviewed, one fix left Next: fix the empty case"
+ev0 = J("GET", f"/tasks/{sp['id']}?brief=1")[1]["ev"]
+assert J("GET", f"/tasks/{sp['id']}?since={ev0}")[1]["same"] == 1                                       # nothing new: a few tokens
+J("PATCH", f"/tasks/{sp['id']}", {"pr": 1}); J("POST", f"/tasks/{sp['id']}/comments", {"c": "late note"})
+sc = J("GET", f"/tasks/{sp['id']}?since={ev0}")[1]
+assert sc["ch"] == {"pr": 1} and sc["cc"][-1]["c"] == "late note" and sc["ev"] > ev0, sc
+assert J("GET", f"/tasks/{sp['id']}?since={sc['ev']}")[1]["same"] == 1
+assert J("GET", f"/tasks/{sp['id']}/history")[1]["state"] in ("in_sync", "partial")                     # comments and decisions do not look like drift
+# quiet messages: kept for the next briefing, never a push
+J("POST", "/agents", {"n": "Quiet V", "hook": "http://127.0.0.1:8782/h"})
+got.clear(); J("POST", "/messages", {"to": "Quiet V", "c": "just so you know", "kind": "fyi"}); time.sleep(0.6)
+assert not got, got
+ib = J("GET", "/inbox?as=Quiet%20V&ack=0")[1]["i"]
+assert any(n["ty"] == "msg.fyi" for n in ib) and J("POST", "/messages", {"to": "Quiet V", "c": "x", "kind": "shout"})[1]["e"] == "bad"
+J("POST", "/messages", {"to": "Quiet V", "c": "please answer"}); time.sleep(1.2)
+assert any(g["n"]["ty"] == "msg.direct" for g in got), got                                                # a normal message still wakes
+st, qt = J("POST", "/tasks", {"b": RB, "t": "quiet subject", "as": "Worker V"})
+J("POST", f"/tasks/{qt['id']}/comments", {"c": "noting for the record", "quiet": True})
+assert not any(n["ty"] == "task.comment" for n in J("GET", "/inbox?ack=0", tok=_wk)[1]["i"] if n.get("tk") == qt["id"])
+assert "tip" in J("POST", f"/tasks/{qt['id']}/comments", {"c": "x" * 1300})[1]
+# decisions and scaffolds
+st, ep3 = J("POST", "/tasks", {"b": RB, "t": "tree epic", "ty": "epic"})
+assert J("POST", f"/tasks/{ep3['id']}/scaffold", {"preset": "standard"})[1]["made"] and J("POST", f"/tasks/{ep3['id']}/scaffold", {"preset": "nope"})[1]["e"] == "bad"
+st, sy3 = J("POST", "/tasks", {"b": RB, "t": "tree story", "ty": "story", "pa": ep3["id"]})
+J("POST", f"/tasks/{ep3['id']}/decisions", {"c": "We use the v2 API only"}); J("POST", f"/tasks/{sy3['id']}/decisions", {"c": "Emails go out within a minute"})
+sf = J("POST", f"/tasks/{sy3['id']}/scaffold", {"preset": "bugfix", "chain": True})[1]
+assert len(sf["made"]) == 4
+ch1 = J("GET", f"/tasks/{sf['made'][1]}")[1]
+assert ch1["pa"] == sy3["id"] and ch1["ty"] == "bug" and str(ch1["dp"]) == str(sf["made"][0]), ch1                  # typed, under the story, chained
+assert J("GET", f"/tasks/{sy3['id']}?ctx=1")[1]["prog"] == [0, 4]
+dec = server.task_brief(sf["made"][0], deep=True)["dec"]
+assert [d["c"] for d in dec] == ["Emails go out within a minute", "We use the v2 API only"], dec             # the nearest decision first, then the epic's
+assert [d["c"] for d in J("GET", f"/tasks/{ep3['id']}/decisions")[1]["i"]] == ["We use the v2 API only"]
+assert J("POST", f"/tasks/{t1['id']}/scaffold", {})[1]["e"] == "bad"                                      # only stories and epics
+print("v29 state of play, since reads, quiet messages, decisions, scaffolds OK")
+
+# v30 verifier pick, answer reuse, fit, overlap warnings, spend history, role-based tool default
+_vk = J("POST", "/tokens", {"n": "Verifier A", "role": "agent"})[1]["token"]
+J("POST", "/agents", {"n": "Verifier A", "skills": "qa"}); J("POST", "/agents", {"n": "Plain B", "skills": "dev"})
+st, vt = J("POST", "/tasks", {"b": RB, "t": "needs a second pair of eyes", "as": "Worker V", "st": "in_progress", "ac": "No errors in the log", "lb": "billing"})
+J("PATCH", f"/tasks/{vt['id']}", {"st": "review"}, tok=_wk)
+nv = [n for n in J("GET", "/inbox?ack=0", tok=_vk)[1]["i"] if n["ty"] == "verify.requested"]
+assert nv and nv[0]["tk"] == vt["id"] and nv[0]["do"].startswith("verify"), nv                          # the qa agent is asked, not the worker
+assert not any(n["ty"] == "verify.requested" for n in J("GET", "/inbox?ack=0", tok=_wk)[1]["i"])
+vq = J("GET", "/verify/queue")[1]["i"]
+assert [x["vf"] for x in vq if x["id"] == vt["id"]] == ["Verifier A"], vq
+assert [x["id"] for x in J("GET", "/verify/queue", tok=_vk)[1]["i"]].count(vt["id"]) == 1 and vt["id"] not in [x["id"] for x in J("GET", "/verify/queue", tok=_wk)[1]["i"]]
+assert J("POST", f"/tasks/{vt['id']}/verify", {"note": "log is clean"}, tok=_vk)[1]["verified"] is True
+assert vt["id"] not in [x["id"] for x in J("GET", "/verify/queue")[1]["i"]]
+J("POST", "/settings", {"auto_verify": "0"}); st, vt2 = J("POST", "/tasks", {"b": RB, "t": "no auto", "as": "Worker V", "st": "in_progress", "ac": "x"}); J("PATCH", f"/tasks/{vt2['id']}", {"st": "review"}, tok=_wk)
+assert not [n for n in J("GET", "/inbox?ack=0", tok=_vk)[1]["i"] if n["ty"] == "verify.requested" and n["tk"] == vt2["id"]]; J("POST", "/settings", {"auto_verify": "1"})
+# answer reuse
+qa = J("POST", "/asks", {"as": "Worker V", "to": "Plain B", "q": "Which timezone do the billing reports use for the cut-off?"})[1]
+J("POST", f"/asks/{qa['id']}/answer", {"as": "Plain B", "a": "UTC, cut-off at midnight."})
+q2 = J("POST", "/asks", {"as": "Checker V", "to": "Plain B", "q": "What timezone is used for the billing reports cut-off time?"})[1]
+assert q2["sim"][0]["a"] == "UTC, cut-off at midnight." and q2["sim"][0]["id"] == qa["id"], q2             # an earlier answer is offered before anyone waits
+assert J("GET", "/faq?q=billing%20reports%20timezone%20cut-off")[1]["i"][0]["id"] == qa["id"] and "sim" not in J("POST", "/asks", {"as": "Checker V", "to": "Plain B", "q": "Completely different matter entirely"})[1]
+# who is good at what
+st, ft = J("POST", "/tasks", {"b": RB, "t": "billing work done", "as": "Worker V", "lb": "billing", "st": "in_progress"}); J("PATCH", f"/tasks/{ft['id']}", {"st": "done"})
+fit = J("GET", "/fit?lb=billing")[1]["i"]
+assert fit[0]["n"] == "Worker V" and fit[0]["done"] >= 1, fit
+J("POST", "/agents", {"n": "Worker V", "skills": "billing,dev"}); J("POST", "/agents", {"n": "Plain B", "skills": "billing,dev"})
+rc = J("GET", "/route?lb=billing")[1]["i"] if J("GET", "/route?lb=billing")[0] == 200 else []
+assert not rc or rc[0]["n"] == "Worker V", rc                                                           # the one who finished billing work comes first
+# overlap
+st, o1 = J("POST", "/tasks", {"b": RB, "t": "overlap one", "as": "Worker V", "st": "in_progress"}); st, o2 = J("POST", "/tasks", {"b": RB, "t": "overlap two", "as": "Checker V", "st": "in_progress"})
+J("PATCH", f"/tasks/{o1['id']}", {"pu": "https://git.example/pr/77"}); J("PATCH", f"/tasks/{o2['id']}", {"pu": "https://git.example/pr/77"})
+for tok_ in (_wk, _ck):
+    assert [n for n in J("GET", "/inbox?ack=0", tok=tok_)[1]["i"] if n["ty"] == "task.overlap"], tok_      # both owners are told
+J("PATCH", f"/tasks/{o1['id']}", {"lb": "area:billing"}); st, o3 = J("POST", "/tasks", {"b": RB, "t": "overlap three", "as": "Plain B", "st": "in_progress", "lb": "area:billing"})
+J("PATCH", f"/tasks/{o3['id']}", {"lb": "area:billing,next"})                                       # labelling work in progress checks for the same area
+assert [n for n in J("GET", "/inbox?as=Plain%20B&ack=0")[1]["i"] if n["ty"] == "task.overlap"]
+# spend history and the role-based default tool set
+J("POST", f"/tasks/{qt['id']}/comments", {"c": "y" * 1600})
+sy_ = J("GET", "/system?days=7")[1]
+assert sy_["long_comments"] >= 1 and sy_["spend"]["agents"] and sy_["spend"]["routes"], sy_["spend"]
+assert server.db.execute("SELECT COUNT(*) FROM usage_day").fetchone()[0] > 0
+print("v30 verifier, answer reuse, fit, overlap, spend OK")

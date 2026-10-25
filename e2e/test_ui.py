@@ -439,6 +439,28 @@ def test_story_holds_tasks_and_shows_progress(page):
     assert kid["pa"] == sy and api("GET", "/tasks/%d?ctx=1" % sy)["prog"] == [1, 2]
 
 
+def test_decisions_scaffold_and_state_of_play(page):
+    b, _ = mkboard("Collab %d" % time.time())
+    sy = mktask(b, "collab story", ty="story")
+    goto(page, scope="b:%d" % b)
+    page.click(".card[data-id='%d'] .t" % sy)
+    page.wait_for_selector("#decin")
+    page.fill("#decin", "Reset links expire after 30 minutes")
+    page.click("#decgo")
+    page.wait_for_selector("#decbox:has-text('expire after 30 minutes')")
+    page.select_option("#scp", "bugfix")
+    page.click("#scgo")
+    page.wait_for_selector("#toast:has-text('Tasks added')")
+    kids = [x for x in api("GET", "/tasks?b=%d&limit=50" % b)["i"] if x.get("pa") == sy]
+    assert len(kids) == 4 and {k["ty"] for k in kids} >= {"bug", "spike"}, kids
+    page.click(".card[data-id='%d'] .t" % kids[0]["id"])
+    page.wait_for_selector("#f [name=play]")
+    page.fill("#f [name=play]", "Reproduced on staging; fix is next")
+    page.click("#dsave")
+    page.wait_for_selector("#toast")
+    assert api("GET", "/tasks/%d?brief=1" % kids[0]["id"])["po"] == "Reproduced on staging; fix is next"
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

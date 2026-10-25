@@ -508,3 +508,9 @@ button.sprow progress{flex:none;height:8px;width:100%}
 .kidsbox{border:1px solid var(--bd2);border-radius:12px;padding:12px 14px;display:flex;flex-direction:column;gap:6px;background:var(--subtle)}
 .kidrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px}.kidrow .muted{margin-left:auto;font-size:12px}.kidrow .link{text-align:left;height:auto;padding:0}
 .chip.ty.spike{background:var(--purple-bg);color:var(--purple)}.chip.ty.chore{background:var(--subtle);color:var(--mut);border:1px dashed var(--bd)}.chip.ty.task{background:var(--subtle);color:var(--mut)}
+
+/* state of play, decisions, spend */
+.decs{display:flex;flex-direction:column;gap:4px;font-size:13px}.decrow{display:flex;gap:8px;align-items:baseline}.decrow small{color:var(--mut);white-space:nowrap}
+.kidsbox .vf{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.kidsbox .vf input,.kidsbox .vf select{flex:1;min-width:140px;max-width:300px}
+.cmtform .qn{display:flex;gap:6px;align-items:center;font-size:12px;color:var(--mut);white-space:nowrap}
+.sprow2{display:grid;grid-template-columns:1fr 70px 80px;gap:8px;font-size:13px;align-items:center;padding:4px 0;border-top:1px solid var(--bd2)}.sprow2:first-of-type{border-top:0}.sprow2 small{color:var(--mut)}.sprow2 .num{text-align:right}
