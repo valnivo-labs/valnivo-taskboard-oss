@@ -329,7 +329,7 @@ def test_today_can_be_clicked_while_the_boards_still_load(page):
     page.wait_for_selector("#v-today .needrow [data-open]")
     assert page.evaluate("B === null"), "the boards must still be loading for this test to mean anything"
     page.click("#v-today .needrow [data-open]")                                       # clicked before B exists: the app waits for it, then opens the task
-    page.wait_for_selector("#dlg.drawer[open]", timeout=15000)
+    page.wait_for_selector("#dlg.drawer[open]", timeout=60000)      # every earlier test left a board, and the browser loads only a few snapshots at a time
 
 
 def test_drawer_shows_due_runs_and_approvals(page):
