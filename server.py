@@ -1305,7 +1305,9 @@ def task_verify(actor, role, tid, body):
     if not t:
         raise ApiError("nf", 404)
     t = t[0]
-    me = _me(actor, body)
+    me = " ".join(str(body.get("as") or actor or "").split())[:60]      # a person using the web page is named by their token (admin, human)
+    if me.lower() in ("", "agent", "anon"):
+        raise ApiError("missing", 400, "as")
     if t["status"] not in ("review", "done"):
         raise ApiError("bad", 400, "st")
     if me.lower() in {(t["assignee"] or "").lower(), (t["claimed_by"] or "").lower()} - {""}:

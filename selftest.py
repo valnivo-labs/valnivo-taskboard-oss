@@ -1151,6 +1151,8 @@ assert J("PATCH", f"/tasks/{ho['id']}", {"pr": 1}, tok=_wk)[0] == 200 and J("PAT
 assert J("POST", f"/tasks/{ho['id']}/comments", {"c": "a note"}, tok=_ck)[0] == 201                   # anyone can still comment
 J("POST", "/settings", {"holder_only": "0"})
 assert J("PATCH", f"/tasks/{ho['id']}", {"pr": 3}, tok=_ck)[0] == 200
+st, hv = J("POST", "/tasks", {"b": RB, "t": "checked by a person", "as": "Worker V", "st": "review"})
+_hv = J("POST", f"/tasks/{hv['id']}/verify", {"note": "fine"})[1]; assert _hv.get("verified") and _hv["by"], _hv     # a person on the web page can verify
 print("v24 acceptance, verification, audit chain, holder-only OK")
 
 # v25 task timeline: items with sources, batons, lanes, relationship graph
