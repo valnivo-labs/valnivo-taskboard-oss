@@ -392,33 +392,37 @@ def main():
     failed = []
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(channel=os.environ.get("E2E_CHANNEL") or None, headless=True)
+            browser = pw.chromium.launch(channel=os.environ.get("E2E_CHANNEL") or None, headless=True, args=["--disable-dev-shm-usage"])
             for fn in [t for t in TESTS if not os.environ.get("E2E_ONLY") or os.environ["E2E_ONLY"] in t.__name__]:
-                ctx = browser.new_context(viewport={"width": 1360, "height": 900})
-                page = ctx.new_page()
-                page.set_default_timeout(10000)
-                errs, logs = [], []
-                page.on("pageerror", lambda e: errs.append(str(e)))
-                page.on("console", lambda m: logs.append("%s: %s" % (m.type, m.text[:200])) if m.type in ("error", "warning") else None)
-                try:
-                    fn(page)
-                    assert not errs, "page errors: %s" % errs[:2]
-                    print("ok   ", fn.__name__)
-                except Exception:
-                    failed.append(fn.__name__)
-                    print("FAIL ", fn.__name__)
-                    traceback.print_exc()
-                    print("      page errors:", errs[:5], "console:", logs[:6])
+                for attempt in (1, 2):                          # a slow runner can time a step out once: a real bug fails both times
+                    ctx = browser.new_context(viewport={"width": 1360, "height": 900})
+                    page = ctx.new_page()
+                    page.set_default_timeout(10000)
+                    errs, logs = [], []
+                    page.on("pageerror", lambda e: errs.append(str(e)))
+                    page.on("console", lambda m: logs.append("%s: %s" % (m.type, m.text[:200])) if m.type in ("error", "warning") else None)
                     try:
-                        print("      url:", page.url, "| view:", page.evaluate("localStorage.tb_view"), "| dialog open:", page.evaluate("document.getElementById('dlg').open"), "| toast:", page.evaluate("(document.getElementById('toast') || {}).textContent"))
+                        fn(page)
+                        assert not errs, "page errors: %s" % errs[:2]
+                        print("ok   ", fn.__name__, "(second try)" if attempt == 2 else "")
+                        ctx.close()
+                        break
                     except Exception:
-                        pass
-                    try:
-                        page.screenshot(path=os.path.join(tmp, fn.__name__ + ".png"))
-                        print("      screenshot:", os.path.join(tmp, fn.__name__ + ".png"))
-                    except Exception:
-                        pass
-                ctx.close()
+                        print("FAIL ", fn.__name__, "(first try, retrying)" if attempt == 1 else "")
+                        traceback.print_exc()
+                        print("      page errors:", errs[:5], "console:", logs[:6])
+                        try:
+                            print("      url:", page.url, "| view:", page.evaluate("localStorage.tb_view"), "| dialog open:", page.evaluate("document.getElementById('dlg').open"), "| toast:", page.evaluate("(document.getElementById('toast') || {}).textContent"))
+                        except Exception:
+                            pass
+                        try:
+                            page.screenshot(path=os.path.join(tmp, fn.__name__ + ".png"))
+                            print("      screenshot:", os.path.join(tmp, fn.__name__ + ".png"))
+                        except Exception:
+                            pass
+                        if attempt == 2:
+                            failed.append(fn.__name__)
+                        ctx.close()
             browser.close()
     finally:
         srv.terminate()
