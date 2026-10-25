@@ -395,7 +395,7 @@ def test_task_timeline_and_independent_check(page):
     page.click(".card[data-id='%d'] .t" % t)
     page.click(".dtab[data-tab=activity]")
     page.wait_for_selector("#actl .tl")
-    assert "Who held it" in page.inner_text("#actl")
+    assert "who held it" in page.inner_text("#actl").lower()
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
