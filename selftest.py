@@ -1370,3 +1370,51 @@ sy_ = J("GET", "/system?days=7")[1]
 assert sy_["long_comments"] >= 1 and sy_["spend"]["agents"] and sy_["spend"]["routes"], sy_["spend"]
 assert server.db.execute("SELECT COUNT(*) FROM usage_day").fetchone()[0] > 0
 print("v30 verifier, answer reuse, fit, overlap, spend OK")
+
+# v31 ways of working: loose / standard / strict / custom per board, stricter per task
+st, PB = J("POST", "/boards", {"n": "Policy board"}); PBID = PB["id"]
+mkp = lambda t, **k: J("POST", "/tasks", {"b": PBID, "t": t, **k})[1]
+pv = J("GET", f"/policy?b={PBID}")[1]
+assert pv["board"]["preset"] == "loose" and pv["board"]["rules"] == [] and set(pv["presets"]) == {"loose", "standard", "strict"}, pv
+assert J("POST", f"/boards/{PBID}/policy", {"preset": "standard"}, tok=_wk)[0] == 403                    # an agent cannot loosen or tighten a board
+assert J("POST", f"/boards/{PBID}/policy", {"preset": "bogus"})[1]["e"] == "bad"
+assert J("POST", f"/boards/{PBID}/policy", {"preset": "standard"})[0] == 200
+assert J("GET", f"/policy?b={PBID}")[1]["board"]["rules"] == ["accept_before_start", "strict_moves"]
+p1 = mkp("no criteria yet", **{"as": "Worker V"})
+r_ = J("POST", f"/tasks/{p1['id']}/claim", {}, tok=_wk); assert r_[0] == 409 and r_[1]["e"] == "accept", r_       # standard: acceptance first
+J("PATCH", f"/tasks/{p1['id']}", {"ac": "It works"})
+assert J("POST", f"/tasks/{p1['id']}/claim", {}, tok=_wk)[0] == 200
+assert J("PATCH", f"/tasks/{p1['id']}", {"st": "todo"}, tok=_wk)[0] == 200 and J("PATCH", f"/tasks/{p1['id']}", {"st": "done"}, tok=_wk)[1]["e"] == "move"
+assert J("PATCH", f"/boards/{PBID}", {"cf": {"sprint_days": 7}})[0] == 200 and J("GET", f"/policy?b={PBID}")[1]["board"]["preset"] == "standard"    # saving board settings keeps the way of working
+# custom: pick single rules
+J("POST", f"/boards/{PBID}/policy", {"preset": "custom", "rules": {"claim_to_start": True}})
+assert J("GET", f"/policy?b={PBID}")[1]["board"]["rules"] == ["claim_to_start"]
+p2 = mkp("claim first", **{"as": "Worker V", "st": "todo", "ac": "x"})
+r_ = J("PATCH", f"/tasks/{p2['id']}", {"st": "in_progress"}, tok=_wk); assert r_[0] == 409 and r_[1]["e"] == "claim", r_
+assert J("POST", f"/tasks/{p2['id']}/claim", {}, tok=_wk)[0] == 200
+# strict
+J("POST", f"/boards/{PBID}/policy", {"preset": "strict", "pipeline": "Build | Worker V | auto\nSign off | Boss V | human"})
+assert set(J("GET", f"/policy?b={PBID}")[1]["board"]["rules"]) == set(pv["rules"])
+assert J("POST", "/tasks", {"b": PBID, "t": "orphan task"})[1]["e"] == "parent"                           # everything belongs to a story or epic
+st, pe = J("POST", "/tasks", {"b": PBID, "t": "strict epic", "ty": "epic"}); st, ps = J("POST", "/tasks", {"b": PBID, "t": "strict story", "ty": "story", "pa": pe["id"]})
+assert [x["gate"] for x in json.loads(ps["pl"])] == ["auto", "human"], ps                                  # new stories start with the board's pipeline
+p3 = mkp("verified before done", pa=ps["id"], ac="Checked", **{"as": "Worker V"})
+J("POST", f"/tasks/{p3['id']}/claim", {}, tok=_wk)
+assert J("PATCH", f"/tasks/{p3['id']}", {"pr": 1}, tok=_ck)[1]["e"] == "holder"                           # one holder
+J("PATCH", f"/tasks/{p3['id']}", {"st": "review"}, tok=_wk)
+r_ = J("POST", f"/tasks/{p3['id']}/finish", {"summary": "done"}, tok=_wk); assert r_[0] == 409 and r_[1]["e"] == "verify", r_
+assert J("POST", f"/tasks/{p3['id']}/verify", {"note": "ok"}, tok=_ck)[0] == 200
+assert J("POST", f"/tasks/{p3['id']}/finish", {"summary": "done"}, tok=_wk)[1]["st"] == "done"
+assert "holder_only" in server.task_brief(p3["id"], deep=True)["rules"]
+# a task can ask for more than its board, and only a supervisor can lower it
+J("POST", f"/boards/{PBID}/policy", {"preset": "loose"})
+p4 = mkp("careful one", rg="strict", pa=ps["id"], **{"as": "Worker V"})
+assert set(J("GET", f"/policy?task={p4['id']}")[1]["task"]["rules"]) == set(pv["rules"]) and J("GET", f"/policy?b={PBID}")[1]["board"]["rules"] == []
+assert J("PATCH", f"/tasks/{p4['id']}", {"rg": "loose"}, tok=_wk)[0] == 403 and J("PATCH", f"/tasks/{p4['id']}", {"rg": "loose"})[0] == 200
+assert J("PATCH", f"/tasks/{p4['id']}", {"rg": "standard"}, tok=_wk)[0] == 200 and J("PATCH", f"/tasks/{p4['id']}", {"rg": "wild"})[1]["e"] == "bad"
+# the global default applies to boards that never chose
+J("POST", "/settings", {"policy_default": "standard"}); st, DB = J("POST", "/boards", {"n": "Default policy board"})
+assert J("GET", f"/policy?b={DB['id']}")[1]["board"]["preset"] == "standard" and J("POST", "/settings", {"policy_default": "wild"})[1]["e"] == "bad"
+J("POST", "/settings", {"policy_default": ""})
+assert J("GET", "/audit/verify")[1]["ok"]
+print("v31 ways of working OK")

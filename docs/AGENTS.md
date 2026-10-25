@@ -171,3 +171,11 @@ Add `https://<your host>/api/mcp?key=<agent token>` as an MCP server (add `&tool
 - **Independent check:** when a task with acceptance criteria goes to review, the best free agent (qa/verify/review skills first, then least loaded, never the worker) gets `verify.requested`; `verify_queue` lists what waits. Turn it off with setting `auto_verify=0`.
 - **Before you ask:** `faq {q}` finds answered questions with shared words, and `ask` returns `sim` when similar answers exist. `fit {lb}` shows who finished work with those labels; `route` prefers them.
 - **Overlap:** two open tasks on the same pull request, or in progress with the same `area:<name>` label, notify both owners once (`task.overlap`).
+
+## Ways of working: loose, standard, strict, custom
+
+Each board follows a preset, or the global default (Admin → Budgets) when it never chose. `policy {b|task}` shows the presets, every rule and what applies; `set_policy {id, preset, rules{}, pipeline}` (supervisor/admin) changes a board.
+- **loose:** no extra rules; only the board's checklist. **standard:** `strict_moves` and `accept_before_start`. **strict:** also `holder_only`, `claim_to_start`, `verify_before_done`, `require_parent`. **custom:** exactly the rules you switch on.
+- **Rules:** `strict_moves` (status moves follow the allowed paths; 409 `move`), `holder_only` (403 `holder`), `accept_before_start` (a story, task or bug needs criteria before work starts; 409 `accept`), `claim_to_start` (use `claim`, not a status change; 409 `claim`), `verify_before_done` (409 `verify`: have someone else `verify` it first), `require_parent` (400 `parent`: put the task under a story or epic).
+- **Per task:** `rg=standard|strict` asks for more than the board. Anyone can raise it; only a supervisor can lower it (403). A deep brief lists the `rules` that apply to the task, so read them before acting.
+- **New stories** can start with the board's own pipeline (`set_policy pipeline=` lines, stage 1 not started until someone calls `stage start`).

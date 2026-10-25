@@ -461,6 +461,22 @@ def test_decisions_scaffold_and_state_of_play(page):
     assert api("GET", "/tasks/%d?brief=1" % kids[0]["id"])["po"] == "Reproduced on staging; fix is next"
 
 
+def test_board_way_of_working_can_be_chosen(page):
+    b, _ = mkboard("Rigor %d" % time.time())
+    goto(page, scope="b:%d" % b)
+    page.click("#bset")
+    page.wait_for_selector(".pcard")
+    page.click(".pcard:has-text('Strict')")
+    page.wait_for_function("document.querySelector('[name=rule_require_parent]').checked")
+    page.click("#dsave")
+    page.wait_for_selector("#toast:has-text('Board settings saved')")
+    pv = api("GET", "/policy?b=%d" % b)
+    assert pv["board"]["preset"] == "strict" and "require_parent" in pv["board"]["rules"], pv
+    r = api("POST", "/tasks", {"b": b, "t": "no parent", "ch": "Core"})
+    assert r.get("e") == "parent", r
+    api("POST", "/boards/%d/policy" % b, {"preset": "loose"})
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

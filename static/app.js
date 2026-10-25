@@ -11,11 +11,15 @@ const ERR_TXT = {
   move: f => "That move is not allowed" + (f.includes(">") ? " (" + f.split(">")[0].replace("_", " ") + " → " + f.split(">")[1].replace("_", " ") + ")" : "") + ". An admin can override it with force.",
   holder: f => "Only " + (f || "the holder") + " can change this task right now.",
   independent: () => "Someone other than the worker has to verify this.",
+  accept: () => "This board wants acceptance criteria written before work starts.",
+  claim: () => "Claim the task to start it; on this board it cannot just be moved to In progress.",
+  verify: () => "Someone other than the worker has to verify this before it can be done.",
+  parent: () => "On this board every task belongs to a story or an epic: pick one in Belongs to.",
   gate: () => "This stage waits for a person to decide it (Review tab).",
 };
 // short event keys -> full task/sprint/board fields
 const KM = {
-  task: {du: "due", cs: "cost", tk: "tokens", b: "board_id", s: "sprint_id", t: "title", d: "description", st: "status", pr: "priority", as: "assignee", k: "kind", u: "updated", bl: "blocker", bb: "blocked_by", lb: "labels", ch: "channel", w: "watch", sh: "short_url", vid: "video_id", at: "publish_at", pu: "pr_url", sha: "sha", cm: "commits", dp: "depends", pt: "points", cb: "claimed_by", cu: "claim_until", v: "version", dn: "dod_done", pl: "pipeline", sg: "stage", po: "play", nd: "needs", mk: "makes", ac: "accept", vb: "verified_by", va: "verified_at", vn: "verified_note", ty: "type", pa: "parent", tg: "target", cr: "current"},
+  task: {du: "due", cs: "cost", tk: "tokens", b: "board_id", s: "sprint_id", t: "title", d: "description", st: "status", pr: "priority", as: "assignee", k: "kind", u: "updated", bl: "blocker", bb: "blocked_by", lb: "labels", ch: "channel", w: "watch", sh: "short_url", vid: "video_id", at: "publish_at", pu: "pr_url", sha: "sha", cm: "commits", dp: "depends", pt: "points", cb: "claimed_by", cu: "claim_until", v: "version", dn: "dod_done", pl: "pipeline", sg: "stage", po: "play", nd: "needs", mk: "makes", rg: "rigor", ac: "accept", vb: "verified_by", va: "verified_at", vn: "verified_note", ty: "type", pa: "parent", tg: "target", cr: "current"},
   sprint: {b: "board_id", n: "name", g: "goal", from: "start", to: "end", st: "state"},
   board: {n: "name", d: "description", tm: "team"},
 };
@@ -343,6 +347,27 @@ function kidsBox(t, ts) {
     <div class="vf"><button type="button" class="mini" id="addkid" data-pt="${t.id}" data-ty="${t.type === "epic" ? "story" : "task"}">+ Add ${t.type === "epic" ? "a story" : "a task"} under this</button>${t.type === "epic" ? `<button type="button" class="mini" id="addkid2" data-pt="${t.id}" data-ty="task">+ Add a task</button>` : ""}</div></div>`;
 }
 
+// ---- the way of working a board follows: loose, standard, strict or your own rules
+const RULE_TXT = {strict_moves: "Tasks only move along the allowed paths", holder_only: "Only the holder changes a task someone is holding", accept_before_start: "Acceptance criteria before work starts",
+  claim_to_start: "Work starts by claiming, not dragging", verify_before_done: "Someone else verifies before a task is done", require_parent: "Every task belongs to a story or epic"};
+const PRESET_TXT = {loose: ["Loose", "Move work freely. Only the board's own checklist applies."], standard: ["Standard", "Clear paths and written acceptance, without getting in the way."],
+  strict: ["Strict", "Paths, one holder, claims, an independent check, everything under a story."], custom: ["Custom", "Pick exactly the rules you want."]};
+const PRESET_RULES = {loose: [], standard: ["strict_moves", "accept_before_start"], strict: Object.keys(RULE_TXT), custom: []};
+function policyBox(pol, dflt) {
+  const preset = pol.preset || dflt || "loose", ov = pol.rules || {}, base = new Set(PRESET_RULES[preset] || []);
+  const on = k => preset === "custom" ? !!ov[k] : (ov[k] !== undefined ? !!ov[k] : base.has(k));
+  const pipe = (pol.pipeline || []).map(s => `${s.name} | ${s.holder} | ${s.gate}`).join("\n");
+  return `<fieldset class="fs"><legend>How strict this board is <span class="muted">(owner, admin or supervisor)</span></legend>
+    <div class="pcards">${Object.entries(PRESET_TXT).map(([k, [n, a]]) => `<label class="pcard ${k === preset ? "on" : ""}"><input type="radio" name="rigor_preset" value="${k}" ${k === preset ? "checked" : ""}><b>${n}</b><span>${a}</span></label>`).join("")}</div>
+    <div class="rulelist">${Object.entries(RULE_TXT).map(([k, t]) => `<label class="chk"><input type="checkbox" name="rule_${k}" ${on(k) ? "checked" : ""}> ${t}</label>`).join("")}</div>
+    <label>New stories start with this pipeline <span class="muted">(optional, one stage per line: name | holder | auto, review or human)</span><textarea name="pol_pipeline" rows="2">${esc(pipe)}</textarea></label></fieldset>`;
+}
+function policyFrom(d) {
+  const preset = d.rigor_preset || "loose", base = new Set(PRESET_RULES[preset] || []), rules = {};
+  for (const k of Object.keys(RULE_TXT)) { const on = d["rule_" + k] === "on"; if (preset === "custom" ? on || true : on !== base.has(k)) rules[k] = on; }
+  return {preset, rules, pipeline: (d.pol_pipeline || "").trim()};
+}
+
 function colHtml(s, ts) {
   const c = ts.filter(t => t.status === s).sort((x, y) => x.priority - y.priority || x.id - y.id);
   const lim = meth().wip ? (bcfg().wip || {})[s] : 0, over = lim && c.length > lim;
@@ -604,6 +629,7 @@ async function renderAdmin() {
       <div class="row2"><label>Wake sleeping agents after (minutes, 0 = off)<input type="number" name="wake_after_min" min="0" max="1440" value="${esc(se.wake_after_min || 10)}"></label><label>Close a task when its PR merges<select name="git_autodone"><option value="1" ${se.git_autodone !== "0" ? "selected" : ""}>Yes (if the gate allows)</option><option value="0" ${se.git_autodone === "0" ? "selected" : ""}>No, only comment</option></select></label></div>
       <label>Mark a run as lost after (minutes without a sign of life, 0 = off)<input type="number" name="run_lost_min" min="0" max="1440" value="${esc(se.run_lost_min || 90)}"></label>
       <label>Monthly budget for all boards (USD, blank = none)<input type="number" step="any" min="0" name="budget_usd" value="${esc(se.budget_usd)}"></label>
+      <label>Default way of working for boards that did not choose<select name="policy_default"><option value="" ${!se.policy_default ? "selected" : ""}>Loose</option><option value="standard" ${se.policy_default === "standard" ? "selected" : ""}>Standard</option><option value="strict" ${se.policy_default === "strict" ? "selected" : ""}>Strict</option></select></label>
       <label>Ask for an independent check when work with acceptance criteria goes to review<select name="auto_verify"><option value="1" ${se.auto_verify !== "0" ? "selected" : ""}>Yes, ask the best free agent</option><option value="0" ${se.auto_verify === "0" ? "selected" : ""}>No</option></select></label>
       <div class="row2"><label>Task moves<select name="strict_moves"><option value="0" ${se.strict_moves !== "1" ? "selected" : ""}>Any move</option><option value="1" ${se.strict_moves === "1" ? "selected" : ""}>Strict (follow the allowed paths)</option></select></label><label>Tasks someone is holding<select name="holder_only"><option value="0" ${se.holder_only !== "1" ? "selected" : ""}>Anyone with access can change</option><option value="1" ${se.holder_only === "1" ? "selected" : ""}>Only the holder, a supervisor or an admin</option></select></label></div>
       <label>Daily limits per agent <span class="muted">(JSON, per UTC day: jobs, usd, secs; "*" = everyone)</span><textarea name="agent_limits" rows="2" placeholder='{"*": {"jobs": 40}, "coder-agent": {"usd": 5}}'>${esc(se.agent_limits)}</textarea></label>
@@ -990,11 +1016,13 @@ function newBoard() {
     async d => { const b = await api("POST", "/boards", {name: d.name, description: d.description, method: d.method || "scrum"}); await loadBoards(b.id); }, "", "Create board");
 }
 
-function boardSetDlg() {
+async function boardSetDlg() {
   if (!B) return;
   const cfg = bcfg(), w = cfg.wip || {};
+  let dflt = ""; try { dflt = (await api("GET", "/policy?b=" + B.id)).default || ""; } catch (_) {}
   dlg(`<h3>Board settings · ${esc(B.name)}</h3>
     <div><label>Way of working</label><div class="methods">${methodCards(B.method || "scrum")}</div></div>
+    ${policyBox(cfg.policy || {}, dflt)}
     <fieldset class="fs"><legend>Work in progress limits <span class="muted">(kanban, scrumban — blank = no limit)</span></legend>
       <div class="row3"><label>${esc(L("todo"))}<input type="number" name="w_todo" min="1" value="${w.todo || ""}"></label><label>${esc(L("in_progress"))}<input type="number" name="w_in_progress" min="1" value="${w.in_progress || ""}"></label><label>${esc(L("review"))}<input type="number" name="w_review" min="1" value="${w.review || ""}"></label></div>
       <label>When a limit is hit<select name="wip_mode"><option value="warn" ${cfg.wip_mode !== "block" ? "selected" : ""}>Warn — allow it, show a warning</option><option value="block" ${cfg.wip_mode === "block" ? "selected" : ""}>Block — refuse (admins and supervisors can force)</option></select></label></fieldset>
@@ -1008,8 +1036,16 @@ function boardSetDlg() {
     async d => {
       const wip = {}; for (const k of ["todo", "in_progress", "review"]) if (d["w_" + k]) wip[k] = +d["w_" + k];
       await api("PATCH", "/boards/" + B.id, {method: d.method, dod: d.dod, cfg: {wip, wip_mode: d.wip_mode, sprint_days: +d.sprint_days || 0, auto_rollover: d.auto_rollover === "on", replenish_below: +d.replenish_below || 0, sla_hours: {1: +d.sla1 || 0, 2: +d.sla2 || 0, 3: +d.sla3 || 0, 4: +d.sla4 || 0}, phases: d.phases, budget_usd: +d.budget_usd || 0, task_budget_usd: +d.task_budget_usd || 0}});
+      const np = policyFrom(d), op = cfg.policy || {};
+      if (JSON.stringify(np) !== JSON.stringify({preset: op.preset || "loose", rules: op.rules || {}, pipeline: (op.pipeline || []).map(s => `${s.name} | ${s.holder} | ${s.gate}`).join("\n")})) await api("POST", "/boards/" + B.id + "/policy", np);
       await loadBoard(); toast("Board settings saved");
     }, "", "Save settings");
+  $("f").addEventListener("change", e => {
+    if (e.target.name !== "rigor_preset") return;
+    const base = new Set(PRESET_RULES[e.target.value] || []);
+    if (e.target.value !== "custom") Object.keys(RULE_TXT).forEach(k => { const c = $("f").querySelector(`[name=rule_${k}]`); if (c) c.checked = base.has(k); });
+    document.querySelectorAll(".pcard").forEach(x => x.classList.toggle("on", x.querySelector("input").checked));
+  });
 }
 
 function retroDlg(sid) {
@@ -1129,6 +1165,7 @@ function taskDlg(id, status, title, boardId, pri, pre) {
     ${id && (t.status === "review" || t.status === "done") ? `<div class="acc"><label>Independent check <span class="muted">(someone other than the worker, against the criteria above)</span></label>${t.verified_by ? `<div>✓ Verified by <b>${esc(t.verified_by)}</b> ${esc(ago(t.verified_at))} ago${t.verified_note ? " · " + esc(t.verified_note) : ""}</div>` : `<div class="muted">Not verified yet. ${t.accept ? "" : "This card has no acceptance criteria."}</div>`}${t.accept ? `<ul>${t.accept.split("\n").map(x => `<li>${esc(x)}</li>`).join("")}</ul>` : ""}<div class="vf"><input id="vfn" placeholder="Note (required to send back)"><button type="button" class="mini primary" id="vfok">Verify</button><button type="button" class="mini" id="vfno">Send back</button></div></div>` : ""}
     ${(bd.dod || "").trim() ? `<div class="dod"><label>Definition of done — every item before this task can be done</label>${bd.dod.split("\n").filter(x => x.trim()).map((x, i) => `<label class="chk"><input type="checkbox" name="dodi" value="${i}" ${csv(t.dod_done).includes(String(i)) ? "checked" : ""}> ${esc(x)}</label>`).join("")}</div>` : ""}
     <details class="more"><summary>More fields (labels, links, blockers, PR)</summary>
+    <label>Rigor for this task <span class="muted">(ask for more discipline than the board; only a supervisor can lower it)</span><select name="rigor"><option value="" ${!t.rigor ? "selected" : ""}>same as the board</option><option value="standard" ${t.rigor === "standard" ? "selected" : ""}>standard</option><option value="strict" ${t.rigor === "strict" ? "selected" : ""}>strict</option></select></label>
     <div class="row2"><label>Needs <span class="muted">(inputs, one per line)</span><textarea name="needs" rows="2">${esc(t.needs || "")}</textarea></label><label>Produces <span class="muted">(outputs, one per line)</span><textarea name="makes" rows="2">${esc(t.makes || "")}</textarea></label></div>
     <label>Labels (comma)<input name="labels" list="lbl" value="${esc(csv(t.labels).map(lbShow).join(", "))}"><datalist id="lbl">${SUG_LB.map(l => `<option value="${esc(lbShow(l))}">`).join("")}</datalist></label>
     <div class="row2"><label>PR URL<input name="pr_url" value="${esc(t.pr_url)}"></label><label>SHA / deployed.txt<input name="sha" value="${esc(t.sha)}"></label></div>

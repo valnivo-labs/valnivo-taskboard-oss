@@ -161,7 +161,7 @@ for _t, _c, _d in (("tasks", "blocker", "TEXT DEFAULT ''"), ("tasks", "blocked_b
                    ("tasks", "accept", "TEXT DEFAULT ''"), ("tasks", "verified_by", "TEXT DEFAULT ''"), ("tasks", "verified_at", "TEXT DEFAULT ''"), ("tasks", "verified_note", "TEXT DEFAULT ''"),
                    ("events", "h", "TEXT DEFAULT ''"), ("events", "hp", "TEXT DEFAULT ''"),
                    ("tasks", "pipeline", "TEXT DEFAULT ''"), ("tasks", "stage", "INTEGER DEFAULT 0"),
-                   ("tasks", "play", "TEXT DEFAULT ''"), ("tasks", "needs", "TEXT DEFAULT ''"), ("tasks", "makes", "TEXT DEFAULT ''"),
+                   ("tasks", "rigor", "TEXT DEFAULT ''"), ("tasks", "play", "TEXT DEFAULT ''"), ("tasks", "needs", "TEXT DEFAULT ''"), ("tasks", "makes", "TEXT DEFAULT ''"),
                    ("agents", "wake_at", "TEXT DEFAULT ''"), ("agents", "wake_n", "INTEGER DEFAULT 0")):
     if _c not in [r[1] for r in db.execute(f"PRAGMA table_info({_t})")]:
         db.execute(f"ALTER TABLE {_t} ADD COLUMN {_c} {_d}")
@@ -197,7 +197,7 @@ FIELDS = {
     "boards": ["name", "description", "team", "dod", "method", "cfg"],
     "docs": ["scope", "ref_id", "title", "body", "url"],
     "sprints": ["board_id", "name", "goal", "start", "end", "state"],
-    "tasks": ["board_id", "sprint_id", "title", "description", "status", "priority", "assignee", "kind", "blocker", "blocked_by", "labels", "channel", "watch", "short_url", "video_id", "publish_at", "pr_url", "sha", "commits", "decline_reason", "nudge", "depends", "points", "dod_done", "type", "parent", "target", "current", "due", "accept", "pipeline", "play", "needs", "makes"],
+    "tasks": ["board_id", "sprint_id", "title", "description", "status", "priority", "assignee", "kind", "blocker", "blocked_by", "labels", "channel", "watch", "short_url", "video_id", "publish_at", "pr_url", "sha", "commits", "decline_reason", "nudge", "depends", "points", "dod_done", "type", "parent", "target", "current", "due", "accept", "pipeline", "play", "needs", "makes", "rigor"],
 }
 REQUIRED = {"docs": ["scope", "ref_id", "title"], "boards": ["name"], "sprints": ["board_id"], "tasks": ["board_id", "title"]}
 # db column -> short key (compact mode). Input accepts short or long keys.
@@ -207,7 +207,7 @@ CK = {
     "sprints": {"id": "id", "board_id": "b", "name": "n", "goal": "g", "start": "from", "end": "to", "state": "st", "committed": "cmt"},
     "tasks": {"id": "id", "board_id": "b", "sprint_id": "s", "title": "t", "description": "d", "status": "st",
               "priority": "pr", "assignee": "as", "kind": "k", "updated": "u", "blocker": "bl", "blocked_by": "bb", "labels": "lb", "channel": "ch",
-              "watch": "w", "short_url": "sh", "video_id": "vid", "publish_at": "at", "pr_url": "pu", "sha": "sha", "commits": "cm", "decline_reason": "dr", "nudge": "nu", "depends": "dp", "points": "pt", "dod_done": "dn", "claimed_by": "cb", "claim_until": "cu", "version": "v", "type": "ty", "parent": "pa", "target": "tg", "current": "cr", "cost": "cs", "tokens": "tk", "due": "du", "accept": "ac", "verified_by": "vb", "verified_at": "va", "verified_note": "vn", "pipeline": "pl", "stage": "sg", "play": "po", "needs": "nd", "makes": "mk"},
+              "watch": "w", "short_url": "sh", "video_id": "vid", "publish_at": "at", "pr_url": "pu", "sha": "sha", "commits": "cm", "decline_reason": "dr", "nudge": "nu", "depends": "dp", "points": "pt", "dod_done": "dn", "claimed_by": "cb", "claim_until": "cu", "version": "v", "type": "ty", "parent": "pa", "target": "tg", "current": "cr", "cost": "cs", "tokens": "tk", "due": "du", "accept": "ac", "verified_by": "vb", "verified_at": "va", "verified_note": "vn", "pipeline": "pl", "stage": "sg", "play": "po", "needs": "nd", "makes": "mk", "rigor": "rg"},
 }
 IN = {t: {**{v: k for k, v in m.items()}, **{k: k for k in m}} for t, m in CK.items()}
 
@@ -581,6 +581,10 @@ def validate(table, body, partial):
         dv = out["dod_done"]
         ids = dv if isinstance(dv, list) else re.findall(r"\d+", str(dv or ""))
         out["dod_done"] = ",".join(str(i) for i in sorted({int(x) for x in ids}))[:200]
+    if "rigor" in out:
+        out["rigor"] = str(out["rigor"] or "").strip().lower()
+        if out["rigor"] not in RIGOR_RANK:
+            raise ApiError("bad", 400, "rg")
     if "play" in out:
         out["play"] = " ".join(str(out["play"] or "").split())[:600]
     for k_ in ("needs", "makes"):
@@ -891,6 +895,11 @@ def crud(actor, method, table, rid, body, q, full):
                 if d.get("status") == "declined" and not d.get("decline_reason"):
                     raise ApiError("missing", 400, "dr")
                 check_hier(0, d.get("type", "task"), d.get("parent"), d["board_id"])
+                _pol = board_policy(d["board_id"])
+                if "require_parent" in (board_rules(d["board_id"]) | set(PRESETS.get(d.get("rigor") or "", {"rules": []})["rules"])) and d.get("type", "task") in LEAF_TYPES and not d.get("parent"):
+                    raise ApiError("parent", 400, "pa")
+                if _pol.get("pipeline") and d.get("type", "task") in (_pol.get("pipeline_types") or ["story"]) and not d.get("pipeline"):
+                    d["pipeline"] = pipeline_clean(_pol["pipeline"])
                 _w = check_wip(d["board_id"], d.get("status", "backlog"), force=body.get("force"))
                 if str(d.get("assignee", "")).lower() == "auto":
                     cand = route_candidates("", d.get("labels", ""))
@@ -947,6 +956,7 @@ def crud(actor, method, table, rid, body, q, full):
                 _wip = None
                 if "status" in d and d["status"] != old["status"]:
                     _wip = check_wip(old["board_id"], d["status"], tid=rid, force=body.get("force"))
+                    check_start(old, d["status"])
                 if "parent" in d or "type" in d:
                     check_hier(rid, d.get("type", old["type"] or "task"), d["parent"] if "parent" in d else old["parent"], old["board_id"])
                 if d.get("status") in ("done", "declined"):
@@ -1354,12 +1364,127 @@ REOPEN_FROM = ("declined", "blocked", "done")
 REOPEN_TO = ("todo", "in_progress", "backlog", "review")
 
 
+# ---- ways of working: which rules apply to a board, and to a task that asks for more
+RULES = {
+    "strict_moves": "A task only moves along the allowed paths (backlog, to do, in progress, review, done).",
+    "holder_only": "A task someone is holding can only be changed by that holder, a supervisor or an admin.",
+    "accept_before_start": "A story, task or bug needs acceptance criteria before work on it can start.",
+    "claim_to_start": "Work starts by claiming the task, not by dragging it to In progress.",
+    "verify_before_done": "A task with acceptance criteria can only be done after someone other than the worker verified it.",
+    "require_parent": "Every task, bug, spike and chore belongs to a story or an epic.",
+}
+PRESETS = {
+    "loose": {"about": "Move work freely; only the board's own checklist applies.", "rules": []},
+    "standard": {"about": "Clear paths and written acceptance, without getting in people's way.", "rules": ["strict_moves", "accept_before_start"]},
+    "strict": {"about": "The full discipline: paths, one holder, claims, an independent check, everything under a story.", "rules": list(RULES)},
+}
+RIGOR_RANK = {"": 0, "loose": 0, "standard": 1, "strict": 2}
+
+
+def policy_clean(v):
+    if isinstance(v, str):
+        try:
+            v = json.loads(v) if v.strip() else {}
+        except ValueError:
+            raise ApiError("bad", 400, "pol")
+    if not isinstance(v, dict):
+        raise ApiError("bad", 400, "pol")
+    out = {}
+    if v.get("preset") not in (None, ""):
+        if v["preset"] not in PRESETS and v["preset"] != "custom":
+            raise ApiError("bad", 400, "preset")
+        out["preset"] = v["preset"]
+    ov = {k: bool(x) for k, x in (v.get("rules") or {}).items() if k in RULES} if isinstance(v.get("rules"), dict) else {}
+    if ov:
+        out["rules"] = ov
+    pl = v.get("pipeline")
+    if pl not in (None, "", []):
+        out["pipeline"] = json.loads(pipeline_clean(pl))
+        types = v.get("pipeline_types") if isinstance(v.get("pipeline_types"), list) else ["story"]
+        out["pipeline_types"] = [x for x in types if x in TASK_TYPES] or ["story"]
+    return out
+
+
+def board_policy(bid):
+    return (board_cfg(bid)[1] or {}).get("policy") or {}
+
+
+def board_rules(bid):
+    """The rules a board applies: its preset (or the global default), then its own switches on top. `custom` starts from nothing."""
+    pol = board_policy(bid)
+    preset = pol.get("preset") or get_setting("policy_default", "") or "loose"
+    rules = set() if preset == "custom" else set(PRESETS.get(preset, PRESETS["loose"])["rules"])
+    for k, on in (pol.get("rules") or {}).items():
+        (rules.add if on else rules.discard)(k)
+    return rules
+
+
+def task_rules(t):
+    """Board rules, plus whatever the task's own rigor adds (a task can ask for more discipline, never less), plus the older global switches."""
+    rules = board_rules(t["board_id"]) | set(PRESETS.get(t["rigor"] or "", {"rules": []})["rules"])
+    for k in ("strict_moves", "holder_only"):
+        if get_setting(k, "0") == "1":
+            rules.add(k)
+    return rules
+
+
+def policy_view(q):
+    bid, tid = qint(q, "b"), qint(q, "task")
+    out = {"presets": {k: {"about": v["about"], "rules": v["rules"]} for k, v in PRESETS.items()}, "rules": RULES, "default": get_setting("policy_default", "") or "loose"}
+    t = None
+    if tid:
+        r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+        if not r:
+            raise ApiError("nf", 404)
+        t, bid = r[0], r[0]["board_id"]
+    if bid:
+        pol = board_policy(bid)
+        out["board"] = {"id": bid, "preset": pol.get("preset") or out["default"], "rules": sorted(board_rules(bid)), "overrides": pol.get("rules") or {},
+                        **({"pipeline": pol["pipeline"], "pipeline_types": pol.get("pipeline_types")} if pol.get("pipeline") else {})}
+    if t:
+        out["task"] = {"id": tid, "rigor": t["rigor"] or None, "rules": sorted(task_rules(t))}
+    return out
+
+
+def board_policy_set(actor, role, bid, body):
+    """Owner, admin or supervisor chooses how strict a board is."""
+    if not _priv(role):
+        raise ApiError("forbidden", 403)
+    with lock:
+        r = rows("SELECT method, cfg FROM boards WHERE id=?", (bid,))
+        if not r:
+            raise ApiError("nf", 404)
+        try:
+            cfg = json.loads(r[0]["cfg"] or "{}")
+        except ValueError:
+            cfg = {}
+        pol = policy_clean(body)
+        if pol:
+            cfg["policy"] = pol
+        else:
+            cfg.pop("policy", None)
+        db.execute("UPDATE boards SET cfg=? WHERE id=?", (json.dumps(cfg, separators=(",", ":")), bid))
+        emit(actor, "board.policy", bid, bid, {"pol": pol.get("preset") or "default"})
+    return {"id": bid, "policy": pol}
+
+
+def check_start(t, new_status, claiming=False):
+    """Rules that decide whether work may start (status becomes in progress)."""
+    if new_status != "in_progress" or t["status"] == "in_progress":
+        return
+    rules = task_rules(t)
+    if "accept_before_start" in rules and (t["type"] or "task") in ("story", "task", "bug") and not t["accept"]:
+        raise ApiError("accept", 409, "ac")
+    if "claim_to_start" in rules and not claiming and not (t["claimed_by"] and t["claim_until"] > now_s()):
+        raise ApiError("claim", 409, "cb")
+
+
 def check_holder(actor, role, tid):
     """With the setting holder_only=1, a task that someone currently holds (a live claim) can only be changed by that holder, a supervisor or an admin."""
-    if _priv(role) or get_setting("holder_only", "0") != "1":
+    if _priv(role):
         return
-    r = rows("SELECT claimed_by, claim_until FROM tasks WHERE id=?", (tid,))
-    if r and r[0]["claimed_by"] and r[0]["claim_until"] > now_s() and r[0]["claimed_by"].lower() != (actor or "").lower():
+    r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+    if r and "holder_only" in task_rules(r[0]) and r[0]["claimed_by"] and r[0]["claim_until"] > now_s() and r[0]["claimed_by"].lower() != (actor or "").lower():
         raise ApiError("holder", 403, r[0]["claimed_by"])
 
 
@@ -1430,10 +1555,10 @@ MOVES = {"backlog": {"todo", "in_progress", "declined"}, "todo": {"backlog", "in
 def check_move(role, tid, body):
     """With strict_moves=1 a task only moves along MOVES. A supervisor or admin can override with force=1."""
     new = body.get("st") or body.get("status")
-    if not new or get_setting("strict_moves", "0") != "1":
+    if not new:
         return
-    r = rows("SELECT status FROM tasks WHERE id=?", (tid,))
-    if not r or r[0]["status"] == new or new not in MOVES:
+    r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+    if not r or r[0]["status"] == new or new not in MOVES or "strict_moves" not in task_rules(r[0]):
         return
     if new not in MOVES.get(r[0]["status"], set()) and not (_priv(role) and body.get("force")):
         raise ApiError("move", 409, "%s>%s" % (r[0]["status"], new))
@@ -3329,6 +3454,7 @@ def claim_task(actor, tid, body):
             raise ApiError("bad", 400, "st")
         if t["status"] in ("backlog", "todo"):
             check_wip(t["board_id"], "in_progress", tid=tid)
+            check_start(t, "in_progress", claiming=True)
         if t["claimed_by"] and t["claimed_by"].lower() != me.lower() and t["claim_until"] > now_s():
             raise ApiError("claimed", 409, t["claimed_by"])
         until = plus_min(ttl)
@@ -3603,6 +3729,9 @@ def check_done_gate(tid, bid, dod_done):
     if rows("SELECT id FROM reviews r WHERE task_id=? AND (status='pending' OR (status='changes' AND NOT EXISTS "
             "(SELECT 1 FROM reviews n WHERE n.task_id=r.task_id AND n.reviewer=r.reviewer COLLATE NOCASE AND n.id>r.id)))", (tid,)):
         raise ApiError("review", 400, "st")
+    t_ = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+    if t_ and t_[0]["accept"] and not t_[0]["verified_by"] and "verify_before_done" in task_rules(t_[0]):
+        raise ApiError("verify", 409, "vb")
 
 
 # ---- skills routing
@@ -4006,6 +4135,8 @@ def norm_cfg(v):
                 if x <= 0 or x > 1e9:
                     raise ValueError
                 out[bk] = round(x, 2)
+        if v.get("policy"):
+            out["policy"] = policy_clean(v["policy"])
         sl = {str(k): int(n) for k, n in (v.get("sla_hours") or {}).items() if str(k) in ("1", "2", "3", "4") and n not in (None, "", 0, "0")}
         if sl:
             if any(n < 1 or n > 24 * 365 for n in sl.values()):
@@ -4549,6 +4680,9 @@ def task_brief(tid, deep=False):
         dec = decisions_for(tid)
         if dec:
             o["dec"] = dec
+        rl = sorted(task_rules(t))
+        if rl:
+            o["rules"] = rl
     o["ev"] = last_event()
     cm = rows("SELECT actor, body FROM comments WHERE task_id=? ORDER BY id DESC LIMIT ?", (tid, 3 if deep else 1))
     if cm:
@@ -5068,7 +5202,7 @@ def token_delete(tid):
     return {"id": tid, "x": 1}
 
 
-SETTING_KEYS = ("digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd", "agent_limits", "run_lost_min", "holder_only", "strict_moves", "auto_verify", "media_hosts")
+SETTING_KEYS = ("digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd", "agent_limits", "run_lost_min", "holder_only", "strict_moves", "auto_verify", "policy_default", "media_hosts")
 
 
 def get_setting(k, default=""):
@@ -5094,6 +5228,8 @@ def settings_set(body):
                         check_public_url(v)
                     except ApiError as e:
                         raise ApiError(e.code, 400, k)
+                if k == "policy_default" and v not in ("", "loose", "standard", "strict"):
+                    raise ApiError("bad", 400, k)
                 if k in ("digest_hour", "backup_keep", "wake_after_min", "run_lost_min") and v:
                     try:
                         assert 0 <= int(v) <= (23 if k == "digest_hour" else 1440 if k in ("wake_after_min", "run_lost_min") else 365)
@@ -5935,6 +6071,11 @@ class H(BaseHTTPRequestHandler):
             mvf = re.fullmatch(r"/api/tasks/(\d+)/verify", path)
             if mvf and method == "POST":
                 return self.send_json(200, task_verify(actor, self.role, int(mvf.group(1)), self.read_body()))
+            if path == "/api/policy" and method == "GET":
+                return self.send_json(200, policy_view(q))
+            mbp = re.fullmatch(r"/api/boards/(\d+)/policy", path)
+            if mbp and method == "POST":
+                return self.send_json(200, board_policy_set(actor, self.role, int(mbp.group(1)), self.read_body()))
             if path == "/api/verify/queue" and method == "GET":
                 return self.send_json(200, verify_queue(q, actor, self.role))
             if path == "/api/faq" and method == "GET":
@@ -6018,10 +6159,27 @@ class H(BaseHTTPRequestHandler):
                     self.send_header("ETag", etag)
                     self.end_headers()
                     return
+            if m.group(1) == "boards" and rid and method in ("PATCH", "PUT") and isinstance(body, dict) and any(k in body for k in ("cf", "cfg")):
+                _k = "cf" if "cf" in body else "cfg"
+                try:
+                    _c = json.loads(body[_k]) if isinstance(body[_k], str) and body[_k].strip() else (body[_k] if isinstance(body[_k], dict) else {})
+                except ValueError:
+                    _c = {}
+                _stored = board_policy(rid)
+                if _c.get("policy") is None or not _priv(self.role):
+                    _c.pop("policy", None)
+                    if _stored:
+                        _c["policy"] = _stored
+                body[_k] = _c
             if m.group(1) == "tasks" and rid and method in ("PATCH", "PUT", "DELETE"):
                 check_holder(actor, self.role, rid)
                 if method != "DELETE" and isinstance(body, dict):
                     check_move(self.role, rid, body)
+                    _nr = body.get("rigor", body.get("rg"))
+                    if _nr is not None and not _priv(self.role):
+                        _cur = rows("SELECT rigor FROM tasks WHERE id=?", (rid,))
+                        if _cur and RIGOR_RANK.get(str(_nr).strip().lower(), 0) < RIGOR_RANK.get(_cur[0]["rigor"] or "", 0):
+                            raise ApiError("forbidden", 403, "rg")
             res = crud(actor, method, m.group(1), rid, body, q, full)
             self.send_json(201 if method == "POST" else 200, res, etag)
         except ApiError as e:

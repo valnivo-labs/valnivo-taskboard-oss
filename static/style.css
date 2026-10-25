@@ -514,3 +514,9 @@ button.sprow progress{flex:none;height:8px;width:100%}
 .kidsbox .vf{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.kidsbox .vf input,.kidsbox .vf select{flex:1;min-width:140px;max-width:300px}
 .cmtform .qn{display:flex;gap:6px;align-items:center;font-size:12px;color:var(--mut);white-space:nowrap}
 .sprow2{display:grid;grid-template-columns:1fr 70px 80px;gap:8px;font-size:13px;align-items:center;padding:4px 0;border-top:1px solid var(--bd2)}.sprow2:first-of-type{border-top:0}.sprow2 small{color:var(--mut)}.sprow2 .num{text-align:right}
+
+/* way of working */
+.pcards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:10px}
+.pcard{border:1px solid var(--bd);border-radius:12px;padding:10px 12px;display:flex!important;flex-direction:column!important;gap:3px;cursor:pointer;background:var(--surface);position:relative}
+.pcard input{position:absolute;top:10px;right:10px}.pcard b{color:var(--fg);font-size:13px}.pcard span{font-weight:400;font-size:12px;color:var(--mut);padding-right:18px}.pcard.on{border-color:var(--pri);box-shadow:0 0 0 1px var(--pri)}
+.rulelist{display:grid;grid-template-columns:1fr 1fr;gap:4px 14px;margin-bottom:8px}@media(max-width:640px){.rulelist{grid-template-columns:1fr}}
