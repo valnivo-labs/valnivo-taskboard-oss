@@ -1110,3 +1110,85 @@ assert any(n["ty"] == "esc.run-lost" and "Lost One" in n["m"] for n in J("GET", 
 J("POST", "/settings", {"run_lost_min": "0"}); server.db.execute("UPDATE runs SET status='running', ended='' WHERE id=?", (lr_["id"],)); assert server.runs_tick() == 0; J("POST", "/settings", {"run_lost_min": ""})
 assert J("POST", "/settings", {"run_lost_min": "x"})[1]["e"] == "bad"
 print("v22 selftest OK")
+
+# v24 acceptance criteria, independent verification, tamper-evident audit chain, holder-only writes
+_wk = J("POST", "/tokens", {"n": "Worker V", "role": "agent"})[1]["token"]; _ck = J("POST", "/tokens", {"n": "Checker V", "role": "agent"})[1]["token"]
+st, at_ = J("POST", "/tasks", {"b": RB, "t": "needs checking", "as": "Worker V", "ac": "tests pass\n\n  docs updated  "})
+assert st == 201 and at_["ac"] == "tests pass\ndocs updated", at_
+J("POST", f"/tasks/{at_['id']}/claim", {}, tok=_wk)
+assert J("POST", f"/tasks/{at_['id']}/verify", {}, tok=_ck)[1]["e"] == "bad"                          # not finished yet
+J("PATCH", f"/tasks/{at_['id']}", {"st": "review"}, tok=_wk)
+assert J("POST", f"/tasks/{at_['id']}/verify", {}, tok=_wk)[0] == 403                                 # the worker cannot verify their own work
+assert J("POST", f"/tasks/{at_['id']}/verify", {"ok": False}, tok=_ck)[1]["e"] == "missing"          # sending back needs a reason
+assert J("POST", f"/tasks/{at_['id']}/verify", {"ok": False, "note": "docs missing"}, tok=_ck)[1]["verified"] is False
+assert J("GET", f"/tasks/{at_['id']}", tok=_ck)[1]["st"] == "in_progress"
+assert any(n["ty"] == "review.changes" for n in J("GET", "/inbox?ack=0", tok=_wk)[1]["i"])
+J("PATCH", f"/tasks/{at_['id']}", {"st": "review"}, tok=_wk)
+assert J("POST", f"/tasks/{at_['id']}/verify", {"note": "looks right"}, tok=_ck)[1]["verified"] is True
+vt = J("GET", f"/tasks/{at_['id']}", tok=_ck)[1]
+assert vt["vb"] == "Checker V" and vt["vn"] == "looks right" and vt["va"], vt
+assert J("PATCH", f"/tasks/{at_['id']}", {"vb": "Someone"}, tok=_wk)[0] in (200, 400) and J("GET", f"/tasks/{at_['id']}", tok=_ck)[1]["vb"] == "Checker V"   # not writable through PATCH
+ch = J("GET", "/audit/verify")[1]
+assert ch["ok"] and ch["n"] > 5, ch
+assert J("GET", "/audit/verify", tok=_ck)[0] == 403
+e1 = server.db.execute("SELECT id, payload FROM events WHERE h!='' ORDER BY id LIMIT 1 OFFSET 3").fetchone()
+server.db.execute("UPDATE events SET payload=? WHERE id=?", (e1["payload"].replace("1", "2", 1) + " ", e1["id"]))
+bad = J("GET", "/audit/verify")[1]
+assert bad["ok"] is False and bad["broken"] == e1["id"], bad                                         # an edited event is found
+server.db.execute("UPDATE events SET payload=? WHERE id=?", (e1["payload"], e1["id"]))
+assert J("GET", "/audit/verify")[1]["ok"]
+e2 = server.db.execute("SELECT id FROM events WHERE h!='' ORDER BY id LIMIT 1 OFFSET 5").fetchone()["id"]
+keep = dict(server.db.execute("SELECT * FROM events WHERE id=?", (e2,)).fetchone())
+server.db.execute("DELETE FROM events WHERE id=?", (e2,))
+assert J("GET", "/audit/verify")[1]["ok"] is False                                                   # a removed event is found
+server.db.execute("INSERT INTO events(id,ts,actor,type,payload,h,hp) VALUES(?,?,?,?,?,?,?)", tuple(keep[k] for k in ("id", "ts", "actor", "type", "payload", "h", "hp")))
+assert J("GET", "/audit/verify")[1]["ok"]
+J("POST", "/settings", {"holder_only": "1"})
+st, ho = J("POST", "/tasks", {"b": RB, "t": "held", "as": "Worker V"})
+J("POST", f"/tasks/{ho['id']}/claim", {}, tok=_wk)
+assert J("PATCH", f"/tasks/{ho['id']}", {"pr": 1}, tok=_ck)[1]["e"] == "holder"                       # someone else cannot change a held task
+assert J("PATCH", f"/tasks/{ho['id']}", {"pr": 1}, tok=_wk)[0] == 200 and J("PATCH", f"/tasks/{ho['id']}", {"pr": 2})[0] == 200   # the holder and an admin can
+assert J("POST", f"/tasks/{ho['id']}/comments", {"c": "a note"}, tok=_ck)[0] == 201                   # anyone can still comment
+J("POST", "/settings", {"holder_only": "0"})
+assert J("PATCH", f"/tasks/{ho['id']}", {"pr": 3}, tok=_ck)[0] == 200
+print("v24 acceptance, verification, audit chain, holder-only OK")
+
+# v25 task timeline: items with sources, batons, lanes, relationship graph
+st, tp = J("POST", "/tasks", {"b": RB, "t": "timeline epic", "ty": "epic"}); st, td = J("POST", "/tasks", {"b": RB, "t": "timeline dep"})
+st, tc = J("POST", "/tasks", {"b": RB, "t": "timeline child", "pa": tp["id"], "dp": [td["id"]], "as": "Worker V"})
+J("POST", f"/tasks/{tc['id']}/claim", {}, tok=_wk)
+rn = J("POST", "/runs", {"task": tc["id"], "runtime": "agent-cli"}, tok=_wk)[1]; J("POST", f"/runs/{rn['id']}/end", {"st": "ok", "out": "built it"}, tok=_wk)
+J("POST", f"/tasks/{tc['id']}/comments", {"c": "halfway"}, tok=_wk)
+J("POST", f"/tasks/{tc['id']}/handoff", {"to": "Checker V", "summary": "over to you"}, tok=_wk)
+J("POST", f"/tasks/{tc['id']}/review", {"reviewer": "Checker V", "note": "please look"}, tok=_wk)
+tl = J("GET", f"/tasks/{tc['id']}/timeline")[1]
+tys = {x["ty"] for x in tl["i"]}
+assert {"run", "comment", "review"} <= tys, tys
+assert {x["src"] for x in tl["i"] if x["ty"] == "comment"} == {"reported"} and any(x["src"] == "recorded" for x in tl["i"])
+assert [b["to"] for b in tl["batons"]][-2:] == ["Worker V", "Checker V"], tl["batons"]
+assert tl["lanes"][0]["ag"] == "Worker V" and tl["lanes"][0]["runs"][0]["st"] == "ok"
+ks = {(e["k"], e["from"], e["to"]) for e in tl["graph"]["edges"]}
+assert ("delegation", tp["id"], tc["id"]) in ks and ("dependency", td["id"], tc["id"]) in ks, ks
+assert [x["ts"] for x in tl["i"]] == sorted(x["ts"] for x in tl["i"])
+assert J("GET", "/tasks/999999/timeline")[0] == 404
+print("v25 timeline OK")
+
+# v26 machines, quota view, system overview
+J("POST", "/settings", {"agent_limits": json.dumps({"Worker V": {"jobs": 5}})})
+assert J("POST", "/nodes", {"name": "box-1", "machine": "vm", "agents": ["claude"], "running": [], "quota": [{"source": "claude", "label": "Claude Max", "used_pct": 40, "resets_at": "2099-01-01T00:00:00Z"}], "secret": "x"}, tok=_wk)[1]["n"] == "box-1"
+assert J("POST", "/nodes", {"name": "box-2"}, tok=_ck)[0] == 200 and J("POST", "/nodes", {})[1]["e"] == "missing"
+nl = {n["n"]: n for n in J("GET", "/nodes")[1]["i"]}
+assert nl["box-1"]["state"] == "up" and "secret" not in nl["box-1"] and nl["box-1"]["agents"] == ["claude"], nl
+server.db.execute("UPDATE nodes SET ts=? WHERE name='box-2'", (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 600)),))
+server.db.execute("INSERT INTO nodes(name,data,ts) VALUES('box-3','{}',?)", (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 7200)),))
+nl = {n["n"]: n["state"] for n in J("GET", "/nodes")[1]["i"]}
+assert nl == {"box-1": "up", "box-2": "stale", "box-3": "down"}, nl
+qv = J("GET", "/quota")[1]
+wq = [a for a in qv["agents"] if a["n"] == "Worker V"][0]
+assert wq["m"][0]["k"] == "jobs" and wq["m"][0]["max"] == 5 and qv["subs"][0]["used_pct"] == 40 and qv["subs"][0]["node"] == "box-1", qv
+J("PATCH", f"/tasks/{at_['id']}", {"st": "done"})
+sy = J("GET", "/system?days=7")[1]
+assert sy["days"] == 7 and len(sy["series"]) == 7 and sy["runs"]["total"] >= 1 and sy["accept"]["verified"] >= 1 and sy["chain"]["ok"], sy
+assert any(r["by"] == "Worker V" for r in sy["receipts"]) and len(J("GET", "/system?days=30")[1]["series"]) == 30 and "chain" not in J("GET", "/system", tok=_ck)[1]
+J("POST", "/settings", {"agent_limits": ""})
+print("v26 nodes, quota, system overview OK")

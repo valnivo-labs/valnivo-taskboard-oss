@@ -370,6 +370,34 @@ def test_agent_quota_is_visible_and_clearable(page):
     page.wait_for_selector("#v-agents .agent:has-text('Quota Agent') .badge:has-text('Quota')", state="detached")
 
 
+def test_system_overview_shows_machines_and_limits(page):
+    api("POST", "/nodes", {"name": "e2e-box", "machine": "test", "agents": ["claude"], "quota": [{"source": "claude", "label": "E2E plan", "used_pct": 55}]})
+    goto(page, view="system")
+    page.wait_for_selector("#v-system .node:has-text('e2e-box')")
+    assert "Up" in page.inner_text("#v-system .node:has-text('e2e-box')")
+    page.wait_for_selector("#v-system:has-text('E2E plan')")
+    page.click("#v-system [data-days='30']")
+    page.wait_for_selector("#v-system .sbar >> nth=29")
+
+
+def test_task_timeline_and_independent_check(page):
+    b, _ = mkboard("Timeline %d" % time.time())
+    t = mktask(b, "timeline subject", ac="Works\nDocumented", **{"as": "Worker"})
+    api("PATCH", "/tasks/%d" % t, {"st": "review"})
+    goto(page, scope="b:%d" % b)
+    page.click(".card[data-id='%d'] .t" % t)
+    page.wait_for_selector("#f [name=accept]")
+    assert "Works" in page.input_value("#f [name=accept]")
+    page.fill("#vfn", "checked by the e2e")
+    page.click("#vfok")
+    page.wait_for_selector("#toast:has-text('Verified')")
+    assert api("GET", "/tasks/%d" % t)["vb"] == "admin"
+    page.click(".card[data-id='%d'] .t" % t)
+    page.click(".dtab[data-tab=activity]")
+    page.wait_for_selector("#actl .tl")
+    assert "Who held it" in page.inner_text("#actl")
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
