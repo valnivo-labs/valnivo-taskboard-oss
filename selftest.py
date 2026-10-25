@@ -1591,3 +1591,13 @@ nx = J("GET", f"/events/feed?since={fd['last']}&limit=2")[1]; assert nx["i"][0][
 assert [e["id"] for e in J("GET", f"/events/feed?ids={fd['i'][2]['id']},{fd['i'][0]['id']}")[1]["i"]] == [fd["i"][0]["id"], fd["i"][2]["id"]]
 assert J("GET", "/events/feed", tok=_wk)[0] == 403
 print("v35 event feed OK")
+
+# v36 a named viewer token can read the feed and nothing else
+wv = J("POST", "/tokens", {"n": "assure-witness", "role": "viewer"})[1]["token"]; ov = J("POST", "/tokens", {"n": "other-viewer", "role": "viewer"})[1]["token"]
+assert J("GET", "/events/feed?limit=1", tok=wv)[0] == 403
+J("POST", "/settings", {"witness_names": "assure-witness, someone-else"})
+assert J("GET", "/events/feed?limit=1", tok=wv)[0] == 200 and J("GET", "/events/feed?limit=1", tok=ov)[0] == 403
+assert J("POST", "/tasks", {"b": RB, "t": "no", "ch": "X"}, tok=wv)[0] == 403 and J("GET", "/settings", tok=wv)[0] in (401, 403)
+J("POST", "/settings", {"witness_names": ""})
+assert J("GET", "/events/feed?limit=1", tok=wv)[0] == 403
+print("v36 witness token OK")

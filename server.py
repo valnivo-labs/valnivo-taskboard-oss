@@ -4505,9 +4505,9 @@ def today_extras(q, actor, role):
     return {"props": proposals_list(q), "less": lessons_list(q), "waits": waits_list(q), "nodes": nodes_list()["i"], "quota": quota_view(), "vq": verify_queue(q, actor, role)}
 
 
-def events_feed(q, role):
+def events_feed(q, role, actor=""):
     """Raw audit events with their chain hashes, for an independent witness: since=<id> (exclusive), limit (default 500, max 1000), or ids=1,2,3."""
-    if not _priv(role):
+    if not _priv(role) and (actor or "").lower() not in {x.strip().lower() for x in get_setting("witness_names").split(",") if x.strip()}:
         raise ApiError("forbidden", 403)
     ids = [int(x) for x in re.findall(r"\d+", _qv(q, "ids") or "")][:500]
     if ids:
@@ -5899,7 +5899,7 @@ def token_delete(tid):
     return {"id": tid, "x": 1}
 
 
-SETTING_KEYS = ("digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd", "agent_limits", "run_lost_min", "holder_only", "strict_moves", "auto_verify", "policy_default", "secret_guard", "lesson_cooldown_h", "wait_escalate_min", "node_admission", "watermarks_on", "watermarks", "ops_board", "snapshot_on", "intake_secret", "intake_senders", "intake_board", "media_hosts")
+SETTING_KEYS = ("digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd", "agent_limits", "run_lost_min", "holder_only", "strict_moves", "auto_verify", "policy_default", "secret_guard", "lesson_cooldown_h", "wait_escalate_min", "witness_names", "node_admission", "watermarks_on", "watermarks", "ops_board", "snapshot_on", "intake_secret", "intake_senders", "intake_board", "media_hosts")
 
 
 def get_setting(k, default=""):
@@ -6854,7 +6854,7 @@ class H(BaseHTTPRequestHandler):
             if path == "/api/snapshot" and method in ("GET", "POST") and _priv(self.role):
                 return self.send_json(200, snapshot_write() if method == "POST" else {"generated_at": json.load(open(os.path.join(snapshot_dir(), "board.json")))["generated_at"] if os.path.exists(os.path.join(snapshot_dir(), "board.json")) else None, "dir": snapshot_dir()})
             if path == "/api/events/feed" and method == "GET":
-                return self.send_json(200, events_feed(q, self.role))
+                return self.send_json(200, events_feed(q, self.role, actor))
             if path == "/api/verify/queue" and method == "GET":
                 return self.send_json(200, verify_queue(q, actor, self.role))
             if path == "/api/faq" and method == "GET":
