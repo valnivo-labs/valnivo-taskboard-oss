@@ -1144,7 +1144,7 @@ def notify(agent, typ, actor, task_id, board_id, summary, delta=None):
                      (agent, task_id, board_id, typ, actor, summary[:300], json.dumps(delta, separators=(",", ":")) if delta else ""))
     with inbox_cv:
         inbox_cv.notify_all()
-    if typ in QUIET_TYPES or typ == "workload.overload":           # for the next briefing, never a push, a wake-up or a job
+    if typ in QUIET_TYPES or typ == "workload.overload" or (typ == "digest.stuck" and not (delta and delta.get("esc"))):           # for the next briefing, never a push, a wake-up or a job
         db.execute("UPDATE notifications SET hook='quiet', woken=1 WHERE id=?", (cur.lastrowid,))
         return
     _push_hook(agent, cur.lastrowid)
@@ -3738,6 +3738,179 @@ def workload_tick(actor="system"):
                     notify(s, "workload.overload", actor, None, None, "[workload] %s is overloaded: %s%s" % (n, "; ".join(m["why"][:3]), (" -> " + m["action"]) if m["action"] else ""), {"ag": n, "ld": m["ld"]})
             sent.append(n)
     return sent
+
+
+# ---- stuck-work digest: scheduled, server-side, no model runs. One quiet `digest.stuck` item per slot for the supervisors.
+# Off until the setting digest_cfg names the slots, e.g. {"times": ["09:00", "14:00"], "days": "mon-fri", "tz": "Europe/Paris"}; GET /api/digest/stuck works any time.
+DIGEST_DEFAULTS = {"times": [], "days": "mon-fri", "tz": "UTC", "grace_h": 3, "esc_x": 3,
+                   "review_h": 24, "approved_h": 8, "deploying_h": 4, "blocked_h": 48, "in_progress_h": 72, "ask_h": 24, "max_ids": 40}
+_HHMM = r"([01]?\d|2[0-3]):[0-5]\d"
+_DOW = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def digest_cfg():
+    cfg = json.loads(json.dumps(DIGEST_DEFAULTS))
+    try:
+        o = json.loads(get_setting("digest_cfg") or "{}")
+    except ValueError:
+        o = {}
+    for k, v in (o.items() if isinstance(o, dict) else ()):
+        d = cfg.get(k)
+        if k == "times" and isinstance(v, list) and v and all(isinstance(x, str) and re.fullmatch(_HHMM, x) for x in v):
+            cfg[k] = sorted("%02d:%s" % (int(x.split(":")[0]), x.split(":")[1]) for x in v)[:6]
+        elif k in ("days", "tz") and isinstance(v, str) and v.strip():
+            cfg[k] = v.strip()
+        elif isinstance(d, (int, float)) and not isinstance(d, bool) and isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+            cfg[k] = v
+    return cfg
+
+
+def digest_check_cfg(v):
+    try:
+        o = json.loads(v)
+        assert isinstance(o, dict) and all(k in DIGEST_DEFAULTS for k in o)
+        for k, x in o.items():
+            if k == "times":
+                assert isinstance(x, list) and x and all(isinstance(y, str) and re.fullmatch(_HHMM, y) for y in x)
+            elif k == "days":
+                assert isinstance(x, str) and _digest_days({"days": x})
+            elif k == "tz":
+                import zoneinfo
+                zoneinfo.ZoneInfo(x)
+            else:
+                assert isinstance(x, (int, float)) and not isinstance(x, bool) and x > 0
+    except Exception:
+        raise ApiError("bad", 400, "digest_cfg")
+
+
+def _digest_days(cfg):
+    """Weekday numbers (Mon=0) from 'mon-fri' or 'mon,wed,fri' (ranges and lists mix); empty set when it does not parse."""
+    names = {d: i for i, d in enumerate(_DOW)}
+    out = set()
+    for part in str(cfg["days"]).lower().replace(" ", "").split(","):
+        a, _, b = part.partition("-")
+        if a not in names or (b and b not in names):
+            return set()
+        i, j = names[a], names[b or a]
+        out |= {k % 7 for k in range(i, j + 1 + (7 if j < i else 0))}
+    return out
+
+
+def digest_slot(now=None, cfg=None):
+    """Latest scheduled slot at/before now ('YYYY-MM-DD HH:MM' in cfg.tz), or '' when none yet today / not a digest day."""
+    import datetime as _dt, zoneinfo
+    cfg = cfg or digest_cfg()
+    t = (now or _dt.datetime.now(_dt.timezone.utc)).astimezone(zoneinfo.ZoneInfo(cfg["tz"]))
+    if t.weekday() not in _digest_days(cfg):
+        return ""
+    hm = "%02d:%02d" % (t.hour, t.minute)
+    done = [x for x in cfg["times"] if x <= hm]
+    return "%s %s" % (t.strftime("%Y-%m-%d"), done[-1]) if done else ""
+
+
+def _slot_age_h(slot, cfg, now=None):
+    import datetime as _dt, zoneinfo
+    s = _dt.datetime.strptime(slot, "%Y-%m-%d %H:%M").replace(tzinfo=zoneinfo.ZoneInfo(cfg["tz"]))
+    return ((now or _dt.datetime.now(_dt.timezone.utc)) - s).total_seconds() / 3600
+
+
+def digest_build(scope=None):
+    """Compact stuck-work digest from board data only. scope=None: all boards, else a list of board ids.
+    {n, esc, s:{status:{n,i:[{id,ow,h,w,x}]}}, rv:[{id,by,h}], ov:[names], b:[names]}: counts and ids only, never titles."""
+    cfg, now = digest_cfg(), now_s()
+    fr, fa = _in("board_id", scope)
+    mx = int(cfg["max_ids"])
+    items = {k: [] for k in ("review", "approved", "deploying", "blocked", "in_progress")}
+    pend = {}
+    for r in rows("SELECT r.task_id, r.reviewer, r.created FROM reviews r JOIN tasks t ON t.id=r.task_id WHERE r.status='pending'" + fr.replace("board_id", "t.board_id") + " ORDER BY r.created", fa):
+        pend.setdefault(r["task_id"], []).append(r)
+    esc_n = 0
+    for t in rows("SELECT id, board_id, status, assignee, updated, approved_at, deploy_owner, blocked_by, blocker FROM tasks WHERE status IN ('review','approved','deploying','blocked','in_progress')" + fr + " ORDER BY updated", fa):
+        if _TEST_AGENT.search(t["assignee"] or ""):
+            continue
+        st = t["status"]
+        lim = cfg[st + "_h"]
+        if st == "approved" and t["approved_at"]:
+            h = work_hours_between(t["approved_at"], now)       # approved counts working hours (Mon-Fri), like its SLA
+        else:
+            h = (_ts(now) - _ts(t["updated"] or now)) / 3600
+        if st == "review" and t["id"] in pend:
+            h = max(h, (_ts(now) - _ts(pend[t["id"]][0]["created"])) / 3600)
+        if h < lim:
+            continue
+        _m, bc = board_cfg(t["board_id"])
+        bb = re.findall(r"\d+", t["blocked_by"] or "")
+        if st in ("approved", "deploying"):
+            w = t["deploy_owner"] or bc.get("deploy_owner") or t["assignee"]
+        elif st == "review":
+            w = ",".join(sorted({x["reviewer"] for x in pend.get(t["id"], [])})) or t["assignee"]
+        elif st == "blocked":
+            w = ("#" + ",#".join(bb[:3])) if bb else (t["blocker"] or "")[:30]
+        else:
+            w = t["assignee"]
+        x = h >= lim * cfg["esc_x"]
+        esc_n += x
+        items[st].append({"id": t["id"], "ow": t["assignee"] or "", "h": int(h), "w": w or "", "x": 1 if x else 0})
+    for v in items.values():
+        v.sort(key=lambda i: -i["h"])
+    rv = []
+    for tid, ps in pend.items():
+        h = (_ts(now) - _ts(ps[0]["created"])) / 3600
+        if h >= cfg["ask_h"] and not any(_TEST_AGENT.search(p["reviewer"]) for p in ps):
+            rv.append({"id": tid, "by": ps[0]["reviewer"], "h": int(h)})
+    rv.sort(key=lambda i: -i["h"])
+    wl = workload_calc(fresh=True)
+    ov = sorted(n for n, m in wl.items() if m["lv"] == "overloaded")
+    bz = sorted(n for n, m in wl.items() if m["lv"] == "busy")
+    n = sum(len(v) for v in items.values()) + len(rv) + len(ov) + len(bz)
+    s = {k: {"n": len(v), "i": v[:mx]} for k, v in items.items() if v}
+    return {"n": n, "esc": esc_n, "s": s, "rv": rv[:mx], "ov": ov[:mx], "b": bz[:mx],
+            "cfg": {k: cfg[k] for k in ("times", "days", "tz", "review_h", "approved_h", "deploying_h", "blocked_h", "in_progress_h", "esc_x")}}
+
+
+def stuck_text(d, slot):
+    parts = ["%s %d (#%s)" % (k, v["n"], ",".join(str(i["id"]) for i in v["i"][:6])) for k, v in d["s"].items()]
+    if d["rv"]:
+        parts.append("oldest review requests " + ", ".join("#%d %dh %s" % (r["id"], r["h"], r["by"]) for r in d["rv"][:3]))
+    if d["ov"]:
+        parts.append("overloaded: " + ", ".join(d["ov"][:5]))
+    if d["b"]:
+        parts.append("busy: " + ", ".join(d["b"][:5]))
+    return ("[digest %s] stuck work: " % slot[-5:] + "; ".join(parts) + (" - %d past escalation" % d["esc"] if d["esc"] else ""))[:600]
+
+
+def digest_tick(actor="system", now=None):
+    """Nudge-loop step: once per configured slot (persisted in setting digest_slot, so a restart never repeats it) send ONE digest.stuck
+    to each supervisor. Quiet inbox item; only when something is past the escalation threshold is it pushed (once, existing push path). Empty = nothing sent."""
+    cfg = digest_cfg()
+    slot = digest_slot(now, cfg) if cfg["times"] else ""        # no slots configured: the schedule is off
+    if not slot or get_setting("digest_slot") >= slot or _slot_age_h(slot, cfg, now) > cfg["grace_h"]:
+        return {"sent": 0}
+    with lock:
+        if get_setting("digest_slot") >= slot:
+            return {"sent": 0}
+        set_setting("digest_slot", slot)
+        d = digest_build()
+        if not d["n"]:
+            return {"sent": 0, "slot": slot, "empty": True}
+        txt = stuck_text(d, slot)
+        pl = {"slot": slot, "esc": d["esc"], "n": d["n"], "s": {k: [i["id"] for i in v["i"]][:20] for k, v in d["s"].items()}}
+        sent = 0
+        for s in sorted(supervisor_names()):
+            if not _TEST_AGENT.search(s):
+                notify(s, "digest.stuck", actor, None, None, txt, pl)
+                sent += 1
+    return {"sent": sent, "slot": slot, "n": d["n"], "esc": d["esc"]}
+
+
+def digest_get(role):
+    if not can(role, "activity.all"):
+        raise ApiError("forbidden", 403)
+    sc = allowed_boards()
+    d = digest_build(sorted(sc) if sc is not None else None)
+    d["slot"] = get_setting("digest_slot")
+    d["next"] = digest_slot()
+    return d
 
 
 def runs_list(q):
@@ -6827,7 +7000,7 @@ def token_delete(tid):
     return {"id": tid, "x": 1}
 
 
-SETTING_KEYS = ("review_sla_min", "fyi_expire_h", "refetch_warn", "workload_cfg", "work_start", "work_end", "work_tz", "digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd", "agent_limits", "run_lost_min", "holder_only", "strict_moves", "auto_verify", "policy_default", "secret_guard", "lesson_cooldown_h", "wait_escalate_min", "witness_names", "node_admission", "watermarks_on", "watermarks", "ops_board", "snapshot_on", "intake_secret", "intake_senders", "intake_board", "media_hosts")
+SETTING_KEYS = ("digest_cfg", "review_sla_min", "fyi_expire_h", "refetch_warn", "workload_cfg", "work_start", "work_end", "work_tz", "digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd", "agent_limits", "run_lost_min", "holder_only", "strict_moves", "auto_verify", "policy_default", "secret_guard", "lesson_cooldown_h", "wait_escalate_min", "witness_names", "node_admission", "watermarks_on", "watermarks", "ops_board", "snapshot_on", "intake_secret", "intake_senders", "intake_board", "media_hosts")
 
 
 def get_setting(k, default=""):
@@ -6860,6 +7033,8 @@ def settings_set(body):
                         assert isinstance(json.loads(v), dict)
                     except Exception:
                         raise ApiError("bad", 400, k)
+                if k == "digest_cfg" and v:
+                    digest_check_cfg(v)
                 if k == "workload_cfg" and v:
                     wl_check_cfg(v)
                     _wl_cache[1] = None
@@ -7717,6 +7892,8 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, run_out(r_[0]))
             if path == "/api/activity" and method == "GET":
                 return self.send_json(200, activity_list(q, self.role))
+            if path == "/api/digest/stuck" and method == "GET":
+                return self.send_json(200, digest_get(self.role))
             if path == "/api/workload" and method == "GET":
                 return self.send_json(200, workload_get(q, self.role, actor))
             if path == "/api/audit" and method == "GET":
@@ -8064,7 +8241,7 @@ def _nudge_loop():
             nudge_tick(actor="nudge-cron")
         except Exception:
             pass
-        for fn in (maybe_digest, maybe_backup, recur_tick, workload_tick):
+        for fn in (maybe_digest, maybe_backup, recur_tick, workload_tick, digest_tick):
             try:
                 fn()
             except Exception:

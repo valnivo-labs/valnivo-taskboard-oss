@@ -535,3 +535,6 @@ button.sprow progress{flex:none;height:8px;width:100%}
 .admbody>.panel.on{display:block}
 .wl{width:100%}.wl td,.wl th{vertical-align:top}.wlrow{cursor:pointer}.wlrow:hover{background:var(--subtle)}.wlbox td{padding:4px 0 8px 14px}.wlbox[hidden]{display:none}
 .badge.wl-overloaded{background:var(--bad-bg);color:var(--bad-h)}.badge.wl-busy{background:var(--warn-bg);color:var(--warn)}.badge.wl-ok{background:var(--ok-bg);color:var(--ok)}.badge.wl-idle{background:var(--subtle);color:var(--mut)}
+#dgcard .dgwrap{max-height:220px;overflow:auto;overscroll-behavior:contain}
+#dgcard .dgids{display:flex;flex-wrap:wrap;gap:4px 8px;justify-content:flex-end;min-width:0}
+#dgcard .dgids a{cursor:pointer;text-decoration:underline}

@@ -2036,3 +2036,73 @@ _c = server.db.execute("SELECT tin, tout, tcached FROM costs WHERE task_id=?", (
 _ct2 = J("POST", "/tasks", {"b": BID, "t": "finish no tokens", "as": "Worker", "st": "in_progress", "d": "probe for finish tokens, done when asserted"}, tok="stok")[1]["id"]
 _f = J("POST", f"/tasks/{_ct2}/finish", {"summary": "no tokens", "as": "Worker", "st": "review"}, tok="stok"); assert _f[0] == 200 and "cost" not in _f[1]["did"] and "warn" not in _f[1], _f
 print("v51.4 finish token reporting OK")
+
+
+# ---- v52: scheduled stuck-work digest: thresholds, per-slot dedupe, restart persistence, empty = nothing, role scoping
+import datetime as _dd, zoneinfo as _zi
+_lux = _zi.ZoneInfo("Europe/Luxembourg")
+_at = lambda d, h, m=0: _dd.datetime(2026, 10, d, h, m, tzinfo=_lux)          # 28 Oct 2026 is a Wednesday, 31 a Saturday
+_ago = lambda h: _tw.strftime("%Y-%m-%d %H:%M:%S", _tw.gmtime(_tw.time() - h * 3600))
+J("POST", "/agents", {"n": "DgA", "capacity": 40}); J("POST", "/agents", {"n": "selftest-dg", "capacity": 40})
+def _dgt(st, who, h, **kw):
+    r = J("POST", "/tasks", {"b": BID, "t": "dg %s" % st, "as": who, "st": "todo"}); assert r[0] in (200, 201), r
+    _db.execute("UPDATE tasks SET status=?, updated=? WHERE id=?", (st, _ago(h), r[1]["id"]))
+    for k, v in kw.items():
+        _db.execute("UPDATE tasks SET %s=? WHERE id=?" % k, (v, r[1]["id"]))
+    return r[1]["id"]
+_rv_old, _rv_new = _dgt("review", "DgA", 30), _dgt("review", "DgA", 2)
+_bl_x = _dgt("blocked", "DgA", 200)                                  # 200 h >= 3 x 48: past escalation
+_ip_old, _ip_new = _dgt("in_progress", "DgA", 80), _dgt("in_progress", "DgA", 1)
+_ap = _dgt("approved", "DgA", 1, approved_at=_ago(24 * 6), deploy_owner="Deployer")
+_tst = _dgt("review", "selftest-dg", 500)                            # test agent: excluded
+_dn = _dgt("done", "DgA", 500)                                       # done: excluded
+_pr = J("POST", f"/tasks/{_rv_old}/review", {"reviewer": "DgB", "note": "x"}, tok="tok")[1]; _db.execute("UPDATE reviews SET created=? WHERE id=?", (_ago(30), _pr["id"]))
+_dg = J("GET", "/digest/stuck")[1]
+_ids = lambda k: [i["id"] for i in _dg["s"].get(k, {"i": []})["i"]]
+assert _rv_old in _ids("review") and _rv_new not in _ids("review") and _tst not in _ids("review"), _dg["s"]          # thresholds + test agents
+assert _bl_x in _ids("blocked") and _ip_old in _ids("in_progress") and _ip_new not in _ids("in_progress") and _ap in _ids("approved") and _dn not in sum((_ids(k) for k in _dg["s"]), []), _dg["s"]
+_o = next(i for i in _dg["s"]["review"]["i"] if i["id"] == _rv_old); assert _o["ow"] == "DgA" and _o["w"] == "DgB" and _o["h"] >= 29, _o            # owner, age, waits on
+assert next(i for i in _dg["s"]["approved"]["i"] if i["id"] == _ap)["w"] == "Deployer" and _dg["esc"] >= 1 and any(r["id"] == _rv_old and r["by"] == "DgB" for r in _dg["rv"]), _dg
+assert len(json.dumps(_dg)) < 6000 and "title" not in json.dumps(_dg), len(json.dumps(_dg))                                     # compact, ids only
+# role scoping
+assert J("GET", "/digest/stuck", tok="stok")[0] == 200 and J("GET", "/digest/stuck", tok="wtok")[0] == 403 and J("GET", "/digest/stuck", tok="vtok")[0] == 403
+# settings validation and schedule
+assert J("POST", "/settings", {"digest_cfg": '{"times": ["9am"]}'})[1]["e"] == "bad" and J("POST", "/settings", {"digest_cfg": '{"nope": 1}'})[1]["e"] == "bad" and J("POST", "/settings", {"digest_cfg": '{"tz": "Mars/Base"}'})[1]["e"] == "bad"
+assert server.digest_tick(now=_at(28, 9, 2))["sent"] == 0 and server.get_setting("digest_slot") == ""                         # off until digest_cfg names slots
+assert J("POST", "/settings", {"digest_cfg": '{"times": ["09:00", "14:00"], "tz": "Europe/Luxembourg"}'})[0] == 200
+assert server.digest_slot(_at(28, 8, 59)) == "" and server.digest_slot(_at(28, 9)) == "2026-10-28 09:00" and server.digest_slot(_at(28, 15)) == "2026-10-28 14:00" and server.digest_slot(_at(31, 10)) == ""   # Mon-Fri only
+# send: one item per supervisor, deduped per slot, persisted slot survives restart
+_dc = lambda: _db.execute("SELECT COUNT(*) FROM notifications WHERE agent='Sup Bot' AND type='digest.stuck'").fetchone()[0]
+_db.execute("DELETE FROM settings WHERE k='digest_slot'"); _c0 = _dc()
+assert server.digest_tick(now=_at(28, 8, 30))["sent"] == 0 and _dc() == _c0                                                      # before the first slot
+assert server.digest_tick(now=_at(28, 9, 2))["sent"] >= 1 and _dc() == _c0 + 1
+_n = _db.execute("SELECT summary, payload, hook FROM notifications WHERE type='digest.stuck' AND agent='Sup Bot' ORDER BY id DESC LIMIT 1").fetchone()
+assert "#%d" % _rv_old in _n["summary"] and json.loads(_n["payload"])["slot"] == "2026-10-28 09:00" and len(_n["summary"]) <= 600, dict(_n)
+assert server.digest_tick(now=_at(28, 9, 20))["sent"] == 0 and server.digest_tick(now=_at(28, 11))["sent"] == 0 and _dc() == _c0 + 1      # same slot: nothing again
+assert server.get_setting("digest_slot") == "2026-10-28 09:00"                                                                    # persisted in the DB: a restart reads it back
+assert server.digest_tick(now=_at(28, 14, 1))["sent"] >= 1 and _dc() == _c0 + 2                                                  # next slot
+assert server.digest_tick(now=_at(28, 18))["sent"] == 0                                                                           # past grace and already sent
+_db.execute("DELETE FROM settings WHERE k='digest_slot'"); assert server.digest_tick(now=_at(28, 20))["sent"] == 0                    # restart hours after a slot: no stale digest
+# past escalation: not held as quiet (goes through the existing push path); otherwise quiet and no wake
+_e = _db.execute("SELECT hook, woken FROM notifications WHERE type='digest.stuck' AND agent='Sup Bot' ORDER BY id DESC LIMIT 1").fetchone()
+assert _e["hook"] != "quiet" and json.loads(_db.execute("SELECT payload FROM notifications WHERE type='digest.stuck' ORDER BY id DESC LIMIT 1").fetchone()[0])["esc"] >= 1
+_db.execute("UPDATE tasks SET status='done' WHERE id IN (?,?,?)", (_bl_x, _ip_old, _ap))
+_db.execute("UPDATE tasks SET updated=? WHERE id=?", (_ago(31), _rv_old))
+_db.execute("DELETE FROM settings WHERE k='digest_slot'")
+_db.execute("UPDATE tasks SET status='done' WHERE status IN ('approved','deploying','blocked','in_progress')")
+_x = server.digest_build(); assert _x["esc"] == 0, _x["s"]
+assert server.digest_tick(now=_at(29, 9, 5))["sent"] >= 1
+_q = _db.execute("SELECT hook, woken FROM notifications WHERE type='digest.stuck' AND agent='Sup Bot' ORDER BY id DESC LIMIT 1").fetchone()
+assert _q["hook"] == "quiet" and _q["woken"] == 1, dict(_q)                                                                        # nothing past escalation: quiet, no wake
+# empty digest sends nothing (still consumes the slot)
+_db.execute("UPDATE tasks SET status='done' WHERE status IN ('review','approved','deploying','blocked','in_progress')")
+_db.execute("UPDATE reviews SET status='approved' WHERE status='pending'")
+_wl0 = server.workload_calc; server.workload_calc = lambda only=None, fresh=False: {}
+try:
+    assert server.digest_build()["n"] == 0
+    _c2 = _dc(); _r = server.digest_tick(now=_at(30, 9, 5)); assert _r["sent"] == 0 and _r.get("empty") and _dc() == _c2, _r
+    assert server.get_setting("digest_slot") == "2026-10-30 09:00"
+finally:
+    server.workload_calc = _wl0
+print("v52 stuck-work digest selftest OK")
+J("POST", "/settings", {"digest_cfg": ""})

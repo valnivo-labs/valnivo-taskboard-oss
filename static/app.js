@@ -302,9 +302,18 @@ function workloadHtml(w) {
   const rowW = a => `<tr class="wlrow" data-wl="${esc(a.ag)}" title="Click to list their open tasks"><td class="wlag"><b>${esc(a.ag)}</b></td><td><span class="badge wl-${esc(a.lv)}">${esc(a.lv)}</span></td><td class="num">${a.open}/${a.cap}</td><td class="num">${a.by.in_progress}/${a.by.review}/${a.bl}/${a.by.todo}</td><td class="num">${a.rvn}${a.rvn ? " · " + ageTxt(a.rvw) : ""}</td><td class="num">${a.un}${a.un ? " · " + ageTxt(a.una) : ""}</td><td class="num">${a.done7}</td><td class="wlwhy">${esc((a.why || []).join("; "))}</td><td class="wlact">${esc(a.action || "")}</td></tr><tr class="wlbox" hidden><td colspan="9"></td></tr>`;
   return `<div class="wlwrap"><table class="tb wl"><tr><th>Agent</th><th>Level</th><th class="num">Open/cap</th><th class="num" title="in progress / review / blocked / todo">WIP/rev/blk/todo</th><th class="num" title="reviews waiting on them, longest wait">Reviews</th><th class="num" title="unread actionable items, oldest">Inbox</th><th class="num" title="done in 7 days">Done 7d</th><th>Why</th><th>Suggested action</th></tr>${w.i.map(rowW).join("")}</table></div><p class="muted hint">overloaded = at/over cap or two signals past their limit; busy = one signal past its limit. Limits: setting <code>workload_cfg</code>. Test agents are left out. Click a row for the agent's open tasks.</p>`;
 }
+function digestHtml(d) {
+  if (!d || !d.s) return '<p class="muted">Digest is not available for this role.</p>';
+  const ln = (k, v) => `<div class="kv"><b>${esc(k.replace("_", " "))} ${v.n}</b><span class="dgids">${v.i.map(i => `<a data-tk="${i.id}" title="${esc(i.ow)} waits on ${esc(i.w || "-")}, ${i.h}h">#${i.id}${i.x ? "!" : ""}</a>`).join(" ")}</span></div>`;
+  const body = Object.entries(d.s).map(([k, v]) => ln(k, v)).join("")
+    + (d.rv.length ? `<div class="kv"><b>review requests</b><span class="dgids">${d.rv.map(r => `<a data-tk="${r.id}" title="${esc(r.by)}">#${r.id} ${r.h}h</a>`).join(" ")}</span></div>` : "")
+    + (d.ov.length ? `<div class="kv"><b>overloaded</b><span>${d.ov.map(esc).join(", ")}</span></div>` : "")
+    + (d.b.length ? `<div class="kv"><b>busy</b><span>${d.b.map(esc).join(", ")}</span></div>` : "");
+  return `<div class="dgwrap">${body || '<p class="muted">Nothing is stuck.</p>'}</div><p class="muted hint">${d.esc ? d.esc + " past escalation (!). " : ""}${d.cfg.times.length ? "Sent at " + esc(d.cfg.times.join(", ")) + " " + esc(d.cfg.days) + " (" + esc(d.cfg.tz) + "); last slot " + esc(d.slot || "none") + "." : "The schedule is off."} Slots and thresholds: setting <code>digest_cfg</code>.</p>`;
+}
 async function renderSystem() {
-  const el = $("v-system"); let r, wl = null;
-  try { [r, wl] = await Promise.all([api("GET", "/system?days=" + sysDays), api("GET", "/workload").catch(() => null)]); } catch (_) { return; }
+  const el = $("v-system"); let r, wl = null, dg = null;
+  try { [r, wl, dg] = await Promise.all([api("GET", "/system?days=" + sysDays), api("GET", "/workload").catch(() => null), api("GET", "/digest/stuck").catch(() => null)]); } catch (_) { return; }
   if (view !== "system") return;
   const mx = Math.max(1, ...r.series.map(x => Math.max(x.done, x.new)));
   const bars = r.series.map(x => `<div class="sbar" title="${x.d}: ${x.new} new, ${x.done} done"><i class="n" style="height:${Math.round(100 * x.new / mx)}%"></i><i class="d" style="height:${Math.round(100 * x.done / mx)}%"></i><small>${r.series.length <= 10 || x === r.series[0] || x === r.series[r.series.length - 1] ? x.d.slice(5) : ""}</small></div>`).join("");
@@ -313,6 +322,7 @@ async function renderSystem() {
     <div class="seg" role="group" aria-label="Period">${[1, 7, 30].map(d => `<button type="button" class="${d === sysDays ? "on" : ""}" data-days="${d}">${d === 1 ? "Today" : d + " days"}</button>`).join("")}</div>
     <section class="panel"><h2>Machines</h2>${machinesHtml(r.nodes)}</section>
     <section class="panel" id="wlcard"><h2>Workload <span class="muted">who is overwhelmed</span></h2>${workloadHtml(wl)}</section>
+    ${dg ? `<section class="panel" id="dgcard"><h2>Digest <span class="muted">stuck work</span></h2>${digestHtml(dg)}</section>` : ""}
     <div class="grid2">
       <section class="panel"><h2>Limits and quota</h2>${limitsHtml(r.quota)}</section>
       <section class="panel"><h2>Tasks per day <span class="muted"><i class="lg n"></i> new <i class="lg d"></i> done</span></h2><div class="sbars">${bars}</div></section>
