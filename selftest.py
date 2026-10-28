@@ -2150,3 +2150,57 @@ assert call("GET", "/team?digest=1&role=supervisor&fmt=text", tok="stok")[2].sta
 _mr = mcp_as("stok", "all", "request_review", {"id": _rr, "reviewer": "Reviewer Z", "as": "Worker", "summary": "again"}); assert "review" in _mr.get("did", []), _mr
 assert "## worker" in mcp_as("wtok", "all", "team", {"role": "worker"})["g"]
 print("v54 request_review and team digest OK")
+
+
+# ================= v55: backlog = open tasks with no sprint (any status column) =================
+BKB = J("POST", "/boards", {"n": "Backlog test board"})[1]["id"]
+BKS = J("POST", "/sprints", {"b": BKB, "st": "active", "n": "Now"})[1]["id"]
+BKP = J("POST", "/sprints", {"b": BKB, "n": "Next"})[1]["id"]
+mk = lambda t, **kw: J("POST", "/tasks", {"b": BKB, "t": t, "s": None, **kw})[1]["id"]
+bk_a = mk("bk a", st="backlog", pr=1, ty="bug", **{"as": "Ann"}, lb="x")
+bk_b = mk("bk b", st="todo", pr=2, ty="task")                     # a 'todo' task with no sprint IS in the backlog
+bk_c = mk("bk c", st="in_progress", pr=3, **{"as": "Bob"})        # so is work in progress without a sprint
+bk_d = mk("bk d", st="done", pr=2)                                # closed work is not
+bk_e = J("POST", "/tasks", {"b": BKB, "t": "bk e"})[1]["id"]      # joins the active sprint on creation -> not in backlog
+assert J("GET", f"/tasks/{bk_e}")[1]["s"] == BKS
+r = J("GET", f"/backlog?b={BKB}")[1]
+assert sorted(x["id"] for x in r["i"]) == sorted([bk_a, bk_b, bk_c]), r
+assert r["cnt"]["total"] == 3 and r["cnt"]["st"] == {"backlog": 1, "todo": 1, "in_progress": 1} and r["cnt"]["pr"] == {"1": 1, "2": 1, "3": 1}, r["cnt"]
+assert r["closed"] == 1 and r["n"] == 3 and {s["id"] for s in r["sp"]} == {BKS, BKP}, r
+assert set(r["i"][0]) == {"id", "t", "st", "pr", "as", "ty", "lb"} and r["i"][0]["id"] == bk_a      # compact rows, sorted by priority
+assert [x["id"] for x in J("GET", f"/backlog?b={BKB}&sort=id")[1]["i"]] == [bk_a, bk_b, bk_c]
+assert [x["id"] for x in J("GET", f"/backlog?b={BKB}&as=Ann")[1]["i"]] == [bk_a]
+assert [x["id"] for x in J("GET", f"/backlog?b={BKB}&as=none")[1]["i"]] == [bk_b]
+assert [x["id"] for x in J("GET", f"/backlog?b={BKB}&ty=bug")[1]["i"]] == [bk_a]
+assert [x["id"] for x in J("GET", f"/backlog?b={BKB}&pr=2,3")[1]["i"]] == [bk_b, bk_c]
+assert [x["id"] for x in J("GET", f"/backlog?b={BKB}&lb=x")[1]["i"]] == [bk_a]
+assert [x["id"] for x in J("GET", f"/backlog?b={BKB}&st=todo")[1]["i"]] == [bk_b]
+assert len(J("GET", f"/backlog?b={BKB}&lim=1")[1]["i"]) == 1 and J("GET", f"/backlog?b={BKB}&lim=1")[1]["n"] == 3
+assert bk_d in [x["id"] for x in J("GET", f"/backlog?b={BKB}&done=1")[1]["i"]]
+assert J("GET", f"/backlog?b={BKB}&st=nope")[0] == 400 and J("GET", "/backlog?b=99999")[0] == 404
+# plan: add to a sprint removes from the backlog, s=null returns it
+r = J("POST", "/backlog/plan", {"ids": [bk_a, bk_b, bk_d, 999999], "s": BKP})[1]
+assert r["i"] == [bk_a, bk_b] and {x["id"]: x["e"] for x in r["skip"]} == {bk_d: "closed", 999999: "nf"}, r
+assert J("GET", f"/tasks/{bk_a}")[1]["s"] == BKP
+assert [x["id"] for x in J("GET", f"/backlog?b={BKB}")[1]["i"]] == [bk_c] and J("GET", f"/backlog?b={BKB}")[1]["cnt"]["total"] == 1
+assert J("POST", "/backlog/plan", {"ids": [bk_a], "s": BKP})[1]["skip"] == [{"id": bk_a, "e": "same"}]
+r = J("POST", "/backlog/plan", {"ids": [bk_a, bk_b], "s": None})[1]
+assert r["i"] == [bk_a, bk_b] and r["s"] is None and J("GET", f"/tasks/{bk_a}")[1].get("s") is None
+assert sorted(x["id"] for x in J("GET", f"/backlog?b={BKB}")[1]["i"]) == sorted([bk_a, bk_b, bk_c])
+assert [x["id"] for x in J("GET", f"/tasks?b={BKB}&s=none&st=open")[1]["i"]] == [bk_a, bk_b, bk_c]     # same membership as the plain task list
+# guards: other board's sprint, closed sprint, bad input, roles
+OTHER = J("POST", "/sprints", {"b": BID, "n": "elsewhere"})[1]["id"]
+assert J("POST", "/backlog/plan", {"ids": [bk_a], "s": OTHER})[1]["skip"] == [{"id": bk_a, "e": "other_board"}]
+assert J("POST", "/backlog/plan", {"ids": [bk_a], "s": 999999})[0] == 404
+assert J("POST", "/backlog/plan", {"ids": [bk_a]})[0] == 400 and J("POST", "/backlog/plan", {"s": BKP})[0] == 400 and J("POST", "/backlog/plan", {"ids": ["x"], "s": BKP})[0] == 400
+assert J("POST", "/backlog/plan", {"ids": [bk_a], "s": BKP}, tok="vtok")[0] == 403 and J("GET", f"/backlog?b={BKB}", tok="vtok")[0] == 200
+assert J("POST", "/backlog/plan", {"ids": [bk_a], "s": BKP}, tok="wtok")[0] == 200          # an agent may plan work
+assert J("POST", "/backlog/plan", {"ids": [bk_a], "s": None}, tok="wtok")[0] == 200
+# closing a sprint with no next one sends the unfinished work back to the backlog
+J("POST", "/backlog/plan", {"ids": [bk_b], "s": BKS}); J("POST", f"/sprints/{BKS}/close", {"to": BKP})
+assert J("GET", f"/tasks/{bk_b}")[1]["s"] == BKP
+# a token limited to other boards cannot read this backlog
+_lt = J("POST", "/tokens", {"n": "Limited", "role": "agent", "boards": [BID]})
+assert _lt[0] == 201, _lt
+assert J("GET", f"/backlog?b={BKB}", tok=_lt[1]["token"])[0] == 403 and J("POST", "/backlog/plan", {"ids": [bk_a], "s": BKP}, tok=_lt[1]["token"])[0] == 403
+print("v55 backlog (membership, filters, counts, plan/unplan) OK")

@@ -807,6 +807,136 @@ def list_tasks(q, full):
     return {"n": total, "o": off, "i": items}
 
 
+BACKLOG_OPEN = "sprint_id IS NULL AND status NOT IN ('done','declined')"
+
+
+def list_backlog(q):
+    """The backlog of a board: every OPEN task with no sprint, whatever its status column. Compact rows + counts.
+    GET /backlog?b=&as=&pr=&ty=&lb=&st=&q=&sort=pr|u|id&lim=&off=&done=1 (done=1 also lists closed work that has no sprint)."""
+    bid = qint(q, "b") or qint(q, "board_id")
+    if bid:
+        need_board(bid)
+        if not rows("SELECT id FROM boards WHERE id=?", (bid,)):
+            raise ApiError("nf", 404, "b")
+        bw, ba = "board_id=?", [bid]
+    else:
+        sids = scope_ids(q)
+        if sids is None:
+            bw, ba = "1=1", []
+        else:
+            frag, fargs = _in("board_id", sids)
+            bw, ba = (frag.replace(" AND ", "", 1) if sids else "0=1"), fargs
+    base = f"{bw} AND {BACKLOG_OPEN}"
+    cnt = {"total": db.execute(f"SELECT COUNT(*) FROM tasks WHERE {base}", ba).fetchone()[0],
+           "st": {r["k"]: r["n"] for r in rows(f"SELECT status k, COUNT(*) n FROM tasks WHERE {base} GROUP BY status", ba)},
+           "pr": {str(r["k"]): r["n"] for r in rows(f"SELECT priority k, COUNT(*) n FROM tasks WHERE {base} GROUP BY priority ORDER BY priority", ba)},
+           "ty": {(r["k"] or "task"): r["n"] for r in rows(f"SELECT type k, COUNT(*) n FROM tasks WHERE {base} GROUP BY type", ba)},
+           "as": {(r["k"] or ""): r["n"] for r in rows(f"SELECT assignee k, COUNT(*) n FROM tasks WHERE {base} GROUP BY assignee", ba)}}
+    closed = db.execute(f"SELECT COUNT(*) FROM tasks WHERE {bw} AND sprint_id IS NULL AND status IN ('done','declined')", ba).fetchone()[0]
+    where, args = [bw, "sprint_id IS NULL"], list(ba)
+    if q.get("done", ["0"])[0] not in ("1", "yes", "true"):
+        where.append("status NOT IN ('done','declined')")
+    st = _qv(q, "st", "status")
+    if st:
+        sts = [x.strip() for x in st.split(",") if x.strip()]
+        if [x for x in sts if x not in STATUSES]:
+            raise ApiError("bad", 400, "st")
+        where.append("status IN (%s)" % ",".join("?" * len(sts)))
+        args.extend(sts)
+    asg = _qv(q, "as", "assignee")
+    if asg is not None:
+        if asg in ("none", ""):
+            where.append("assignee=''")
+        elif asg.startswith("~"):
+            where.append("assignee LIKE ? COLLATE NOCASE")
+            args.append("%" + asg[1:] + "%")
+        else:
+            where.append("assignee=? COLLATE NOCASE")
+            args.append(asg)
+    pr = _qv(q, "pr", "priority")
+    if pr:
+        try:
+            ps = [int(x) for x in pr.split(",") if x.strip()]
+        except ValueError:
+            raise ApiError("bad", 400, "pr")
+        where.append("priority IN (%s)" % ",".join("?" * len(ps)))
+        args.extend(ps)
+    ty = _qv(q, "ty", "type")
+    if ty:
+        where.append("COALESCE(NULLIF(type,''),'task')=?")
+        args.append(ty)
+    if _qv(q, "lb", "label"):
+        where.append("(',' || labels || ',') LIKE ?")
+        args.append("%," + _qv(q, "lb", "label").strip().lower() + ",%")
+    if _qv(q, "q"):
+        where.append("title LIKE ?")
+        args.append("%" + _qv(q, "q") + "%")
+    w = " AND ".join(where)
+    n = db.execute(f"SELECT COUNT(*) FROM tasks WHERE {w}", args).fetchone()[0]
+    order = {"u": "updated DESC, id DESC", "id": "id"}.get(_qv(q, "sort") or "pr", "priority, id")
+    lim = max(1, min(qint(q, "lim", qint(q, "limit", 200)), 500))
+    off = max(0, qint(q, "off", qint(q, "offset", 0)))
+    rs = rows(f"SELECT id, title, status, priority, assignee, type, labels, board_id FROM tasks WHERE {w} ORDER BY {order} LIMIT ? OFFSET ?", args + [lim, off])
+    items = [{"id": r["id"], "t": r["title"], "st": r["status"], "pr": r["priority"], "as": r["assignee"], "ty": r["type"] or "task", "lb": r["labels"], **({} if bid else {"b": r["board_id"]})} for r in rs]
+    out = {"n": n, "o": off, "i": items, "cnt": cnt, "closed": closed}
+    if bid:
+        out["b"] = bid
+        out["sp"] = [{"id": s["id"], "n": s["name"], "st": s["state"]} for s in rows("SELECT id, name, state FROM sprints WHERE board_id=? AND state IN ('active','planned') ORDER BY id", (bid,))]
+    return out
+
+
+def plan_backlog(actor, role, body):
+    """POST /backlog/plan {"ids":[..],"s":<sprint id>|null}: add open tasks to a sprint of their board, or (s=null) send them back to the backlog."""
+    ids = body.get("ids") if "ids" in body else body.get("id")
+    if ids is None:
+        raise ApiError("missing", 400, "ids")
+    ids = ids if isinstance(ids, list) else [ids]
+    try:
+        ids = list(dict.fromkeys(int(i) for i in ids))
+    except (TypeError, ValueError):
+        raise ApiError("bad", 400, "ids")
+    if not ids or len(ids) > 200:
+        raise ApiError("bad", 400, "ids")
+    if "s" not in body and "sprint" not in body and "sprint_id" not in body:
+        raise ApiError("missing", 400, "s")
+    sv = body.get("s", body.get("sprint", body.get("sprint_id")))
+    sprint = None
+    if sv not in (None, "", "none", "null"):
+        try:
+            sprint = int(sv)
+        except (TypeError, ValueError):
+            raise ApiError("bad", 400, "s")
+        sp = rows("SELECT * FROM sprints WHERE id=?", (sprint,))
+        if not sp:
+            raise ApiError("nf", 404, "s")
+        need_board(sp[0]["board_id"])
+        if sp[0]["state"] == "closed":
+            raise ApiError("bad", 400, "s", "That sprint is closed. Choose an active or planned sprint.")
+    moved, skip = [], []
+    for tid in ids:
+        r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
+        if not r:
+            skip.append({"id": tid, "e": "nf"})
+            continue
+        t = r[0]
+        need_board(t["board_id"])
+        if sprint is not None and sp[0]["board_id"] != t["board_id"]:
+            skip.append({"id": tid, "e": "other_board"})
+        elif t["status"] in ("done", "declined"):
+            skip.append({"id": tid, "e": "closed"})
+        elif t["sprint_id"] == sprint:
+            skip.append({"id": tid, "e": "same"})
+        else:
+            try:
+                check_holder(actor, role, tid)
+                crud(actor, "PATCH", "tasks", tid, {"sprint_id": sprint}, {}, False)
+                moved.append(tid)
+            except ApiError as e:
+                skip.append({"id": tid, "e": e.code})
+    out = {"n": len(moved), "s": sprint, "i": moved, "skip": skip}
+    return {k: v for k, v in out.items() if v != [] or k == "i"}
+
+
 def bulk_set_tasks(actor, body, full):
     """PATCH /tasks body {"ids":[1,2], ...fields} — multi-id set; tiny response."""
     ids = body.get("ids") or body.get("id")
@@ -7968,6 +8098,10 @@ class H(BaseHTTPRequestHandler):
                     return self.send_json(200, messages_get(actor, self.role, q))
             if path == "/api/overview" and method == "GET":
                 return self.send_json(200, scope_analytics(q))
+            if path == "/api/backlog" and method == "GET":
+                return self.send_json(200, list_backlog(q))
+            if path == "/api/backlog/plan" and method == "POST":
+                return self.send_json(200, plan_backlog(actor, self.role, self.read_body()))
             if path == "/api/briefing" and method == "GET":
                 res = briefing(actor, q)
                 if can(self.role, "activity.all") and (qint(q, "since", None) is None or q.get("full", ["0"])[0] not in ("0", "")):

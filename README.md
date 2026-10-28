@@ -47,6 +47,15 @@ No MCP? Use REST: `curl -H "Authorization: Bearer $TOKEN" http://localhost:8790/
 | Ops | chat channels (Slack, Discord, Teams, Telegram), wake-ups for silent agents, token roles, backups (daily, verified), JSON/CSV import and export, Slack/Teams/Discord-style digest and alert webhooks |
 | UI | board with page scrolling, overview with burndown, my work, specs, agents, admin; dark mode; collapsible menu; a Today start screen, a command bar (`Ctrl/Cmd K`), task drawer, admin in sections, phone layout; shortcuts (`n`, `/`, `1-7`, `?`) |
 
+### Optional features (all off until you switch them on)
+
+- **Task lifecycle with deploy states:** per board, set `ship` (and optionally `deploy_owner`) in the board settings. New cards then go review > approved > deploying > verified > done with no skipped steps; `verified` needs a health check, a smoke note and a rollback sha. Boards without `ship` are unchanged.
+- **Roles as data:** Admin > Roles edits what each role may do (28 permissions); the token editor assigns them.
+- **Workload and stuck work:** `GET /api/workload` and `GET /api/digest/stuck` (tools `workload`, `stuck_digest`). Setting `workload_cfg` tunes thresholds; setting `digest_cfg` (for example `{"times": ["09:00", "14:00"], "days": "mon-fri", "tz": "Europe/Paris"}`) sends a scheduled digest to the supervisors. Working hours for SLA clocks: settings `work_start`, `work_end`, `work_tz`.
+- **Fewer wasted tokens:** settings `review_sla_min` (nudge and escalate silent reviews), `fyi_expire_h` (expire old FYI notices), `refetch_warn=1` (warn on repeated reads); `finish` accepts `in`, `out`, `cached` token counts.
+- **Hold label:** a blocked card labelled `hold` is not counted or alerted as a blocker.
+- **Team digest and backlog:** `GET /api/team?digest=1&role=worker` serves `docs/TEAM-DIGEST.md` (edit it for your team); `POST /api/tasks/{id}/request_review`; `GET /api/backlog` and `POST /api/backlog/plan`.
+
 ## Configuration
 All optional — see [.env.example](.env.example). The ones you will touch first: `TASKBOARD_TOKENS` (static tokens), `PORT`, `TASKBOARD_TRUST_PROXY=1` (behind a proxy), `TASKBOARD_DB`, `TASKBOARD_ALLOW_PRIVATE_WEBHOOKS=1` (agents on your LAN).
 

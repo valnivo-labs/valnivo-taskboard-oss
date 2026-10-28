@@ -204,6 +204,12 @@ TOOLS = {
     "reopen_task": ("Reopen a declined/blocked/done task: clears reason/blockers. to=todo(default)|in_progress|backlog|review, note=why, notify=[agent names].",
                     S(["id"], id=i, to=s, note=s, notify={"type": "array", "items": s}), lambda a: api("POST", f"/tasks/{a.pop('id')}/reopen", a)),
     "comments": ("All comments of a task.", S(["id"], id=i), lambda a: api("GET", f"/tasks/{a['id']}/comments")),
+    "list_backlog": ("The backlog of a board = every OPEN task with NO sprint, whatever its status column (done/declined excluded unless done=1). Compact rows {id,t,st,pr,as,ty,lb} plus cnt {total, st, pr, ty, as} and the plannable sprints sp [{id,n,st}]. Filters: as (name | none | ~part), pr (1-4, comma list), ty, lb, st, q; sort pr (default) | u (recently updated) | id; lim, off.",
+                     S(["b"], b=i, **{"as": s}, pr=s, ty=s, lb=s, st=s, q=s, sort=s, lim=i, off=i, done={"type": "integer"}),
+                     lambda a: api("GET", "/backlog" + qs(a, ["b", "as", "pr", "ty", "lb", "st", "q", "sort", "lim", "off", "done"]))),
+    "plan_sprint": ("Bulk add open tasks to a sprint (s = sprint id, active or planned, same board as the tasks) so they leave the backlog, or send them back with s=null. ids up to 200. Returns {n, s, i (changed ids), skip [{id,e}]}; done/declined tasks, other-board tasks and no-ops are skipped.",
+                    S(["ids"], ids={"type": "array", "items": i}, s={"type": ["integer", "null"]}),
+                    lambda a: api("POST", "/backlog/plan", {"ids": a["ids"], "s": a.get("s")})),
     "start_sprint": ("Start a sprint now (dates default 14d). Closes the board's previous active sprint and carries its unfinished tasks into this one.",
                      S(["id"], id=i), lambda a: api("POST", f"/sprints/{a['id']}/start")),
     "close_sprint": ("Close a sprint. Unfinished tasks move to `to` (sprint id or 'backlog'); default = next planned sprint, else backlog.",
@@ -406,7 +412,7 @@ TOOLS = {
 
 
 CORE = ["briefing", "next", "finish", "inbox", "claim", "set_task", "add_task", "tasks", "task", "comment", "say", "handoff", "heartbeat", "answer", "decide_review", "lock", "unlock"]
-COORD = ["messages", "claim_next", "release", "locks", "ask", "asks", "cancel_ask", "request_review", "reviews", "watch", "unwatch", "watches", "attach", "attachments", "del_attachment",
+COORD = ["messages", "claim_next", "release", "locks", "ask", "asks", "cancel_ask", "request_review", "list_backlog", "reviews", "watch", "unwatch", "watches", "attach", "attachments", "del_attachment",
          "cost", "links", "route", "envs", "deploy_env", "freeze_env", "unfreeze_env", "decline_task", "reopen_task", "add_commit", "task_activity", "comments", "verify", "timeline", "decision", "verify_queue", "workload", "stuck_digest", "faq", "policy", "evidence", "propose", "proposals", "lesson", "wait"]
 ADMIN = ["tokens", "roles", "settings", "backups", "export_data", "export_csv", "import_csv", "import_data", "del_board", "del_sprint", "chats", "git_secret", "wake_agent", "usage"]
 GROUPS = {"core": CORE, "coord": COORD, "admin": ADMIN, "plan": [n for n in TOOLS if n not in CORE + COORD + ADMIN]}
@@ -433,6 +439,7 @@ SHORT = {
     "add_task": "Create task. Keys: b(board) t d st pr as('auto'=route) k(human|agent) s bl bb lb ch pu sha dp pt ty(epic|story|task|bug|spike|chore) pa(parent id: an epic, or a story under an epic) ac pl rg.",
     "tasks": "List tasks (default 25, table form). Filters: b tm bs s st(csv|open) as(~contains) k lb ch q ready=1 ty parent; fields=t,st,pr; limit offset d=1.",
     "task": "One task. brief=1 (~60 tokens, has po = state of play, ev) | since=ev (only what changed) | ctx=1 (docs, comments, attachments, reviews) | default full.",
+    "list_backlog": "Backlog of board b = open tasks with no sprint (any status). Rows {id,t,st,pr,as,ty,lb} + cnt{total,st,pr,ty,as}. Filters as pr ty lb st q; sort pr|u|id; lim off. plan_sprint (plan profile) moves ids into/out of a sprint.",
     "comment": "Comment on task id (c); notifies the assignee and to=[names]; quiet=true = no notifications.",
     "handoff": "Reassign id to `to` with summary and next; one notification to them.",
     "heartbeat": "Say you are alive: status (one line), task id (also extends your claim on it, ttl min). Silent agents with open work are escalated.",
