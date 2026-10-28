@@ -183,6 +183,9 @@ db.execute("CREATE TABLE IF NOT EXISTS nodes(name TEXT PRIMARY KEY COLLATE NOCAS
 for _c, _d in (("admitted", "INTEGER DEFAULT 1"), ("retired", "INTEGER DEFAULT 0"), ("by", "TEXT DEFAULT ''")):
     if _c not in [r[1] for r in db.execute("PRAGMA table_info(nodes)")]:
         db.execute("ALTER TABLE nodes ADD COLUMN %s %s" % (_c, _d))
+db.execute("CREATE TABLE IF NOT EXISTS review_sla(task_id INTEGER PRIMARY KEY, nudged TEXT DEFAULT '', escalated TEXT DEFAULT '')")
+db.execute("CREATE TABLE IF NOT EXISTS agent_flags(id INTEGER PRIMARY KEY, ts TEXT DEFAULT CURRENT_TIMESTAMP, agent TEXT COLLATE NOCASE, kind TEXT, task_id INTEGER)")
+db.execute("CREATE INDEX IF NOT EXISTS ix_agent_flags ON agent_flags(kind, ts)")
 db.execute("CREATE TABLE IF NOT EXISTS hook_sent(agent TEXT COLLATE NOCASE, h TEXT, ts TEXT, PRIMARY KEY(agent, h))")
 
 db.executescript("""
@@ -192,6 +195,8 @@ CREATE INDEX IF NOT EXISTS ix_cost_task ON costs(task_id); CREATE INDEX IF NOT E
 CREATE TABLE IF NOT EXISTS chats(id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT DEFAULT 'slack', url TEXT NOT NULL, target TEXT DEFAULT '', events TEXT DEFAULT '',
   board_id INTEGER, minpr INTEGER DEFAULT 4, active INTEGER DEFAULT 1, last TEXT DEFAULT '', last_ok INTEGER DEFAULT 1, created TEXT DEFAULT CURRENT_TIMESTAMP);
 """)
+if "tcached" not in [r[1] for r in db.execute("PRAGMA table_info(costs)")]:
+    db.execute("ALTER TABLE costs ADD COLUMN tcached INTEGER DEFAULT 0")
 
 db.executescript("""
 CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, ts TEXT DEFAULT CURRENT_TIMESTAMP, sender TEXT NOT NULL COLLATE NOCASE, recipient TEXT NOT NULL COLLATE NOCASE,
@@ -872,7 +877,9 @@ def crud(actor, method, table, rid, body, q, full):
         if table == "tasks" and "since" in q:
             return task_since(rid, qint(q, "since", 0) or 0)
         if table == "tasks" and "brief" in q:
-            return task_brief(rid)
+            o = task_brief(rid)
+            w = refetch_warn(actor, rid)
+            return {**o, "warn": w} if w else o
         if table == "sprints":
             return sprint_row(r, full)
         if table == "boards":
@@ -911,7 +918,12 @@ def crud(actor, method, table, rid, body, q, full):
                 o["cc"] = [comment_out(c) for c in reversed(cc)]
             o["dc"] = docs_for([("task", rid)] + ([("sprint", r["sprint_id"])] if r["sprint_id"] else []) + [("board", r["board_id"])], False)
             return o
-        return cdict(table, r, full)
+        o = cdict(table, r, full)
+        if table == "tasks" and isinstance(o, dict):
+            w = refetch_warn(actor, rid)
+            if w:
+                o["warn"] = w
+        return o
     with lock:
         if method == "POST" and rid is None:
             d = validate(table, body, False)
@@ -1083,7 +1095,7 @@ def comment_out(c):
 
 
 NOTIF_DO = {"verify.requested": "verify", "task.overlap": "task", "approval.requested": "decide_review", "approval.granted": "task", "approval.denied": "task", "msg.direct": "say", "task.assigned": "claim", "task.handoff": "claim", "task.ready": "claim", "task.unblocked": "claim", "claim.expired": "claim", "task.comment": "comment", "task.mention": "comment",
-            "ask.new": "answer", "ask.overdue": "answer", "review.requested": "decide_review", "task.nudged": "set_task", "sla.breach": "set_task",
+            "ask.new": "answer", "ask.overdue": "answer", "review.requested": "decide_review", "task.nudged": "set_task", "review.sla": "decide_review", "sla.breach": "set_task",
             "review.changes": "set_task", "review.approved": "finish", "ask.answered": "task", "sprint.risk": "risks", "env.frozen": "envs"}
 COALESCE_TYPES = frozenset({"task.updated", "task.status", "task.comment", "watch.task", "task.attachment"})
 
@@ -3084,6 +3096,7 @@ def cost_log(actor, body):
     tid = body.get("task") or body.get("t") or body.get("id")
     tin = int(_num(body.get("in", body.get("tin")), 0, 1e10, "in"))
     tout = int(_num(body.get("out", body.get("tout")), 0, 1e10, "out"))
+    tcached = int(_num(body.get("cached", body.get("tcached")), 0, 1e10, "cached"))
     model = " ".join(str(body.get("model") or "").split())[:60]
     usd = round(_num(body["usd"], 0, 1e6, "usd"), 6) if body.get("usd") not in (None, "") else cost_price(model, tin, tout)
     if not (tin or tout or usd):
@@ -3097,7 +3110,7 @@ def cost_log(actor, body):
             tid, bid = int(tid), t[0]["board_id"]
         else:
             tid = None
-        cid = db.execute("INSERT INTO costs(agent,task_id,board_id,model,tin,tout,usd,note) VALUES(?,?,?,?,?,?,?,?)", (me, tid, bid, model, tin, tout, usd, str(body.get("note") or "")[:200])).lastrowid
+        cid = db.execute("INSERT INTO costs(agent,task_id,board_id,model,tin,tout,tcached,usd,note) VALUES(?,?,?,?,?,?,?,?,?)", (me, tid, bid, model, tin, tout, tcached, usd, str(body.get("note") or "")[:200])).lastrowid
         out = {"id": cid, "usd": usd}
         if tid:
             db.execute("UPDATE tasks SET cost=ROUND(COALESCE(cost,0)+?,6), tokens=COALESCE(tokens,0)+? WHERE id=?", (usd, tin + tout, tid))
@@ -5443,11 +5456,146 @@ def att_del(aid):
 
 
 # ---- housekeeping (runs with the periodic tick, under `lock`)
+def in_quiet_hours(now=None):
+    """True outside the working week set by work_start / work_end / work_tz (Mon-Fri); SLA clocks only run in working hours."""
+    import datetime as _dt
+    try:
+        import zoneinfo
+        z = zoneinfo.ZoneInfo(get_setting("work_tz", WORK_TZ))
+    except Exception:
+        z = _dt.timezone.utc
+    t = _dt.datetime.fromtimestamp(now or time.time(), z)
+    try:
+        ws, we = int(get_setting("work_start", WORK_START)), int(get_setting("work_end", WORK_END))
+    except ValueError:
+        ws, we = WORK_START, WORK_END
+    return t.weekday() >= 5 or not (ws <= t.hour + t.minute / 60 < we)
+
+
+def _last_activity(tid, names):
+    """Latest comment, task event or run by any of `names` on the task (UTC 'YYYY-MM-DD HH:MM:SS' or '')."""
+    ns = [n.lower() for n in names if n]
+    if not ns:
+        return ""
+    ph = ",".join("?" * len(ns))
+    best = ""
+    for sql, a in (("SELECT MAX(ts) m FROM comments WHERE task_id=? AND LOWER(actor) IN (%s)" % ph, [tid] + ns),
+                   ("SELECT MAX(ts) m FROM events WHERE LOWER(actor) IN (%s) AND type LIKE 'task.%%' AND json_extract(payload,'$.id')=?" % ph, ns + [tid]),
+                   ("SELECT MAX(started) m FROM runs WHERE task_id=? AND LOWER(agent) IN (%s)" % ph, [tid] + ns)):
+        m = (db.execute(sql, a).fetchone()["m"] or "")[:19]
+        best = max(best, m)
+    return best
+
+
+def review_sla_tick(actor="system"):
+    """Setting review_sla_min (minutes, 0 = off): a card in review whose reviewer/assignee has been silent that long gets ONE nudge to the reviewer, then (after a second
+    window) ONE escalation to the supervisors. Working hours only; any activity on the card re-arms it. Server work only: nothing is woken."""
+    try:
+        sla = float(get_setting("review_sla_min", "0") or 0)
+    except ValueError:
+        sla = 0
+    if sla <= 0:
+        return {"nudged": 0, "escalated": 0}
+    cur = {r["id"]: r for r in rows("SELECT id, board_id, title, assignee, updated FROM tasks WHERE status='review'")}
+    for r in rows("SELECT task_id FROM review_sla"):
+        if r["task_id"] not in cur:
+            db.execute("DELETE FROM review_sla WHERE task_id=?", (r["task_id"],))
+    work = not in_quiet_hours()
+    now, n_n, n_e = time.time(), 0, 0
+    for tid, t in cur.items():
+        revs = rows("SELECT id, reviewer, created FROM reviews WHERE task_id=? AND status='pending' ORDER BY id", (tid,))
+        who = [x["reviewer"] for x in revs] or ([t["assignee"]] if t["assignee"] else [])
+        if not who:
+            continue
+        start = max([x["created"][:19] for x in revs] + [(t["updated"] or "")[:19]])
+        last = max(start, _last_activity(tid, who + ([t["assignee"]] if t["assignee"] else [])))
+        if not last:
+            continue
+        st = db.execute("SELECT * FROM review_sla WHERE task_id=?", (tid,)).fetchone()
+        if st and last > st["nudged"]:
+            db.execute("DELETE FROM review_sla WHERE task_id=?", (tid,))      # activity: re-arm
+            st = None
+        if not work:
+            continue
+        idle = (now - _ts(last)) / 60
+        if not st:
+            if idle >= sla:
+                db.execute("INSERT OR REPLACE INTO review_sla(task_id, nudged) VALUES(?,?)", (tid, now_s()))
+                notify(who[0], "review.sla", actor, tid, t["board_id"], "#%d '%s' has waited %d min for your review - decide_review or comment" % (tid, t["title"][:70], idle), {"min": int(idle), "review": revs[0]["id"] if revs else None})
+                n_n += 1
+        elif not st["escalated"] and (now - _ts(st["nudged"])) / 60 >= sla:
+            db.execute("UPDATE review_sla SET escalated=? WHERE task_id=?", (now_s(), tid))
+            escalate("review-sla", actor, tid, t["board_id"], "#%d '%s' still unreviewed by %s after %d min (nudged)" % (tid, t["title"][:70], who[0], idle), skip=tuple(who))
+            n_e += 1
+    return {"nudged": n_n, "escalated": n_e}
+
+
+# FYI / automated noise that agents never need to act on; setting fyi_expire_h (hours, 0 = off) marks it read after that long. Assignments, review requests,
+# blockers, asks, decisions and anything from a person named in TASKBOARD_HUMAN_NAMES are never touched.
+FYI_EXPIRE_TYPES = frozenset({"sprint.risk", "task.nudged", "esc.sprint-red", "esc.stale", "spec.created", "msg.fyi", "task.fyi", "nudge.digest", "task.unblocked", "claim.expired"})
+
+
+def inbox_hygiene(force=False):
+    """Mark old FYI/noise notifications read for agents (not for the people in TASKBOARD_HUMAN_NAMES). At most every 10 min."""
+    try:
+        hrs = float(get_setting("fyi_expire_h", "0") or 0)
+    except ValueError:
+        hrs = 0
+    if hrs <= 0:
+        return None
+    last = get_setting("inbox_hygiene_at")
+    if not force and last and last > plus_min(-10):
+        return None
+    set_setting("inbox_hygiene_at", now_s())
+    cut = plus_min(-hrs * 60)
+    hum = sorted(set(HUMAN_NAMES) | {"admin", "a"}) 
+    hp = ",".join("?" * len(hum))
+    where = "read=0 AND ts<? AND type IN (%s) AND LOWER(actor) NOT IN (%s) AND LOWER(agent) NOT IN (%s)" % (",".join("?" * len(FYI_EXPIRE_TYPES)), hp, hp)
+    a = [cut] + sorted(FYI_EXPIRE_TYPES) + hum + hum
+    cur = rows("SELECT type, COUNT(*) n FROM notifications WHERE " + where + " GROUP BY type", a)
+    if not cur:
+        return {}
+    db.execute("UPDATE notifications SET read=1 WHERE " + where, a)
+    try:
+        tot = json.loads(get_setting("inbox_hygiene_n") or "{}")
+    except ValueError:
+        tot = {}
+    for r in cur:
+        tot[r["type"]] = tot.get(r["type"], 0) + r["n"]
+    set_setting("inbox_hygiene_n", json.dumps(tot, separators=(",", ":")))
+    return {r["type"]: r["n"] for r in cur}
+
+
+_fetch_lock = threading.Lock()
+_fetches = {}     # (agent, task) -> [timestamps] of recent full reads
+REFETCH_N, REFETCH_S = 3, 120
+
+
+def refetch_warn(agent, tid):
+    """Setting refetch_warn=1: a soft warning (never an error) when one agent reads the same task REFETCH_N times in REFETCH_S seconds; counted in the usage report."""
+    if not agent or agent.lower() in GENERIC_ACTORS or get_setting("refetch_warn", "0") != "1":
+        return None
+    k, now = (agent.lower(), tid), time.time()
+    with _fetch_lock:
+        ts = [x for x in _fetches.get(k, []) if now - x < REFETCH_S] + [now]
+        _fetches[k] = ts
+        if len(_fetches) > 2000:
+            for kk in [kk for kk, v in _fetches.items() if not v or now - v[-1] > REFETCH_S]:
+                _fetches.pop(kk, None)
+    if len(ts) < REFETCH_N:
+        return None
+    with lock:
+        db.execute("INSERT INTO agent_flags(agent,kind,task_id) VALUES(?,'refetch',?)", (agent, tid))
+    return "task #%d read %d times in %ds: reuse the first reading (next and finish already do their work in one call)" % (tid, len(ts), REFETCH_S)
+
+
 def housekeeping(actor="system"):
     nowt = now_s()
     rollover_tick(actor)
     replenish_tick(actor)
     sla_tick(actor)
+    review_sla_tick(actor)
+    inbox_hygiene()
     for t in rows("SELECT * FROM tasks WHERE claimed_by!='' AND claim_until<?", (nowt,)):
         db.execute("UPDATE tasks SET claimed_by='', claim_until='', version=COALESCE(version,1)+1 WHERE id=?", (t["id"],))
         emit(actor, "task.updated", t["id"], t["board_id"], {"cb": ""})
@@ -6194,7 +6342,9 @@ def next_task(actor, body):
     res = claim_next(actor, body)
     if res.get("none"):
         return res
-    return {**res, "task": task_brief(res["id"], deep=True)}
+    out = {**res, "task": task_brief(res["id"], deep=True)}
+    w = refetch_warn(_ident(actor, body), res["id"])
+    return {**out, "warn": w} if w else out
 
 
 def task_finish(actor, role, tid, body):
@@ -6236,8 +6386,11 @@ def task_finish(actor, role, tid, body):
     if closing and st == "done" and t["status"] != "done":
         check_done_gate(tid, t["board_id"], ",".join(str(i) for i in patch["dn"]) if isinstance(patch.get("dn"), list) else patch.get("dn", t["dod_done"]))   # fail before any side effect
     did = []
-    if isinstance(body.get("cost"), dict):
-        cost_log(actor, {**body["cost"], "task": tid, "as": body.get("as")})
+    cst = body.get("cost") if isinstance(body.get("cost"), dict) else None
+    if cst is None and any(body.get(k) not in (None, "") for k in ("in", "out", "cached")):
+        cst = {k: body[k] for k in ("in", "out", "cached", "usd", "model") if body.get(k) not in (None, "")}      # tokens used on this task, reported with finish
+    if cst is not None:
+        cost_log(actor, {**cst, "task": tid, "as": body.get("as")})
         did.append("cost")
     for a in (body.get("attach") or []):
         att_add(actor, tid, a)
@@ -6312,7 +6465,8 @@ def usage_report(top=8):
     for x in ag.values():
         x["routes"] = sorted(x["routes"], key=lambda z: -z["t"])[:5]
         x["t"] = x["out"] + x["in"]
-    return {"since": USAGE_SINCE, "unit": "tokens (bytes/4, responses 'out' and requests 'in')",
+    flags = {r["kind"]: r["n"] for r in rows("SELECT kind, COUNT(*) n FROM agent_flags WHERE ts>=? GROUP BY kind", (USAGE_SINCE,))}
+    return {"since": USAGE_SINCE, "flags": flags, "unit": "tokens (bytes/4, responses 'out' and requests 'in')",
             "agents": sorted(ag.values(), key=lambda z: -z["t"])[:top], "routes": sorted(rt.values(), key=lambda z: -z["t"])[:top]}
 
 
@@ -6673,7 +6827,7 @@ def token_delete(tid):
     return {"id": tid, "x": 1}
 
 
-SETTING_KEYS = ("workload_cfg", "work_start", "work_end", "work_tz", "digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd", "agent_limits", "run_lost_min", "holder_only", "strict_moves", "auto_verify", "policy_default", "secret_guard", "lesson_cooldown_h", "wait_escalate_min", "witness_names", "node_admission", "watermarks_on", "watermarks", "ops_board", "snapshot_on", "intake_secret", "intake_senders", "intake_board", "media_hosts")
+SETTING_KEYS = ("review_sla_min", "fyi_expire_h", "refetch_warn", "workload_cfg", "work_start", "work_end", "work_tz", "digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd", "agent_limits", "run_lost_min", "holder_only", "strict_moves", "auto_verify", "policy_default", "secret_guard", "lesson_cooldown_h", "wait_escalate_min", "witness_names", "node_admission", "watermarks_on", "watermarks", "ops_board", "snapshot_on", "intake_secret", "intake_senders", "intake_board", "media_hosts")
 
 
 def get_setting(k, default=""):
@@ -6712,6 +6866,13 @@ def settings_set(body):
                 if k == "secret_guard" and v not in ("", "redact", "block", "off"):
                     raise ApiError("bad", 400, k)
                 if k == "policy_default" and v not in ("", "loose", "standard", "strict"):
+                    raise ApiError("bad", 400, k)
+                if k in ("review_sla_min", "fyi_expire_h") and v:
+                    try:
+                        assert 0 <= int(v) <= 100000
+                    except Exception:
+                        raise ApiError("bad", 400, k)
+                if k == "refetch_warn" and v not in ("", "0", "1"):
                     raise ApiError("bad", 400, k)
                 if k in ("work_start", "work_end") and v:
                     try:

@@ -1965,3 +1965,74 @@ for _q in ("WlA", "wla", "WLA"):
     _one = J("GET", "/workload?agent=" + _q, tok="stok")[1]["i"]
     assert [a["ag"] for a in _one] == ["WlA"] and _one[0]["action"] == _fa and "to WlB" in _one[0]["action"] and "add a helper" not in _one[0]["action"], (_q, _one[0]["action"], _fa)
 print("workload scope cache + ?agent= action selftest OK")
+
+# ---- v51 (#147 phase 2, generic parts): review SLA, inbox hygiene, refetch warning, tokens on finish
+import time
+def _ago(m): return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - m * 60))
+_real_qh = server.in_quiet_hours
+server.in_quiet_hours = lambda now=None: False
+J("POST", "/agents", {"n": "Rev One"}); J("POST", "/agents", {"n": "Coder X"})
+_rt = J("POST", "/tasks", {"b": BID, "t": "sla probe", "as": "Coder X", "st": "in_progress", "d": "probe for the review SLA, done when asserted"}, tok="stok")[1]["id"]
+_rv = J("POST", f"/tasks/{_rt}/review", {"reviewer": "Rev One", "as": "Coder X", "note": "please review"}, tok="stok"); assert _rv[0] in (200, 201), _rv
+def _age(m):
+    server.db.execute("UPDATE reviews SET created=? WHERE task_id=?", (_ago(m), _rt)); server.db.execute("UPDATE tasks SET updated=? WHERE id=?", (_ago(m), _rt))
+def _sla_n(ty, ag): return server.db.execute("SELECT COUNT(*) FROM notifications WHERE agent=? AND type=? AND task_id=?", (ag, ty, _rt)).fetchone()[0]
+server.db.execute("DELETE FROM review_sla"); _age(10)
+assert server.review_sla_tick() == {"nudged": 0, "escalated": 0}                                          # off by default
+J("POST", "/settings", {"review_sla_min": "45"}); assert J("POST", "/settings", {"review_sla_min": "x"})[1]["e"] == "bad"
+assert server.review_sla_tick() == {"nudged": 0, "escalated": 0}                                          # not idle long enough
+_age(50); server.in_quiet_hours = lambda now=None: True
+assert server.review_sla_tick()["nudged"] == 0                                                              # outside working hours: nothing
+server.in_quiet_hours = lambda now=None: False
+assert server.review_sla_tick()["nudged"] == 1 and _sla_n("review.sla", "Rev One") == 1
+assert server.review_sla_tick()["nudged"] == 0 and _sla_n("review.sla", "Rev One") == 1                    # deduped
+assert "review" in server.db.execute("SELECT payload FROM notifications WHERE type='review.sla' AND task_id=?", (_rt,)).fetchone()["payload"]
+assert server.review_sla_tick()["escalated"] == 0                                                          # second window not over
+server.db.execute("UPDATE review_sla SET nudged=? WHERE task_id=?", (_ago(50), _rt))
+assert server.review_sla_tick()["escalated"] == 1
+def _esc(): return server.db.execute("SELECT COUNT(*) FROM notifications WHERE type='esc.review-sla' AND task_id=?", (_rt,)).fetchone()[0]
+_e1 = _esc(); assert _e1 >= 1
+assert server.review_sla_tick() == {"nudged": 0, "escalated": 0} and _esc() == _e1                          # one escalation only
+time.sleep(1.1); J("POST", f"/tasks/{_rt}/comments", {"c": "looking now", "as": "Rev One"}, tok="stok")   # reviewer activity re-arms
+server.review_sla_tick(); assert server.db.execute("SELECT COUNT(*) FROM review_sla WHERE task_id=?", (_rt,)).fetchone()[0] == 0
+J("PATCH", f"/tasks/{_rt}", {"st": "done"}, tok="stok"); server.review_sla_tick()
+assert server.db.execute("SELECT COUNT(*) FROM review_sla WHERE task_id=?", (_rt,)).fetchone()[0] == 0
+J("POST", "/settings", {"review_sla_min": ""}); server.in_quiet_hours = _real_qh
+print("v51.1 review SLA OK")
+# 2) inbox hygiene (setting fyi_expire_h)
+J("POST", "/agents", {"n": "Hyg"})
+for _ty in ("sprint.risk", "task.nudged", "esc.sprint-red", "esc.stale", "spec.created", "msg.fyi", "task.assigned", "review.requested", "blocker.set", "ask.new", "msg.direct", "review.sla"):
+    server.notify("Hyg", _ty, "system", None, BID, "hyg %s" % _ty)
+server.notify("Hyg", "msg.fyi", "Owner", None, BID, "owner fyi")
+server.db.execute("UPDATE notifications SET ts=? WHERE agent='Hyg'", (_ago(60 * 25),))
+assert server.inbox_hygiene(force=True) is None                                                             # off by default
+J("POST", "/settings", {"fyi_expire_h": "24"})
+_keep = {"task.assigned", "review.requested", "blocker.set", "ask.new", "msg.direct", "review.sla"}
+_r = server.inbox_hygiene(force=True); assert _r.get("sprint.risk") == 1 and _r.get("msg.fyi") == 1 and not (set(_r) & _keep), _r
+_left = {x[0] for x in server.db.execute("SELECT type FROM notifications WHERE agent='Hyg' AND read=0")}
+assert _left == _keep | {"msg.fyi"}, _left                                                                  # actionable + a person's message kept
+server.notify("Hyg", "sprint.risk", "system", None, BID, "fresh risk"); assert server.inbox_hygiene(force=True) == {}   # newer than the limit is untouched
+assert server.inbox_hygiene() is None                                                                       # throttled
+J("POST", "/settings", {"fyi_expire_h": ""})
+print("v51.2 inbox hygiene OK")
+# 3) repeated fetch warning (setting refetch_warn)
+_ft = J("POST", "/tasks", {"b": BID, "t": "refetch probe", "as": "Worker", "d": "probe for repeat reads, done when asserted"}, tok="stok")[1]["id"]
+assert all(J("GET", f"/tasks/{_ft}?brief=1", tok="wtok")[1].get("warn") is None for _ in range(4))          # off by default
+J("POST", "/settings", {"refetch_warn": "1"})
+_w = [J("GET", f"/tasks/{_ft}?brief=1", tok="wtok")[1].get("warn") for _ in range(4)]
+assert _w[0] is None and _w[1] is None and _w[2] and "read" in _w[2], _w
+assert J("GET", f"/tasks/{_ft}", tok="wtok")[1].get("warn")
+assert J("GET", f"/tasks/{_ft}?brief=1", tok="stok")[1].get("warn") is None                                 # another agent: own window
+assert J("GET", "/admin/usage")[1]["flags"]["refetch"] >= 3
+J("POST", "/tasks", {"b": BID, "t": "next probe", "as": "Worker", "st": "todo", "d": "probe for next and finish in two calls, done when asserted"}, tok="stok")
+_r = J("POST", "/next", {"b": BID}, tok="wtok")[1]; assert _r.get("task", {}).get("id") == _r.get("id"), _r    # read + claim in one call
+J("POST", "/settings", {"refetch_warn": ""})
+print("v51.3 refetch warning OK")
+# 4) tokens on finish
+_ct = J("POST", "/tasks", {"b": BID, "t": "finish tokens", "as": "Worker", "st": "in_progress", "d": "probe for finish tokens, done when asserted"}, tok="stok")[1]["id"]
+_f = J("POST", f"/tasks/{_ct}/finish", {"summary": "with tokens", "as": "Worker", "st": "review", "in": 1000, "out": 200, "cached": 700}, tok="stok")
+assert _f[0] == 200 and "warn" not in _f[1] and "cost" in _f[1]["did"], _f
+_c = server.db.execute("SELECT tin, tout, tcached FROM costs WHERE task_id=?", (_ct,)).fetchone(); assert tuple(_c) == (1000, 200, 700)
+_ct2 = J("POST", "/tasks", {"b": BID, "t": "finish no tokens", "as": "Worker", "st": "in_progress", "d": "probe for finish tokens, done when asserted"}, tok="stok")[1]["id"]
+_f = J("POST", f"/tasks/{_ct2}/finish", {"summary": "no tokens", "as": "Worker", "st": "review"}, tok="stok"); assert _f[0] == 200 and "cost" not in _f[1]["did"] and "warn" not in _f[1], _f
+print("v51.4 finish token reporting OK")
