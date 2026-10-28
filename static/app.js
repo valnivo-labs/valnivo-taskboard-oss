@@ -1234,7 +1234,7 @@ function taskDlg(id, status, title, boardId, pri, pre) {
     <label>Points (estimate)<input type="number" name="points" min="0" max="1000" value="${t.points || ""}"></label></div>
     <div class="row2"><label>Due date<input type="date" name="due" value="${esc(t.due || "")}"></label><span></span></div>
     ${["approved", "deploying", "verified"].includes(t.status) || (bcfg().ship && id) ? `<div class="deploybox"><b>Deploy</b> <span class="muted">(approved and deploying need an owner; verified needs health, smoke and a rollback sha)</span>
-      <div class="row2"><label>Deploy owner<input name="deploy_owner" value="${esc(t.deploy_owner || "")}" placeholder="${esc(bcfg().deploy_owner || "e.g. claude-vm")}"></label><label>Deploy due<input name="deploy_due" value="${esc(t.deploy_due || "")}" placeholder="set when approved"></label></div>
+      <div class="row2"><label>Deploy owner<input name="deploy_owner" value="${esc(t.deploy_owner || "")}" placeholder="${esc(bcfg().deploy_owner || "e.g. deploy-bot")}"></label><label>Deploy due<input name="deploy_due" value="${esc(t.deploy_due || "")}" placeholder="set when approved"></label></div>
       <label>Health check<input name="health" value="${esc(t.health || "")}" placeholder="e.g. /health 200 on prod"></label>
       <label>Smoke / browser test<input name="smoke" value="${esc(t.smoke || "")}" placeholder="what was clicked and seen"></label>
       <label>Rollback sha<input name="rollback" value="${esc(t.rollback || "")}" placeholder="previous good sha"></label></div>` : ""}
