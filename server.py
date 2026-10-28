@@ -13,7 +13,7 @@ DB = os.environ.get("TASKBOARD_DB", os.path.join(HERE, "data", "taskboard.db"))
 PORT = int(os.environ.get("PORT", "8790"))
 HOST = os.environ.get("HOST", "127.0.0.1")   # the Docker image sets 0.0.0.0
 NUDGE_HOURS = float(os.environ.get("TASKBOARD_NUDGE_HOURS", "24"))  # stale open → set nu
-NUDGE_OPEN = frozenset({"backlog", "todo", "in_progress", "review", "blocked"})
+NUDGE_OPEN = frozenset({"backlog", "todo", "in_progress", "review", "approved", "deploying", "verified", "blocked"})
 NUDGE_INTERVAL_SEC = int(os.environ.get("TASKBOARD_NUDGE_INTERVAL", "1200"))  # 20 min
 # Agent notifications: who triggers them ("*" = any actor; else comma list of token names, e.g. "human")
 NOTIFY_ACTORS = {x.strip().lower() for x in os.environ.get("TASKBOARD_NOTIFY_ACTORS", "*").split(",") if x.strip()} or {"*"}
@@ -44,7 +44,7 @@ for p in os.environ.get("TASKBOARD_TOKENS", "").split(","):
         tk = ":".join(parts[1:])
     TOKENS[tk.strip()] = (n, role or ("admin" if n.lower() in ("human", "admin", "owner") else "supervisor" if "supervisor" in n.lower() else "agent"))
 BACKUP_DIR = os.environ.get("TASKBOARD_BACKUP_DIR", os.path.join(os.path.dirname(DB), "backups"))
-STATUSES = ["backlog", "todo", "in_progress", "review", "blocked", "done", "declined"]
+STATUSES = ["backlog", "todo", "in_progress", "review", "approved", "deploying", "verified", "blocked", "done", "declined"]
 SPRINT_STATES = ["planned", "active", "closed"]
 SILENT_MIN = int(os.environ.get("TASKBOARD_SILENT_MIN", "60"))
 SPRINT_DAYS = int(os.environ.get("TASKBOARD_SPRINT_DAYS", "14"))
@@ -163,7 +163,9 @@ for _t, _c, _d in (("tasks", "blocker", "TEXT DEFAULT ''"), ("tasks", "blocked_b
                    ("events", "h", "TEXT DEFAULT ''"), ("events", "hp", "TEXT DEFAULT ''"),
                    ("tasks", "pipeline", "TEXT DEFAULT ''"), ("tasks", "stage", "INTEGER DEFAULT 0"),
                    ("tasks", "waiting", "TEXT DEFAULT ''"), ("agents", "role", "TEXT DEFAULT ''"), ("agents", "goal", "TEXT DEFAULT ''"), ("tasks", "lease", "INTEGER DEFAULT 0"), ("tasks", "rigor", "TEXT DEFAULT ''"), ("tasks", "play", "TEXT DEFAULT ''"), ("tasks", "needs", "TEXT DEFAULT ''"), ("tasks", "makes", "TEXT DEFAULT ''"),
-                   ("agents", "wake_at", "TEXT DEFAULT ''"), ("agents", "wake_n", "INTEGER DEFAULT 0")):
+                   ("agents", "wake_at", "TEXT DEFAULT ''"), ("agents", "wake_n", "INTEGER DEFAULT 0"),
+                   ("tasks", "deploy_owner", "TEXT DEFAULT ''"), ("tasks", "deploy_due", "TEXT DEFAULT ''"), ("tasks", "approved_at", "TEXT DEFAULT ''"), ("tasks", "health", "TEXT DEFAULT ''"),
+                   ("tasks", "smoke", "TEXT DEFAULT ''"), ("tasks", "rollback", "TEXT DEFAULT ''"), ("tasks", "apr_n", "INTEGER DEFAULT 0")):
     if _c not in [r[1] for r in db.execute(f"PRAGMA table_info({_t})")]:
         db.execute(f"ALTER TABLE {_t} ADD COLUMN {_c} {_d}")
 if "woken" not in [r[1] for r in db.execute("PRAGMA table_info(notifications)")]:
@@ -205,7 +207,7 @@ FIELDS = {
     "boards": ["name", "description", "team", "dod", "method", "cfg"],
     "docs": ["scope", "ref_id", "title", "body", "url"],
     "sprints": ["board_id", "name", "goal", "start", "end", "state"],
-    "tasks": ["board_id", "sprint_id", "title", "description", "status", "priority", "assignee", "kind", "blocker", "blocked_by", "labels", "channel", "watch", "short_url", "video_id", "publish_at", "pr_url", "sha", "commits", "decline_reason", "nudge", "depends", "points", "dod_done", "type", "parent", "target", "current", "due", "accept", "pipeline", "play", "needs", "makes", "rigor"],
+    "tasks": ["board_id", "sprint_id", "title", "description", "status", "priority", "assignee", "kind", "blocker", "blocked_by", "labels", "channel", "watch", "short_url", "video_id", "publish_at", "pr_url", "sha", "commits", "decline_reason", "nudge", "depends", "points", "dod_done", "type", "parent", "target", "current", "due", "accept", "pipeline", "play", "needs", "makes", "rigor", "deploy_owner", "deploy_due", "health", "smoke", "rollback"],
 }
 REQUIRED = {"docs": ["scope", "ref_id", "title"], "boards": ["name"], "sprints": ["board_id"], "tasks": ["board_id", "title"]}
 # db column -> short key (compact mode). Input accepts short or long keys.
@@ -215,7 +217,7 @@ CK = {
     "sprints": {"id": "id", "board_id": "b", "name": "n", "goal": "g", "start": "from", "end": "to", "state": "st", "committed": "cmt"},
     "tasks": {"id": "id", "board_id": "b", "sprint_id": "s", "title": "t", "description": "d", "status": "st",
               "priority": "pr", "assignee": "as", "kind": "k", "updated": "u", "blocker": "bl", "blocked_by": "bb", "labels": "lb", "channel": "ch",
-              "watch": "w", "short_url": "sh", "video_id": "vid", "publish_at": "at", "pr_url": "pu", "sha": "sha", "commits": "cm", "decline_reason": "dr", "nudge": "nu", "depends": "dp", "points": "pt", "dod_done": "dn", "claimed_by": "cb", "claim_until": "cu", "version": "v", "type": "ty", "parent": "pa", "target": "tg", "current": "cr", "cost": "cs", "tokens": "tk", "due": "du", "accept": "ac", "verified_by": "vb", "verified_at": "va", "verified_note": "vn", "pipeline": "pl", "stage": "sg", "play": "po", "needs": "nd", "makes": "mk", "rigor": "rg", "lease": "lt", "waiting": "wt"},
+              "watch": "w", "short_url": "sh", "video_id": "vid", "publish_at": "at", "pr_url": "pu", "sha": "sha", "commits": "cm", "decline_reason": "dr", "nudge": "nu", "depends": "dp", "points": "pt", "dod_done": "dn", "claimed_by": "cb", "claim_until": "cu", "version": "v", "type": "ty", "parent": "pa", "target": "tg", "current": "cr", "cost": "cs", "tokens": "tk", "due": "du", "accept": "ac", "verified_by": "vb", "verified_at": "va", "verified_note": "vn", "pipeline": "pl", "stage": "sg", "play": "po", "needs": "nd", "makes": "mk", "rigor": "rg", "lease": "lt", "waiting": "wt", "deploy_owner": "do", "deploy_due": "ddu", "approved_at": "apa", "health": "hc", "smoke": "sk", "rollback": "rb", "apr_n": "apn"},
 }
 IN = {t: {**{v: k for k, v in m.items()}, **{k: k for k in m}} for t, m in CK.items()}
 
@@ -325,6 +327,7 @@ def nudge_tick(board_id=None, actor="system"):
                                "#%d '%s' is unblocked (all blockers done) -> todo" % (r["id"], r["title"][:80]), {"st": "todo"})
                         n_ub += 1
         try:
+            approved_sla_tick(actor)
             risk_alerts()
             housekeeping(actor)
             assure_tick(actor)
@@ -526,7 +529,7 @@ def cdict(table, r, full, skip=()):
     if full:
         return r
     m = CK[table]
-    return {m[k]: v for k, v in r.items() if k in m and k not in skip and v is not None and v != "" and v != [] and not (k in ("points", "target", "current", "cost", "tokens", "stage") and not v)}
+    return {m[k]: v for k, v in r.items() if k in m and k not in skip and v is not None and v != "" and v != [] and not (k in ("points", "target", "current", "cost", "tokens", "stage", "apr_n") and not v)}
 
 
 def validate(table, body, partial):
@@ -818,11 +821,15 @@ def bulk_set_tasks(actor, body, full):
         d.setdefault("blocked_by", "")
     m = CK["tasks"]
     out = []
+    d0 = d
     for rid in ids:
         old = rows("SELECT * FROM tasks WHERE id=?", (rid,))
         if not old:
             continue
         old = old[0]
+        d = dict(d0)
+        if "status" in d and d["status"] != old["status"]:
+            check_lifecycle(getattr(_ctx, "role", "admin"), old, d, body)       # the lifecycle applies to bulk moves too
         sets = ",".join(f"{k}=?" for k in d) + ",updated=CURRENT_TIMESTAMP"
         db.execute(f"UPDATE tasks SET {sets} WHERE id=?", list(d.values()) + [rid])
         delta = {m[k]: (json.loads(v) if k == "commits" else v) for k, v in d.items() if old.get(k) != v}
@@ -911,6 +918,7 @@ def crud(actor, method, table, rid, body, q, full):
             if table == "tasks":
                 if d.get("status") == "declined" and not d.get("decline_reason"):
                     raise ApiError("missing", 400, "dr")
+                check_create_lifecycle(getattr(_ctx, "role", "admin"), d, body)       # lifecycle (#148): no creating straight into approved..done
                 check_hier(0, d.get("type", "task"), d.get("parent"), d["board_id"])
                 check_limits(d.get("parent"), d["board_id"])
                 if "self_assign_only" in (board_rules(d["board_id"]) | set(PRESETS.get(d.get("rigor") or "", {"rules": []})["rules"])) and not can(getattr(_ctx, "role", "admin"), "assign.any") and str(d.get("assignee") or "").lower() not in ("", "auto", (actor or "").lower()):
@@ -968,6 +976,11 @@ def crud(actor, method, table, rid, body, q, full):
             d = validate(table, body, True)
             if not d:
                 raise ApiError("empty", 400)
+            if table == "boards" and "cfg" in d:        # a re-saved cfg keeps the lifecycle start date of a board that still ships
+                _nc, _oc = json.loads(d["cfg"] or "{}"), json.loads(old["cfg"] or "{}")
+                if _nc.get("ship") and _oc.get("ship") and _oc.get("lifecycle_since"):
+                    _nc["lifecycle_since"] = _oc["lifecycle_since"]
+                    d["cfg"] = json.dumps(_nc, separators=(",", ":"))
             if table == "tasks" and body.get("ver") not in (None, "") and int(body["ver"]) != (old.get("version") or 1):
                 raise ApiError("conflict", 409, "ver")
             if table == "tasks":
@@ -977,6 +990,7 @@ def crud(actor, method, table, rid, body, q, full):
                 if "status" in d and d["status"] != old["status"]:
                     _wip = check_wip(old["board_id"], d["status"], tid=rid, force=body.get("force"))
                     check_start(old, d["status"])
+                    check_lifecycle(getattr(_ctx, "role", "admin"), old, d, body)
                 if "assignee" in d and d["assignee"] and "self_assign_only" in task_rules(old) and not can(getattr(_ctx, "role", "admin"), "assign.any") and d["assignee"].lower() not in ((actor or "").lower(), (old["assignee"] or "").lower()):
                     raise ApiError("forbidden", 403, "as")
                 if "parent" in d and d["parent"] and d["parent"] != old["parent"]:
@@ -1042,7 +1056,7 @@ def crud(actor, method, table, rid, body, q, full):
             res = {"id": rid, **{m[k]: (json.loads(v) if k == "commits" else v) for k, v in d.items() if k in m}}
             if table == "tasks":
                 res["v"] = (old.get("version") or 1) + 1
-            if table == "tasks" and d.get("status") in ("in_progress", "review", "done"):
+            if table == "tasks" and d.get("status") in ("in_progress", "review", "approved", "deploying", "verified", "done"):
                 od = open_dep_ids(d.get("depends", old["depends"]))
                 if od:
                     res["w"] = ["depends on open " + " ".join("#%d" % i for i in od)]
@@ -1393,7 +1407,7 @@ REOPEN_TO = ("todo", "in_progress", "backlog", "review")
 
 # ---- ways of working: which rules apply to a board, and to a task that asks for more
 RULES = {
-    "strict_moves": "A task only moves along the allowed paths (backlog, to do, in progress, review, done).",
+    "strict_moves": "A task only moves along the allowed paths (backlog, to do, in progress, review, approved, deploying, verified, done).",
     "holder_only": "A task someone is holding can only be changed by that holder, a supervisor or an admin.",
     "accept_before_start": "A story, task or bug needs acceptance criteria before work on it can start.",
     "claim_to_start": "Work starts by claiming the task, not by dragging it to In progress.",
@@ -1537,7 +1551,7 @@ def task_verify(actor, role, tid, body):
     me = " ".join(str(body.get("as") or actor or "").split())[:60]      # a person using the web page is named by their token (admin, human)
     if me.lower() in ("", "agent", "anon"):
         raise ApiError("missing", 400, "as")
-    if t["status"] not in ("review", "done"):
+    if t["status"] not in ("review", "approved", "deploying", "verified", "done"):
         raise ApiError("bad", 400, "st")
     if me.lower() in {(t["assignee"] or "").lower(), (t["claimed_by"] or "").lower()} - {""}:
         raise ApiError("independent", 403, "as")
@@ -1589,8 +1603,10 @@ def task_history(tid):
 
 # ---- strict state moves (setting strict_moves=1)
 MOVES = {"backlog": {"todo", "in_progress", "declined"}, "todo": {"backlog", "in_progress", "blocked", "declined"},
-         "in_progress": {"todo", "review", "blocked", "done", "declined"}, "review": {"in_progress", "done", "blocked", "declined"},
-         "blocked": {"todo", "in_progress", "declined"}, "done": {"in_progress", "todo"}, "declined": {"backlog", "todo", "in_progress"}}
+         "in_progress": {"todo", "review", "blocked", "done", "declined"}, "review": {"in_progress", "approved", "done", "blocked", "declined"},
+         "approved": {"in_progress", "deploying", "done", "blocked", "declined"}, "deploying": {"in_progress", "approved", "verified", "blocked", "declined"},
+         "verified": {"in_progress", "deploying", "done", "blocked", "declined"},
+         "blocked": {"todo", "in_progress", "review", "approved", "deploying", "verified", "declined"}, "done": {"in_progress", "todo"}, "declined": {"backlog", "todo", "in_progress"}}
 
 
 def check_move(role, tid, body):
@@ -1603,6 +1619,152 @@ def check_move(role, tid, body):
         return
     if new not in MOVES.get(r[0]["status"], set()) and not (can(role, "force") and body.get("force")):
         raise ApiError("move", 409, "%s>%s" % (r[0]["status"], new))
+
+
+# ---- task lifecycle (#148): review > approved > deploying > verified > done on boards with cfg.ship
+# Only cards created at/after cfg.lifecycle_since follow it (older cards keep the old flow). Non-ship boards may use review > approved > done (optional).
+LIFE_NEXT = {"review": {"approved"}, "approved": {"deploying", "done"}, "deploying": {"verified", "approved"}, "verified": {"done", "deploying"}}
+LIFE_ONLY = ("approved", "deploying", "verified")
+WORK_START, WORK_END, WORK_TZ = 8, 18, "UTC"      # default working hours for SLA clocks (Mon-Fri); settings work_start / work_end / work_tz override
+APPROVED_NUDGE_H, APPROVED_ESC_H = 4, 8
+
+
+def life_mode(t):
+    """'ship' when this card follows the strict deploy lifecycle, else None."""
+    _m, cfg = board_cfg(t["board_id"])
+    since = cfg.get("lifecycle_since") or ""
+    if not cfg.get("ship") or not since:
+        return None
+    return "ship" if (t.get("created") or "")[:19] >= since[:19] else None
+
+
+def check_lifecycle(role, old, d, body):
+    """Reject status moves that break the lifecycle; default deploy owner/due when entering approved; require evidence for verified."""
+    new, was = d["status"], old["status"]
+    force = can(role, "force") and body.get("force")
+    mode = life_mode(old)
+    _m, cfg = board_cfg(old["board_id"])
+    lbl = _lbl_set(d.get("labels", old["labels"]))
+
+    def get(k):
+        return str(d[k] if k in d else (old.get(k) or "")).strip()
+    if not mode:
+        if new in ("deploying", "verified"):
+            raise ApiError("lifecycle", 409, new, "%s is only used on boards that ship, for cards created after the lifecycle start. Here use review > approved > done." % new)
+        if new == "approved" and was != "review" and not force:
+            raise ApiError("lifecycle", 409, "%s>approved" % was, "approved comes right after review.")
+    else:
+        if was == "blocked":
+            ok = new in (old.get("prev_status") or "todo", "in_progress", "blocked", "declined")
+        elif new == "done":
+            ok = was in ("verified", "done") or (was == "approved" and "noship" in lbl)
+        elif new in LIFE_ONLY:
+            ok = new in LIFE_NEXT.get(was, ())
+        elif new == "review":
+            ok = was not in ("approved", "deploying", "verified", "done")
+        else:
+            ok = True
+        if not ok and not force:
+            msg = "done on a shipping board follows verified (or approved for a card labelled noship)." if new == "done" else \
+                "skips are rejected on shipping boards (flow: review > approved > deploying > verified > done; a failed verification goes back to deploying or in_progress)."
+            raise ApiError("lifecycle", 409, "%s>%s" % (was, new), "%s From %s allowed: %s, in_progress, blocked." % (msg, was, ", ".join(sorted(LIFE_NEXT.get(was, ()))) or "-"))
+    if new in ("approved", "deploying") and new != was:
+        owner = get("deploy_owner") or str(cfg.get("deploy_owner") or "").strip()
+        if mode and not owner and not force:
+            raise ApiError("missing", 400, "do", "%s needs a deploy owner: set do on the card or deploy_owner in the board settings." % new)
+        if owner and not get("deploy_owner"):
+            d["deploy_owner"] = owner
+    if new == "approved" and was != "approved":
+        d["approved_at"] = now_s()
+        d["apr_n"] = 0
+        if not get("deploy_due"):
+            d["deploy_due"] = work_deadline(d["approved_at"], APPROVED_NUDGE_H)
+    if mode and new == "verified" and was != "verified" and not force:
+        miss = [n for n, k in (("hc (health check result)", "health"), ("sk (smoke/browser test note)", "smoke"), ("rb (rollback sha)", "rollback")) if not get(k)]
+        if miss:
+            raise ApiError("evidence", 409, "verified", "verified needs evidence on the card; missing: %s." % ", ".join(miss))
+    if mode and was == "verified" and new in ("deploying", "in_progress") and not get("rollback") and not force:
+        raise ApiError("evidence", 409, "rb", "a failed verification needs the rollback sha (rb) on the card.")
+
+
+def life_apply(role, old, new, body, extra=None):
+    """Run check_lifecycle for a status write outside crud PATCH; returns the extra columns it defaults (approved_at, deploy_owner, ...)."""
+    d = {"status": new, **(extra or {})}
+    if new != old["status"]:
+        check_lifecycle(role, old, d, body or {})
+    d.pop("status", None)
+    return d
+
+
+def check_create_lifecycle(role, d, body):
+    """A card created on a shipping board starts the lifecycle: only backlog/todo/in_progress (and blocked/review/declined) at create; approved..done need force by an authorised role."""
+    new = d.get("status") or "backlog"
+    if new not in LIFE_ONLY + ("done",):
+        return
+    _m, cfg = board_cfg(d["board_id"])
+    if not cfg.get("ship") or not cfg.get("lifecycle_since"):
+        return
+    if can(role, "force") and body.get("force"):
+        return
+    raise ApiError("lifecycle", 409, "create>%s" % new, "A card on a shipping board cannot be created as %s; create it as backlog/todo/in_progress and move it through review > approved > deploying > verified > done (force=1 by an authorised role overrides)." % new)
+
+
+def work_hours_between(a, b):
+    """Working hours (Mon-Fri, work_start-work_end in work_tz) between two UTC 'YYYY-MM-DD HH:MM:SS' stamps."""
+    import datetime as _dt
+    try:
+        import zoneinfo
+        z = zoneinfo.ZoneInfo(get_setting("work_tz", WORK_TZ))
+    except Exception:
+        z = _dt.timezone.utc
+    try:
+        t0 = _dt.datetime.strptime(a[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=_dt.timezone.utc).astimezone(z)
+        t1 = _dt.datetime.strptime(b[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=_dt.timezone.utc).astimezone(z)
+    except ValueError:
+        return 0.0
+    try:
+        ws, we = int(get_setting("work_start", WORK_START)), int(get_setting("work_end", WORK_END))
+    except ValueError:
+        ws, we = WORK_START, WORK_END
+    tot, day = 0.0, t0.replace(hour=12, minute=0, second=0, microsecond=0)
+    while day.date() <= t1.date():
+        if day.weekday() < 5:
+            mid = day.replace(hour=0)
+            lo, hi = max(t0, mid + _dt.timedelta(hours=ws)), min(t1, mid + _dt.timedelta(hours=we))
+            if hi > lo:
+                tot += (hi - lo).total_seconds() / 3600
+        day += _dt.timedelta(days=1)
+    return tot
+
+
+def work_deadline(start, hours):
+    """UTC stamp `hours` working hours after start (15 minute steps)."""
+    import datetime as _dt
+    t = _dt.datetime.strptime(start[:19], "%Y-%m-%d %H:%M:%S")
+    for _ in range(4 * 24 * 14):
+        if work_hours_between(start, t.strftime("%Y-%m-%d %H:%M:%S")) >= hours:
+            break
+        t += _dt.timedelta(minutes=15)
+    return t.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def approved_sla_tick(actor="nudge-cron"):
+    """A card in approved for more than 4 working hours: ONE nudge to the deploy owner; after 8 working hours ONE escalation to the supervisors. Counted on the card (apr_n); no bot runs."""
+    n = 0
+    for r in rows("SELECT * FROM tasks WHERE status='approved' AND approved_at!='' AND apr_n<2"):
+        h = work_hours_between(r["approved_at"], now_s())
+        _m, cfg = board_cfg(r["board_id"])
+        owner = r["deploy_owner"] or cfg.get("deploy_owner") or r["assignee"]
+        if r["apr_n"] < 1 and h > APPROVED_NUDGE_H:
+            db.execute("UPDATE tasks SET apr_n=1 WHERE id=?", (r["id"],))
+            r["apr_n"] = 1
+            notify(owner, "task.approved_wait", actor, r["id"], r["board_id"], "#%d '%s' has been approved for %.0f working hours and is not deploying yet: deploy it or say why" % (r["id"], r["title"][:70], h), {"st": "approved"})
+            n += 1
+        if r["apr_n"] < 2 and h > APPROVED_ESC_H:
+            db.execute("UPDATE tasks SET apr_n=2 WHERE id=?", (r["id"],))
+            escalate("approved-wait", actor, r["id"], r["board_id"], "#%d '%s' approved %.0f working hours ago, deploy owner %s has not shipped it" % (r["id"], r["title"][:70], h, owner or "-"), skip=(owner,))
+            n += 1
+    return n
 
 
 # ---- pipelines: ordered stages, each with a holder and a gate (auto = holder passes it on, review = holder can also send it back, human = a person approves)
@@ -1642,6 +1804,12 @@ def _stage_enter(actor, t, idx, why):
     tid, bid, ss = t["id"], t["board_id"], _stages(t)
     if idx >= len(ss):
         check_done_gate(tid, bid, t["dod_done"])
+        if life_mode(t):        # a shipping card ends its pipeline in approved; done follows verified
+            x = life_apply(getattr(_ctx, "role", "admin"), dict(t, status="review"), "approved", {})
+            cols = {"status": "approved", "stage": len(ss) + 1, **x}
+            db.execute("UPDATE tasks SET %s, updated=CURRENT_TIMESTAMP, version=COALESCE(version,1)+1 WHERE id=?" % ",".join(k + "=?" for k in cols), list(cols.values()) + [tid])
+            emit(actor, "task.updated", tid, bid, {"st": "approved", "sg": len(ss) + 1})
+            return {"id": tid, "st": "approved", "sg": len(ss) + 1}
         db.execute("UPDATE tasks SET status='done', stage=?, updated=CURRENT_TIMESTAMP, version=COALESCE(version,1)+1 WHERE id=?", (len(ss) + 1, tid))
         emit(actor, "task.updated", tid, bid, {"st": "done", "sg": len(ss) + 1})
         return {"id": tid, "st": "done", "sg": len(ss) + 1}
@@ -2175,8 +2343,11 @@ def task_handoff(actor, tid, body):
         if st not in STATUSES:
             raise ApiError("bad", 400, "st")
         clear = st != "blocked"
+        _x = life_apply(getattr(_ctx, "role", "admin"), t, st, body)          # lifecycle (#148): handoff with st follows the same rules
         db.execute("UPDATE tasks SET assignee=?, description=?, status=?, nudge='', updated=CURRENT_TIMESTAMP" + (", blocker='', blocked_by=''" if clear else "") + " WHERE id=?",
                    (to, desc, st, tid))
+        for _k, _v in _x.items():
+            db.execute("UPDATE tasks SET %s=? WHERE id=?" % _k, (_v, tid))
         play = " ".join((summary + ((" Next: " + nxt) if nxt else "")).split())[:600]
         db.execute("UPDATE tasks SET play=? WHERE id=?", (play, tid))
         db.execute("INSERT INTO comments(task_id,actor,body) VALUES(?,?,?)",
@@ -2855,7 +3026,12 @@ def git_event(h, p):
                 closed = False
                 if get_setting("git_autodone", "1") != "0" and t["status"] not in ("done", "declined"):
                     try:
-                        crud("git", "PATCH", "tasks", tid, {"st": "done"}, {}, False)
+                        if life_mode(t):          # a shipping card: a merge moves approved to deploying; verified and done need evidence
+                            if t["status"] != "approved":
+                                raise ApiError("lifecycle", 409)
+                            crud("git", "PATCH", "tasks", tid, {"st": "deploying"}, {}, False)
+                        else:
+                            crud("git", "PATCH", "tasks", tid, {"st": "done"}, {}, False)
                         closed = True
                     except ApiError as e:
                         msg += " - not closed automatically (%s): finish the task when ready" % e.code
@@ -4114,7 +4290,11 @@ def review_decide(actor, role, rid, body):
         db.execute("UPDATE reviews SET status=?, decision_note=?, decided=? WHERE id=?", (st, note, now_s(), rid))
         t = rows("SELECT * FROM tasks WHERE id=?", (r["task_id"],))[0]
         if r["kind"] == "gate":
-            _gate_decided(me, t, st == "approved", note)
+            try:
+                _gate_decided(me, t, st == "approved", note)
+            except ApiError:        # the last gate could not advance (e.g. ship card without a deploy owner): keep the review pending so it can be decided again
+                db.execute("UPDATE reviews SET status='pending', decision_note='', decided='' WHERE id=?", (rid,))
+                raise
             db.execute("INSERT INTO comments(task_id,actor,body) VALUES(?,?,?)", (t["id"], me, ("Gate approved" if st == "approved" else "Gate sent back") + (": " + note if note else "")))
             return {"id": rid, "st": st}
         db.execute("INSERT INTO comments(task_id,actor,body) VALUES(?,?,?)", (t["id"], me, (("Approval granted" if st == "approved" else "Approval denied") if r["kind"] == "approval" else ("Review approved" if st == "approved" else "Changes requested")) + (": " + note if note else "")))
@@ -4129,7 +4309,15 @@ def review_decide(actor, role, rid, body):
         elif st == "changes":
             db.execute("UPDATE tasks SET status='in_progress', updated=CURRENT_TIMESTAMP, version=COALESCE(version,1)+1 WHERE id=?", (t["id"],))
             emit(actor, "task.updated", t["id"], t["board_id"], {"st": "in_progress"})
-        pend = rows("SELECT id FROM reviews WHERE task_id=? AND status IN ('pending','changes')", (t["id"],))
+        pend = open_reviews(t["id"])
+        if st == "approved" and r["kind"] not in ("approval", "gate") and not pend and t["status"] == "review" and life_mode(t):
+            try:        # lifecycle (#148): an approved review moves a shipping card review > approved
+                _x = life_apply(getattr(_ctx, "role", "admin"), t, "approved", {})
+                _cols = {"status": "approved", **_x}
+                db.execute("UPDATE tasks SET %s, updated=CURRENT_TIMESTAMP, version=COALESCE(version,1)+1 WHERE id=?" % ",".join(k + "=?" for k in _cols), list(_cols.values()) + [t["id"]])
+                emit(actor, "task.updated", t["id"], t["board_id"], {"st": "approved"})
+            except ApiError as e:
+                db.execute("INSERT INTO comments(task_id,actor,body) VALUES(?,?,?)", (t["id"], me, "Review approved but the card stayed in review: %s" % (e.msg or e.field or e.code)))
         msg = ("%s approved #%d '%s'%s" % (me, t["id"], t["title"][:60], " - all reviews approved" if not pend else "")) if st == "approved" else \
               ("%s requested changes on #%d '%s': %s" % (me, t["id"], t["title"][:60], note[:160]))
         ntype = ("approval." + ("granted" if st == "approved" else "denied")) if r["kind"] == "approval" else "review." + st
@@ -4156,6 +4344,12 @@ def reviews_list(q):
     return {"n": len(rs), "i": [review_out(r) for r in rs]}
 
 
+def open_reviews(tid):
+    """Reviews still blocking a card: pending ones, and 'changes' ones the same reviewer has not looked at again (a newer review by them supersedes it)."""
+    return rows("SELECT id FROM reviews r WHERE task_id=? AND (status='pending' OR (status='changes' AND NOT EXISTS "
+                "(SELECT 1 FROM reviews n WHERE n.task_id=r.task_id AND n.reviewer=r.reviewer COLLATE NOCASE AND n.id>r.id)))", (tid,))
+
+
 def check_done_gate(tid, bid, dod_done):
     """Definition of done (board checklist) + open reviews must be satisfied before a task can reach done."""
     b = rows("SELECT dod FROM boards WHERE id=?", (bid,))
@@ -4165,8 +4359,7 @@ def check_done_gate(tid, bid, dod_done):
         if not set(range(len(items))) <= done:
             raise ApiError("dod", 400, "dn")
     # a review blocks while it is pending, or asked for changes and nobody has looked again since (a newer review by the same person supersedes it)
-    if rows("SELECT id FROM reviews r WHERE task_id=? AND (status='pending' OR (status='changes' AND NOT EXISTS "
-            "(SELECT 1 FROM reviews n WHERE n.task_id=r.task_id AND n.reviewer=r.reviewer COLLATE NOCASE AND n.id>r.id)))", (tid,)):
+    if open_reviews(tid):
         raise ApiError("review", 400, "st")
     t_ = rows("SELECT * FROM tasks WHERE id=?", (tid,))
     if t_ and t_[0]["accept"] and not t_[0]["verified_by"] and "verify_before_done" in task_rules(t_[0]):
@@ -5007,7 +5200,7 @@ def housekeeping(actor="system"):
 
 
 # ---------------------------------------------------------------- work methodologies: scrum, kanban, scrumban, shape up, simple
-ALL_STATUSES = ["backlog", "todo", "in_progress", "review", "blocked", "done"]
+ALL_STATUSES = ["backlog", "todo", "in_progress", "review", "approved", "deploying", "verified", "blocked", "done"]
 METHODS = {
     "scrum": {"name": "Scrum", "about": "Fixed-length sprints with a commitment, velocity and a retrospective after each one.",
               "sprints": True, "wip": False, "term": "Sprint", "sprint_days": 14, "columns": ALL_STATUSES,
@@ -5083,6 +5276,11 @@ def norm_cfg(v):
                 out[bk] = round(x, 2)
         if v.get("policy"):
             out["policy"] = policy_clean(v["policy"])
+        if v.get("ship"):                 # task lifecycle: this board deploys; new cards go review > approved > deploying > verified > done
+            out["ship"] = True
+            out["lifecycle_since"] = str(v.get("lifecycle_since") or now_s())[:19]
+        if v.get("deploy_owner"):
+            out["deploy_owner"] = " ".join(str(v["deploy_owner"]).split())[:60]
         sl = {str(k): int(n) for k, n in (v.get("sla_hours") or {}).items() if str(k) in ("1", "2", "3", "4") and n not in (None, "", 0, "0")}
         if sl:
             if any(n < 1 or n > 24 * 365 for n in sl.values()):
@@ -5697,7 +5895,7 @@ def _briefing_once(actor, q):
         out["nw"] = nw
     if since is None or q.get("full", ["0"])[0] not in ("0", ""):
         fr, fa = _in("board_id", scope)
-        work = rows("SELECT * FROM tasks WHERE assignee=? COLLATE NOCASE AND status NOT IN ('done','declined')" + fr + " ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'review' THEN 1 WHEN 'todo' THEN 2 WHEN 'blocked' THEN 3 ELSE 4 END, priority, id LIMIT 15", [me] + fa)
+        work = rows("SELECT * FROM tasks WHERE assignee=? COLLATE NOCASE AND status NOT IN ('done','declined')" + fr + " ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'deploying' THEN 0 WHEN 'review' THEN 1 WHEN 'approved' THEN 1 WHEN 'verified' THEN 1 WHEN 'todo' THEN 2 WHEN 'blocked' THEN 3 ELSE 4 END, priority, id LIMIT 15", [me] + fa)
         if work:
             out["work"] = [{k: v for k, v in cdict("tasks", t, False, ("description",)).items() if k in ("id", "t", "st", "pr", "b", "cu", "dpo")} for t in work]
         att = attention(scope)[:5]
@@ -5735,17 +5933,18 @@ def next_task(actor, body):
 def task_finish(actor, role, tid, body):
     """Attach outputs, comment, record PR/sha, then close, send to review, or hand off - one call."""
     check_holder(actor, role, tid)
-    check_move(role, tid, {"st": body.get("st") or ("done" if not (body.get("review") or body.get("to")) else None), "force": body.get("force")})
     t = rows("SELECT * FROM tasks WHERE id=?", (tid,))
     if not t:
         raise ApiError("nf", 404)
     t = t[0]
+    shipped = life_mode(t) and not body.get("st") and t["status"] in ("backlog", "todo", "in_progress", "blocked")      # lifecycle (#148): finish on a shipping board goes to review, never done
+    check_move(role, tid, {"st": "review" if shipped else (body.get("st") or ("done" if not (body.get("review") or body.get("to")) else None)), "force": body.get("force")})
     check_fence(tid, body.get("lt"))
     summary = sg(str(body.get("summary") or "").strip()[:2000])
     if not summary:
         raise ApiError("missing", 400, "summary")
     review, to = str(body.get("review") or "").strip(), str(body.get("to") or "").strip()
-    st = body.get("st") or "done"
+    st = body.get("st") or ("review" if shipped else "done")
     if st not in STATUSES:
         raise ApiError("bad", 400, "st")
     if (st in ("done", "review") and not to) or review:
@@ -5760,7 +5959,7 @@ def task_finish(actor, role, tid, body):
             if gap:
                 raise ApiError("evidence", 409, ",".join(str(n) for n in gap)[:100])
     patch = {}
-    for k_, src in (("pu", "pr"), ("pu", "pu"), ("sha", "sha"), ("dn", "dn")):
+    for k_, src in (("pu", "pr"), ("pu", "pu"), ("sha", "sha"), ("dn", "dn"), ("do", "do"), ("hc", "hc"), ("sk", "sk"), ("rb", "rb")):
         if body.get(src) not in (None, "", []):
             patch[k_] = body[src]
     patch["po"] = summary[:600]
@@ -5789,7 +5988,10 @@ def task_finish(actor, role, tid, body):
     elif to:
         task_handoff(actor, tid, {"to": to, "summary": summary, "next": body.get("next", ""), "st": body.get("st")})
         did.append("handoff")
-    return {"id": tid, "did": did, "st": rows("SELECT status FROM tasks WHERE id=?", (tid,))[0]["status"]}
+    res = {"id": tid, "did": did, "st": rows("SELECT status FROM tasks WHERE id=?", (tid,))[0]["status"]}
+    if shipped and res["st"] == "review":
+        res["next"] = "shipping board: sent to review. Assign the card to a reviewer; approved > deploying > verified > done follow."
+    return res
 
 
 GUIDES = {
@@ -6204,7 +6406,7 @@ def token_delete(tid):
     return {"id": tid, "x": 1}
 
 
-SETTING_KEYS = ("digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd", "agent_limits", "run_lost_min", "holder_only", "strict_moves", "auto_verify", "policy_default", "secret_guard", "lesson_cooldown_h", "wait_escalate_min", "witness_names", "node_admission", "watermarks_on", "watermarks", "ops_board", "snapshot_on", "intake_secret", "intake_senders", "intake_board", "media_hosts")
+SETTING_KEYS = ("work_start", "work_end", "work_tz", "digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd", "agent_limits", "run_lost_min", "holder_only", "strict_moves", "auto_verify", "policy_default", "secret_guard", "lesson_cooldown_h", "wait_escalate_min", "witness_names", "node_admission", "watermarks_on", "watermarks", "ops_board", "snapshot_on", "intake_secret", "intake_senders", "intake_board", "media_hosts")
 
 
 def get_setting(k, default=""):
@@ -6241,6 +6443,17 @@ def settings_set(body):
                     raise ApiError("bad", 400, k)
                 if k == "policy_default" and v not in ("", "loose", "standard", "strict"):
                     raise ApiError("bad", 400, k)
+                if k in ("work_start", "work_end") and v:
+                    try:
+                        assert 0 <= int(v) <= 24
+                    except Exception:
+                        raise ApiError("bad", 400, k)
+                if k == "work_tz" and v:
+                    try:
+                        import zoneinfo
+                        zoneinfo.ZoneInfo(v)
+                    except Exception:
+                        raise ApiError("bad", 400, k)
                 if k in ("digest_hour", "backup_keep", "wake_after_min", "run_lost_min") and v:
                     try:
                         assert 0 <= int(v) <= (23 if k == "digest_hour" else 1440 if k in ("wake_after_min", "run_lost_min") else 365)
@@ -6452,6 +6665,7 @@ def import_csv(actor, bid, text):
             body.setdefault("channel", "Import")
             try:
                 d = validate("tasks", body, False)
+                check_create_lifecycle(getattr(_ctx, "role", "admin"), d, {})
                 db.execute("INSERT INTO tasks(%s) VALUES(%s)" % (",".join(d), ",".join("?" * len(d))), list(d.values()))
                 made += 1
             except ApiError as e:
@@ -6496,9 +6710,9 @@ def dashboard(q):
     for r in rows("SELECT assignee, status, COUNT(*) n FROM tasks WHERE assignee!='' AND status NOT IN ('done','declined')" + wh + " GROUP BY assignee COLLATE NOCASE, status", ar):
         load.setdefault(r["assignee"], {})[r["status"]] = r["n"]
     unread = {r["agent"].lower(): r["n"] for r in rows("SELECT agent, COUNT(*) n FROM notifications WHERE read=0 GROUP BY agent COLLATE NOCASE")}
-    tot = {"boards": len(boards), "open": 0, "in_progress": 0, "review": 0, "blocked": 0, "done": 0, "red_sprints": 0}
+    tot = {"boards": len(boards), "open": 0, "in_progress": 0, "review": 0, "approved": 0, "deploying": 0, "verified": 0, "blocked": 0, "done": 0, "red_sprints": 0}
     for o in boards:
-        for k in ("in_progress", "review", "blocked", "done"):
+        for k in ("in_progress", "review", "approved", "deploying", "verified", "blocked", "done"):
             tot[k] += o["by"].get(k, 0)
         tot["open"] += sum(v for k, v in o["by"].items() if k not in ("done", "declined"))
         tot["red_sprints"] += 1 if (o.get("sp") or {}).get("hl") == "red" else 0
@@ -6506,7 +6720,7 @@ def dashboard(q):
     me = _qv(q, "as", "agent")
     if me:
         work = rows("SELECT * FROM tasks WHERE assignee=? COLLATE NOCASE AND status NOT IN ('done','declined')" + wh +
-                    " ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'review' THEN 1 WHEN 'todo' THEN 2 WHEN 'blocked' THEN 3 ELSE 4 END, priority, id LIMIT 30", [me] + ar)
+                    " ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'deploying' THEN 0 WHEN 'review' THEN 1 WHEN 'approved' THEN 1 WHEN 'verified' THEN 1 WHEN 'todo' THEN 2 WHEN 'blocked' THEN 3 ELSE 4 END, priority, id LIMIT 30", [me] + ar)
         out["me"] = {"as": me, "inbox": unread.get(me.lower(), 0), "work": [cdict("tasks", t, False, ("description",)) for t in work]}
     return out
 

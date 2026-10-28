@@ -785,7 +785,7 @@ async function refreshDash() {
 }
 const kickDash = () => { clearTimeout(dashT); dashT = setTimeout(() => { if (view === "today") renderToday(); else if (view === "overview") renderOverview(); else if (view === "agents") renderAgents(); else if (view === "system") renderSystem(); else refreshDash(); }, view === "today" || view === "system" ? 2000 : 400); };
 
-const CFD_ORDER = [["done", "#00805c"], ["review", "#7d58c2"], ["in_progress", "#ba5c33"], ["todo", "#326bae"], ["backlog", "#b2b6b5"]];
+const CFD_ORDER = [["done", "#00805c"], ["verified", "#2f9e7a"], ["deploying", "#c9892b"], ["approved", "#4f8f9c"], ["review", "#7d58c2"], ["in_progress", "#ba5c33"], ["todo", "#326bae"], ["backlog", "#b2b6b5"]];
 function cfdSvg(cfd) {
   const W = 560, H = 170, P = 26, n = Math.max(1, cfd.length - 1), tot = cfd.map(r => CFD_ORDER.reduce((a, [k]) => a + r[k], 0)), max = Math.max(1, ...tot);
   const x = i => P + (W - P * 2) * i / n, y = v => H - P - (H - P * 2) * v / max;
@@ -1214,6 +1214,11 @@ function taskDlg(id, status, title, boardId, pri, pre) {
     <div class="row2"><label>Depends on (task ids, any board)<input name="depends" value="${esc(csv(t.depends).join(", "))}" placeholder="e.g. 12, 15"><input id="dpq" class="dpq" list="dpl" placeholder="Search a task on any board to add it" autocomplete="off"><datalist id="dpl"></datalist></label>
     <label>Points (estimate)<input type="number" name="points" min="0" max="1000" value="${t.points || ""}"></label></div>
     <div class="row2"><label>Due date<input type="date" name="due" value="${esc(t.due || "")}"></label><span></span></div>
+    ${["approved", "deploying", "verified"].includes(t.status) || (bcfg().ship && id) ? `<div class="deploybox"><b>Deploy</b> <span class="muted">(approved and deploying need an owner; verified needs health, smoke and a rollback sha)</span>
+      <div class="row2"><label>Deploy owner<input name="deploy_owner" value="${esc(t.deploy_owner || "")}" placeholder="${esc(bcfg().deploy_owner || "e.g. claude-vm")}"></label><label>Deploy due<input name="deploy_due" value="${esc(t.deploy_due || "")}" placeholder="set when approved"></label></div>
+      <label>Health check<input name="health" value="${esc(t.health || "")}" placeholder="e.g. /health 200 on prod"></label>
+      <label>Smoke / browser test<input name="smoke" value="${esc(t.smoke || "")}" placeholder="what was clicked and seen"></label>
+      <label>Rollback sha<input name="rollback" value="${esc(t.rollback || "")}" placeholder="previous good sha"></label></div>` : ""}
     ${id ? '<div id="linksbox" class="linksbox"></div>' + codeBox(t) + '<div id="runsbox" class="codebox" hidden></div>' : ""}
     ${meth().group === "okr" ? `<div class="row2"><label>Target (key result)<input type="number" step="any" min="0" name="target" value="${t.target ?? ""}"></label><label>Current value<input type="number" step="any" min="0" name="current" value="${t.current ?? ""}"></label></div>` : ""}
     ${id && t.status !== "done" && t.status !== "declined" ? `<div class="waitbox"><label>Waiting for someone? <span class="muted">(they are asked; a long wait goes to the supervisors)</span></label>${(() => { let w = null; try { w = t.waiting ? JSON.parse(t.waiting) : null; } catch (_) {} return w ? `<div>Waiting for <b>${esc(w.o)}</b> (${esc(w.k)}) since ${esc(ago(w.s))} ago: ${esc(w.r)} <button type="button" class="mini" id="wclear">It is over</button></div>` : `<div class="vf"><select id="wk">${["input", "review", "human", "external", "dependency"].map(k => `<option>${k}</option>`).join("")}</select><input id="wo" placeholder="Who"><input id="wr" placeholder="What for"><button type="button" class="mini" id="wgo">I am waiting</button></div>`; })()}</div>` : ""}

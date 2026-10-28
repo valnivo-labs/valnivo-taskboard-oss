@@ -1735,3 +1735,132 @@ assert J("PATCH", f"/tokens/{_dep}", {"role": "agent"}, tok=_dt)[1]["e"] == "las
 server.TOKENS.update(_env2)
 assert J("PATCH", f"/tokens/{_dep}", {"role": "agent"})[0] == 200 and J("DELETE", "/roles/deputy")[0] == 200
 print("v47 roles selftest OK")
+
+# v49 (#148): task lifecycle review > approved > deploying > verified > done
+def _mk(bid, t, st="todo", **kw):
+    return J("POST", "/tasks", {"b": bid, "t": t, "st": st, "as": "Worker", "d": "lifecycle probe card for the v49 selftest, done when asserted", **kw}, tok="stok")[1]["id"]
+def _st(tid, st, tok="stok", **kw):
+    return J("PATCH", f"/tasks/{tid}", {"st": st, **kw}, tok=tok)
+_sb = J("POST", "/boards", {"n": "Ship board", "cf": {"ship": True, "deploy_owner": "deploy-bot"}})[1]["id"]
+_cf = json.loads(server.rows("SELECT cfg FROM boards WHERE id=?", (_sb,))[0]["cfg"]); assert _cf["ship"] and _cf["lifecycle_since"] and _cf["deploy_owner"] == "deploy-bot", _cf
+J("PATCH", f"/boards/{_sb}", {"cf": {"ship": True, "deploy_owner": "deploy-bot", "wip": {"todo": 50}}}); assert json.loads(server.rows("SELECT cfg FROM boards WHERE id=?", (_sb,))[0]["cfg"])["lifecycle_since"] == _cf["lifecycle_since"]   # re-save keeps the start
+_nb = J("POST", "/boards", {"n": "Content board"})[1]["id"]
+# 1) ship board: full flow, skips rejected, evidence required
+_old = _mk(_sb, "old card", "in_progress"); server.db.execute("UPDATE tasks SET created='2000-01-01 00:00:00' WHERE id=?", (_old,))
+_c = _mk(_sb, "new card", "in_progress")
+assert _st(_c, "review")[0] == 200
+for _bad in ("done", "deploying", "verified"):
+    r = _st(_c, _bad); assert r[0] == 409 and r[1]["e"] == "lifecycle", (_bad, r)          # no skips, review > done is closed on ship boards
+r = _st(_c, "approved"); assert r[0] == 200, r
+_t = server.rows("SELECT * FROM tasks WHERE id=?", (_c,))[0]
+assert _t["deploy_owner"] == "deploy-bot" and _t["approved_at"] and _t["deploy_due"] > _t["approved_at"], _t     # deploy owner defaults from the board, due time set
+assert _st(_c, "verified")[0] == 409 and _st(_c, "done")[0] == 409 and _st(_c, "review")[0] == 409
+assert _st(_c, "deploying")[0] == 200
+r = _st(_c, "verified"); assert r[0] == 409 and r[1]["e"] == "evidence" and all(k in json.dumps(r[1]) for k in ("hc", "sk", "rb")), r
+r = _st(_c, "verified", hc="health 200", sk="login + create card in browser"); assert r[0] == 409 and "rb" in json.dumps(r[1]) and "hc (" not in json.dumps(r[1]), r   # names only what is missing
+assert _st(_c, "verified", hc="health 200", sk="login + create card in browser", rb="abc1234")[0] == 200
+assert _st(_c, "done")[0] == 200
+# failed verification goes back to deploying (needs rollback sha) or in_progress
+_f = _mk(_sb, "fails verification", "review"); _st(_f, "approved"); _st(_f, "deploying"); _st(_f, "verified", hc="x", sk="y", rb="r1")
+assert _st(_f, "deploying")[0] == 200 and _st(_f, "verified")[0] == 200 and _st(_f, "in_progress")[0] == 200
+server.db.execute("UPDATE tasks SET rollback='', status='verified' WHERE id=?", (_f,))
+r = _st(_f, "deploying"); assert r[0] == 409 and "rb" in json.dumps(r[1]), r
+# deploy owner is required when neither the card nor the board has one
+_sb2 = J("POST", "/boards", {"n": "Ship no owner", "cf": {"ship": True}})[1]["id"]; _o = _mk(_sb2, "no owner", "review")
+r = _st(_o, "approved"); assert r[0] == 400 and r[1]["e"] == "missing", r
+assert _st(_o, "approved", **{"do": "codex-vm"})[0] == 200
+# noship label: approved > done
+_n1 = _mk(_sb, "docs only", "review", lb="noship"); _st(_n1, "approved"); assert _st(_n1, "done")[0] == 200
+# bulk moves obey the same rules
+_bl = _mk(_sb, "bulk probe", "review"); _st(_bl, "approved")
+r = J("PATCH", "/tasks", {"ids": [_bl], "st": "done"}); assert r[0] == 409, r
+# 2) old cards keep the old flow (and cannot enter the deploy states)
+assert _st(_old, "review")[0] == 200 and _st(_old, "deploying")[0] == 409 and _st(_old, "done")[0] == 200
+# 3) non-ship board: approved is optional, review > done unchanged, no deploy states
+_a = _mk(_nb, "content a", "review"); assert _st(_a, "approved")[0] == 200 and _st(_a, "done")[0] == 200
+_b = _mk(_nb, "content b", "review"); assert _st(_b, "done")[0] == 200
+_d = _mk(_nb, "content d", "review"); assert _st(_d, "deploying")[0] == 409 and _st(_d, "verified")[0] == 409
+# 4) finish on a ship board goes to review, not done; non-ship still closes
+_fs = _mk(_sb, "finish on ship board", "in_progress")
+r = J("POST", f"/tasks/{_fs}/finish", {"summary": "implemented, PR open"}, tok="stok"); assert r[0] == 200 and r[1]["st"] == "review" and "next" in r[1], r
+_fn = _mk(_nb, "finish on content board", "in_progress"); r = J("POST", f"/tasks/{_fn}/finish", {"summary": "published the video"}, tok="stok"); assert r[1]["st"] == "done", r
+# 5) strict_moves allows the new transitions and rejects skips
+server.set_setting("strict_moves", "1")
+_sm = _mk(_nb, "strict content", "review"); assert _st(_sm, "approved")[0] == 200 and _st(_sm, "done")[0] == 200
+_sm2 = _mk(_sb, "strict ship", "in_progress"); _st(_sm2, "review"); assert _st(_sm2, "deploying")[0] == 409 and _st(_sm2, "approved")[0] == 200
+server.set_setting("strict_moves", "0")
+# 6) working hours and the approved nudge: ONE nudge to the deploy owner, then ONE escalation to the supervisors
+assert abs(server.work_hours_between("2026-10-23 14:00:00", "2026-10-26 09:00:00") - 5.0) < 1e-6           # Fri 14:00 > Mon 09:00 UTC: weekend and night do not count
+_nq = _mk(_sb, "stuck approved", "review"); _st(_nq, "approved")
+server.db.execute("UPDATE tasks SET approved_at='2026-10-20 08:00:00', apr_n=0 WHERE id=?", (_nq,))      # Tue 08:00 UTC, start of the working day
+_cnt = lambda ty, ag="%": server.db.execute("SELECT COUNT(*) FROM notifications WHERE task_id=? AND type=? AND agent LIKE ?", (_nq, ty, ag)).fetchone()[0]
+_real = server.now_s
+try:
+    server.now_s = lambda: "2026-10-20 10:00:00"; server.approved_sla_tick(); assert _cnt("task.approved_wait") == 0           # 2 working hours: nothing
+    server.now_s = lambda: "2026-10-20 14:00:00"; server.approved_sla_tick(); server.approved_sla_tick()                       # 6 h: one nudge, deduped
+    assert _cnt("task.approved_wait") == 1 and _cnt("esc.approved-wait") == 0
+    server.now_s = lambda: "2026-10-20 17:00:00"; server.approved_sla_tick(); server.approved_sla_tick(); server.approved_sla_tick()   # 9 h: one escalation
+    assert _cnt("task.approved_wait") == 1 and _cnt("esc.approved-wait", "Sup Bot") == 1
+finally:
+    server.now_s = _real
+assert _cnt("task.approved_wait", "deploy-bot") == 1
+print("v49 task lifecycle OK")
+# v49b (#148 FAIL fixes): create/handoff/review-approve follow the lifecycle
+_D = "lifecycle probe card for the v49 selftest, done when asserted"
+for _bad in ("approved", "deploying", "verified", "done"):
+    _r = J("POST", "/tasks", {"b": _sb, "t": "create " + _bad, "st": _bad, "as": "Worker", "d": _D}, tok="stok"); assert _r[0] == 409 and _r[1]["e"] == "lifecycle", (_bad, _r)
+assert J("POST", "/tasks", {"b": _nb, "t": "create ns done", "st": "done", "as": "Worker", "d": _D}, tok="stok")[0] in (200, 201)   # non-ship boards unaffected
+_cf1 = J("POST", "/tasks", {"b": _sb, "t": "create forced", "st": "approved", "force": 1, "as": "Worker", "d": _D}, tok="stok"); assert _cf1[0] in (200, 201), _cf1
+assert J("POST", "/tasks", {"b": _sb, "t": "create todo ok", "st": "todo", "as": "Worker", "d": _D}, tok="stok")[0] in (200, 201)
+_h = _mk(_sb, "handoff card", "in_progress")
+for _bad in ("done", "verified", "approved"):
+    _r = J("POST", f"/tasks/{_h}/handoff", {"to": "Worker", "summary": "x", "st": _bad}, tok="stok"); assert _r[0] == 409 and _r[1]["e"] == "lifecycle", (_bad, _r)
+assert J("POST", f"/tasks/{_h}/handoff", {"to": "Worker", "summary": "x", "st": "review"}, tok="stok")[0] in (200, 201)
+_r = J("POST", f"/tasks/{_h}/handoff", {"to": "Worker", "summary": "x", "st": "approved"}, tok="stok"); assert _r[0] == 200, _r
+_hr = server.rows("SELECT status, approved_at, deploy_owner FROM tasks WHERE id=?", (_h,))[0]; assert _hr["status"] == "approved" and _hr["approved_at"] and _hr["deploy_owner"] == "deploy-bot", _hr
+_ho = _mk(_sb, "handoff old", "in_progress"); server.db.execute("UPDATE tasks SET created='2000-01-01 00:00:00' WHERE id=?", (_ho,))
+assert J("POST", f"/tasks/{_ho}/handoff", {"to": "Worker", "summary": "x", "st": "done"}, tok="stok")[0] in (200, 201)       # old card keeps the old flow
+_hn = _mk(_nb, "handoff nonship", "in_progress")
+assert J("POST", f"/tasks/{_hn}/handoff", {"to": "Worker", "summary": "x", "st": "verified"}, tok="stok")[0] == 409     # verified is ship-only
+assert J("POST", f"/tasks/{_hn}/handoff", {"to": "Worker", "summary": "x", "st": "done"}, tok="stok")[0] in (200, 201)
+# review approve moves a shipping card to approved, others untouched
+_ra = _mk(_sb, "review approve ship", "in_progress"); _st(_ra, "review")
+_rv = J("POST", f"/tasks/{_ra}/review", {"reviewer": "Reviewer", "as": "Worker"}, tok="stok")[1]
+assert J("POST", f"/reviews/{_rv['id']}/decide", {"decision": "approve", "as": "Reviewer"}, tok="stok")[0] in (200, 201)
+assert server.rows("SELECT status FROM tasks WHERE id=?", (_ra,))[0]["status"] == "approved"
+_rn = _mk(_nb, "review approve nonship", "in_progress"); _st(_rn, "review")
+_rv = J("POST", f"/tasks/{_rn}/review", {"reviewer": "Reviewer", "as": "Worker"}, tok="stok")[1]
+J("POST", f"/reviews/{_rv['id']}/decide", {"decision": "approve", "as": "Reviewer"}, tok="stok")
+assert server.rows("SELECT status FROM tasks WHERE id=?", (_rn,))[0]["status"] == "review"
+_ro = _mk(_sb, "review approve old", "in_progress"); server.db.execute("UPDATE tasks SET created='2000-01-01 00:00:00', status='review' WHERE id=?", (_ro,))
+_rv = J("POST", f"/tasks/{_ro}/review", {"reviewer": "Reviewer", "as": "Worker"}, tok="stok")[1]
+J("POST", f"/reviews/{_rv['id']}/decide", {"decision": "approve", "as": "Reviewer"}, tok="stok")
+assert server.rows("SELECT status FROM tasks WHERE id=?", (_ro,))[0]["status"] == "review"
+# B3: a later approve by the same reviewer supersedes their earlier changes; another reviewer's changes still block
+def _rvd(tid, who, dec, note=""):
+    _r = J("POST", f"/tasks/{tid}/review", {"reviewer": who, "as": "Worker"}, tok="stok")[1]
+    assert J("POST", f"/reviews/{_r['id']}/decide", {"decision": dec, "as": who, "note": note}, tok="stok")[0] in (200, 201)
+_s1 = _mk(_sb, "supersede same reviewer", "in_progress"); _st(_s1, "review")
+_rvd(_s1, "Reviewer", "changes", "fix it"); _st(_s1, "review"); _rvd(_s1, "Reviewer", "approve")
+assert server.rows("SELECT status FROM tasks WHERE id=?", (_s1,))[0]["status"] == "approved"
+_s2 = _mk(_sb, "changes by A approve by B", "in_progress"); _st(_s2, "review")
+_rvd(_s2, "Reviewer A", "changes", "no"); _st(_s2, "review"); _rvd(_s2, "Reviewer B", "approve")
+assert server.rows("SELECT status FROM tasks WHERE id=?", (_s2,))[0]["status"] == "review"
+# B4: pipeline with a human last gate ends in approved on a ship board, done on a non-ship board; no deploy owner keeps the gate decidable
+_PL = "Build | Worker | auto\nSign off | Boss | human"
+for _bd, _want in ((_sb, "approved"), (_nb, "done")):
+    _p = J("POST", "/tasks", {"b": _bd, "t": "pipe end " + _want, "st": "backlog", "as": "Worker", "d": _D, "pl": _PL}, tok="stok")[1]["id"]
+    assert J("POST", f"/tasks/{_p}/stage", {"action": "start"}, tok="stok")[0] == 200
+    assert J("POST", f"/tasks/{_p}/stage", {"action": "done", "as": "Worker"}, tok="stok")[0] == 200
+    _g = server.rows("SELECT id FROM reviews WHERE task_id=? AND kind='gate' AND status='pending'", (_p,))[0]["id"]
+    assert J("POST", f"/reviews/{_g}/decide", {"decision": "approve", "as": "Boss"}, tok="stok")[0] == 200
+    _pr = server.rows("SELECT status, deploy_owner, approved_at FROM tasks WHERE id=?", (_p,))[0]
+    assert _pr["status"] == _want and (_want != "approved" or (_pr["deploy_owner"] == "deploy-bot" and _pr["approved_at"])), _pr
+_p = J("POST", "/tasks", {"b": _sb2, "t": "pipe no owner", "st": "backlog", "as": "Worker", "d": _D, "pl": _PL}, tok="stok")[1]["id"]
+J("POST", f"/tasks/{_p}/stage", {"action": "start"}, tok="stok"); J("POST", f"/tasks/{_p}/stage", {"action": "done", "as": "Worker"}, tok="stok")
+_g = server.rows("SELECT id FROM reviews WHERE task_id=? AND kind='gate' AND status='pending'", (_p,))[0]["id"]
+_r = J("POST", f"/reviews/{_g}/decide", {"decision": "approve", "as": "Boss"}, tok="stok"); assert _r[0] == 400 and _r[1]["e"] == "missing", _r
+assert server.rows("SELECT status FROM reviews WHERE id=?", (_g,))[0]["status"] == "pending" and server.rows("SELECT status FROM tasks WHERE id=?", (_p,))[0]["status"] == "review"
+J("PATCH", f"/tasks/{_p}", {"do": "codex-vm"}, tok="stok")
+assert J("POST", f"/reviews/{_g}/decide", {"decision": "approve", "as": "Boss"}, tok="stok")[0] == 200 and server.rows("SELECT status FROM tasks WHERE id=?", (_p,))[0]["status"] == "approved"
+print("v49b lifecycle create/handoff/review-approve OK")

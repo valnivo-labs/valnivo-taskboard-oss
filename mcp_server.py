@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 URL = os.environ.get("TASKBOARD_URL", "http://127.0.0.1:8790").rstrip("/")
 TOKEN = os.environ.get("TASKBOARD_TOKEN", "")
 ME = os.environ.get("TASKBOARD_AGENT", "")  # default agent name for inbox/dashboard
-ST = ["backlog", "todo", "in_progress", "review", "blocked", "done"]
+ST = ["backlog", "todo", "in_progress", "review", "approved", "deploying", "verified", "blocked", "done"]
 etags = {}
 _ctx = threading.local()      # set by the taskboard's own /api/mcp endpoint: the caller's address and token for this one call
 
@@ -71,7 +71,7 @@ def pop(a, k="id"):
 
 i, s = {"type": "integer"}, {"type": "string"}
 CM = {"type": "array", "items": {"type": "object", "properties": {"h": s, "u": s, "m": s, "r": s}}}
-stenum = {"type": "string", "enum": ST}
+stenum = {"type": "string"}
 sps = {"type": "string", "enum": ["planned", "active", "closed"]}
 
 
@@ -164,7 +164,7 @@ TOOLS = {
     "task": ("Get one task incl. description. ctx=1 adds dc: docs/rules of task+sprint+board (with bodies). since=<ev from an earlier read> returns only what changed ({same:1} if nothing).", S(["id"], id=i, ctx=i, brief=i, since=i),
              lambda a: api("GET", f"/tasks/{a['id']}" + qs(a, ["ctx", "brief", "since"]))),
     "add_task": ("Create a task. Keys: ty(type: task|story|bug|epic|spike|chore) pa(parent epic id) b(board) t(title) d(description) st pr(1-4) as(assignee; 'auto' routes by label/skills) k(human|agent) s(sprint) bl bb(blockers) lb(labels csv) ch(area, optional) pu(PR url) sha dp(depends on ids) pt(points) ac(acceptance criteria, one per line) pl(pipeline) rg(rigor: loose|standard|strict, ask for more discipline on this task). New tasks join the active sprint unless s is given. Common labels: gate (review inbox), next (pick-up queue), bug, feature. Blocked waiting: st=blocked bl=why bb=[ids]",
-                 S(["b", "t"], b=i, t=s, d=s, st=stenum, pr=i, **{"as": s}, k={"type": "string", "enum": ["human", "agent"]}, s=i, bl=s, bb={"type": ["array", "string"]}, lb=s, ch=s,  pu=s, sha=s, du=s, cm=CM, dp={"type": ["array", "string"]}, pt=i, ty=s, pa=i, tg=s, cr=s),
+                 S(["b", "t"], b=i, t=s, d=s, st=stenum, pr=i, **{"as": s}, k={"type": "string", "enum": ["human", "agent"]}, s=i, bl=s, bb={"type": ["array", "string"]}, lb=s, ch=s,  pu=s, sha=s, du=s, cm=CM, dp={"type": ["array", "string"]}, pt=i, ty=s, pa=i, tg=s, cr=s, do=s, hc=s, sk=s, rb=s),
                  lambda a: api("POST", "/tasks", a)),
     "set_task": ("Patch one task by id; changed keys only (ty(type: task|story|bug|epic|spike|chore) pa(parent epic id) t d st pr as s k bl bb lb ch w sh vid at pu sha cm dp pt dn). ver=the v you read: 409 conflict if someone changed the task since. dn=ticked definition-of-done item indexes (done is refused until all board DoD items are ticked and no review is open). sha=TEST DEPLOY sha; cm=[{h,u,m,r?}] commits (replaces list). Block={id,st:'blocked',bl,bb}; leaving blocked clears bl/bb.",
                  S(["id"], id=i, t=s, d=s, st=stenum, pr=i, **{"as": s}, s=i, k=s, bl=s, bb={"type": ["array", "string"]}, lb=s, ch=s,  pu=s, sha=s, du=s, cm=CM, dp={"type": ["array", "string"]}, pt=i, ty=s, pa=i, tg=s, cr=s, dn={"type": ["array", "string"]}, ver=i),
@@ -295,8 +295,8 @@ TOOLS = {
                  S(**{"as": s}, full=i, ack=i, tm=s, bs=s, wait=i), lambda a: _briefing(a)),
     "next": ("Claim the best ready task for you (priority, todo, no open dependencies, unclaimed) and get its context in the same response: description, open deps, latest comments, rules, attachment count. lb=labels/skills to match, b=board, ttl=minutes. {none:1} when the queue is empty.",
              S(lb=s, b=i, ttl=i, **{"as": s}), lambda a: api("POST", "/next", idn(a))),
-    "finish": ("Wrap up a task in ONE call: summary (required) is posted as a comment; optional attach=[{name,url,kind}], pr, sha, dn=[ticked checklist items]; then st=done (default), or review=<reviewer> to ask for review, or to=<agent> (+next) to hand it over. The done gate (checklist, open reviews) is checked before anything is written.",
-               S(["id", "summary"], id=i, summary=s, pr=s, sha=s, dn={"type": ["array", "string"]}, attach={"type": "array", "items": {"type": "object", "properties": {"name": s, "url": s, "kind": s}}}, to=s, next=s, review=s, st=stenum, cost={"type": "object", "properties": {"in": i, "out": i, "usd": {"type": "number"}, "model": s}}, **{"as": s}),
+    "finish": ("Wrap up a task in ONE call: summary (required) is posted as a comment; optional attach=[{name,url,kind}], pr, sha, dn=[ticked checklist items]; then st=done (default; ship boards: review), or review=<reviewer> to ask for review, or to=<agent> (+next) to hand it over. The done gate (checklist, open reviews) is checked before anything is written.",
+               S(["id", "summary"], id=i, summary=s, pr=s, sha=s, dn={"type": ["array", "string"]}, attach={"type": "array", "items": {"type": "object", "properties": {"name": s, "url": s, "kind": s}}}, to=s, next=s, review=s, st=stenum, cost={"type": "object", "properties": {"in": i, "out": i, "usd": {"type": "number"}, "model": s}}, do=s, hc=s, sk=s, rb=s, **{"as": s}),
                lambda a: api("POST", f"/tasks/{a['id']}/finish", {k: v for k, v in idn(a).items() if k != 'id'})),
     "cost": ("Log what work cost: in/out tokens and usd (or only model: priced from the admin price table), optional task id and note. Task, board and monthly budgets warn the supervisor. finish takes the same as cost={...}.",
              S(task=i, usd={"type": "number"}, model=s, note=s, **{"in": i, "out": i, "as": s}), lambda a: api("POST", "/cost", idn(a))),
@@ -423,7 +423,7 @@ SHORT = {
     "finish": "Wrap up: summary(required)+attach[],pr,sha,dn[],cost{in,out,usd,model},tests,met[{n,note,ref}],lesson,lt; then st=done | review=<who> | to=<who>,next. Gates and the card's check: lines are tested first.",
     "inbox": "Notifications (unread). Reading marks them read (ack=0 to peek). wait<=30 long-polls. Prefer briefing.",
     "claim": "Claim task id (ttl min): you become assignee, todo->in_progress. 409 claimed if held.",
-    "set_task": "Patch task id. Keys: t d st pr(1-4) as k s bl bb lb ch pu sha dp pt ty pa dn cr tg po(state of play) nd mk ver. ver=v you read (409 on conflict). dn=ticked checklist idx.",
+    "set_task": "Patch task id. Keys: t d st pr(1-4) as k s bl bb lb ch pu sha dp pt ty pa dn cr tg po(state of play) nd mk do hc sk rb ver. ver=v you read (409 on conflict). dn=ticked checklist idx. Ship boards: do=deploy owner, hc/sk/rb=health/smoke/rollback evidence for verified.",
     "add_task": "Create task. Keys: b(board) t d st pr as('auto'=route) k(human|agent) s bl bb lb ch pu sha dp pt ty(epic|story|task|bug|spike|chore) pa(parent id: an epic, or a story under an epic) ac pl rg.",
     "tasks": "List tasks (default 25, table form). Filters: b tm bs s st(csv|open) as(~contains) k lb ch q ready=1 ty parent; fields=t,st,pr; limit offset d=1.",
     "task": "One task. brief=1 (~60 tokens, has po = state of play, ev) | since=ev (only what changed) | ctx=1 (docs, comments, attachments, reviews) | default full.",

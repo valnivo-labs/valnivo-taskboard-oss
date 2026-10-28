@@ -87,7 +87,7 @@ button.preset.on{background:var(--tint);border-color:var(--pri);color:var(--pri)
 .col h3 b{margin-left:auto;font:500 11px var(--mono);background:var(--surface);border-radius:99px;padding:0 8px;line-height:20px;color:var(--fg)}
 .col h3 .add{height:24px;width:24px;padding:0;border:0;background:transparent;color:var(--mut);font-size:16px;border-radius:8px}
 .col h3 .add:hover{background:var(--surface);color:var(--pri)}
-.col[data-s=backlog]{--sc:#939896}.col[data-s=todo]{--sc:#326bae}.col[data-s=in_progress]{--sc:#ba5c33}.col[data-s=review]{--sc:#7d58c2}.col[data-s=blocked]{--sc:#e92020}.col[data-s=done]{--sc:#00805c}.col[data-s=declined]{--sc:#707573}
+.col[data-s=backlog]{--sc:#939896}.col[data-s=todo]{--sc:#326bae}.col[data-s=in_progress]{--sc:#ba5c33}.col[data-s=review]{--sc:#7d58c2}.col[data-s=approved]{--sc:#4f8f9c}.col[data-s=deploying]{--sc:#c9892b}.col[data-s=verified]{--sc:#2f9e7a}.col[data-s=blocked]{--sc:#e92020}.col[data-s=done]{--sc:#00805c}.col[data-s=declined]{--sc:#707573}
 .cards{display:flex;flex-direction:column;gap:10px;min-height:56px}
 .none{border:1.5px dashed var(--bd);border-radius:var(--r);color:var(--mut2);text-align:center;padding:18px 8px;font-size:12px;margin:0}
 .card{position:relative;display:flex;flex-direction:column;gap:8px;background:var(--surface);border-radius:var(--r);padding:12px;box-shadow:0 0 0 1px var(--bd2),var(--sh1);cursor:grab;min-width:0;transition:box-shadow .14s}
