@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS spec_revs(id INTEGER PRIMARY KEY, spec_id INTEGER NOT
 CREATE INDEX IF NOT EXISTS ix_sr_spec ON spec_revs(spec_id, rev);
 CREATE TABLE IF NOT EXISTS tokens(id INTEGER PRIMARY KEY, name TEXT NOT NULL, hash TEXT NOT NULL UNIQUE, role TEXT DEFAULT 'agent',
   created TEXT DEFAULT CURRENT_TIMESTAMP, used TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS roles(name TEXT PRIMARY KEY, perms TEXT DEFAULT '', builtin INTEGER DEFAULT 0, created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS templates(id INTEGER PRIMARY KEY, board_id INTEGER REFERENCES boards(id) ON DELETE CASCADE, name TEXT NOT NULL,
   title TEXT DEFAULT '', description TEXT DEFAULT '', assignee TEXT DEFAULT '', kind TEXT DEFAULT 'agent', priority INTEGER DEFAULT 3,
@@ -251,8 +252,8 @@ def check_public_url(url):
 
 
 class ApiError(Exception):
-    def __init__(self, code, status=400, field=None):
-        self.code, self.status, self.field = code, status, field
+    def __init__(self, code, status=400, field=None, msg=""):
+        self.code, self.status, self.field, self.msg = code, status, field, msg
 
 
 
@@ -398,7 +399,7 @@ def _chain(eid):
 
 def audit_verify(role):
     """Walk the chain: every hashed event must hash to its stored value and point at the hash before it."""
-    if not _priv(role):
+    if not can(role, "audit"):
         raise ApiError("forbidden", 403)
     n, prev, first, bad = 0, None, None, None
     for e in db.execute("SELECT id, ts, actor, type, payload, h, hp FROM events WHERE h!='' ORDER BY id"):
@@ -912,7 +913,7 @@ def crud(actor, method, table, rid, body, q, full):
                     raise ApiError("missing", 400, "dr")
                 check_hier(0, d.get("type", "task"), d.get("parent"), d["board_id"])
                 check_limits(d.get("parent"), d["board_id"])
-                if "self_assign_only" in (board_rules(d["board_id"]) | set(PRESETS.get(d.get("rigor") or "", {"rules": []})["rules"])) and getattr(_ctx, "role", "admin") not in ("admin", "supervisor") and str(d.get("assignee") or "").lower() not in ("", "auto", (actor or "").lower()):
+                if "self_assign_only" in (board_rules(d["board_id"]) | set(PRESETS.get(d.get("rigor") or "", {"rules": []})["rules"])) and not can(getattr(_ctx, "role", "admin"), "assign.any") and str(d.get("assignee") or "").lower() not in ("", "auto", (actor or "").lower()):
                     raise ApiError("forbidden", 403, "as")
                 _pol = board_policy(d["board_id"])
                 if "require_parent" in (board_rules(d["board_id"]) | set(PRESETS.get(d.get("rigor") or "", {"rules": []})["rules"])) and d.get("type", "task") in LEAF_TYPES and not d.get("parent"):
@@ -976,7 +977,7 @@ def crud(actor, method, table, rid, body, q, full):
                 if "status" in d and d["status"] != old["status"]:
                     _wip = check_wip(old["board_id"], d["status"], tid=rid, force=body.get("force"))
                     check_start(old, d["status"])
-                if "assignee" in d and d["assignee"] and "self_assign_only" in task_rules(old) and getattr(_ctx, "role", "admin") not in ("admin", "supervisor") and d["assignee"].lower() not in ((actor or "").lower(), (old["assignee"] or "").lower()):
+                if "assignee" in d and d["assignee"] and "self_assign_only" in task_rules(old) and not can(getattr(_ctx, "role", "admin"), "assign.any") and d["assignee"].lower() not in ((actor or "").lower(), (old["assignee"] or "").lower()):
                     raise ApiError("forbidden", 403, "as")
                 if "parent" in d and d["parent"] and d["parent"] != old["parent"]:
                     check_limits(d["parent"], old["board_id"])
@@ -1486,7 +1487,7 @@ def policy_view(q):
 
 def board_policy_set(actor, role, bid, body):
     """Owner, admin or supervisor chooses how strict a board is."""
-    if not _priv(role):
+    if not can(role, "policy"):
         raise ApiError("forbidden", 403)
     with lock:
         r = rows("SELECT method, cfg FROM boards WHERE id=?", (bid,))
@@ -1519,7 +1520,7 @@ def check_start(t, new_status, claiming=False):
 
 def check_holder(actor, role, tid):
     """With the setting holder_only=1, a task that someone currently holds (a live claim) can only be changed by that holder, a supervisor or an admin."""
-    if _priv(role):
+    if can(role, "override"):
         return
     r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
     if r and "holder_only" in task_rules(r[0]) and r[0]["claimed_by"] and r[0]["claim_until"] > now_s() and r[0]["claimed_by"].lower() != (actor or "").lower():
@@ -1600,7 +1601,7 @@ def check_move(role, tid, body):
     r = rows("SELECT * FROM tasks WHERE id=?", (tid,))
     if not r or r[0]["status"] == new or new not in MOVES or "strict_moves" not in task_rules(r[0]):
         return
-    if new not in MOVES.get(r[0]["status"], set()) and not (_priv(role) and body.get("force")):
+    if new not in MOVES.get(r[0]["status"], set()) and not (can(role, "force") and body.get("force")):
         raise ApiError("move", 409, "%s>%s" % (r[0]["status"], new))
 
 
@@ -1678,7 +1679,7 @@ def task_stage(actor, role, tid, body):
             raise ApiError("bad", 400, "st")
         s = ss[idx]
         me = " ".join(str(body.get("as") or actor or "").split())
-        if me.lower() != (t["assignee"] or "").lower() and not _priv(role):
+        if me.lower() != (t["assignee"] or "").lower() and not can(role, "override"):
             raise ApiError("holder", 403, t["assignee"] or "")
         if s["gate"] == "human":
             raise ApiError("gate", 409, "approval")            # a human gate only moves on an approval decision
@@ -2042,7 +2043,7 @@ def evidence_set(actor, role, tid, body, items=None):
         raise ApiError("nf", 404)
     t = t[0]
     me = " ".join(str(body.get("as") or actor or "").split())
-    if not _priv(role) and me.lower() not in {(t["assignee"] or "").lower(), (t["claimed_by"] or "").lower()} - {""}:
+    if not can(role, "override") and me.lower() not in {(t["assignee"] or "").lower(), (t["claimed_by"] or "").lower()} - {""}:
         raise ApiError("forbidden", 403)
     valid = {i for i, _ in human_criteria(t["accept"])}
     got = items if items is not None else [body]
@@ -2197,7 +2198,7 @@ NODE_KEYS = ("machine", "version", "agents", "running", "caps", "dispatch", "quo
 
 def node_report(actor, role, body):
     """A machine that runs agents (a bridge) tells the board it is alive and what it is doing. One row per machine, replaced on every report."""
-    if role == "viewer":
+    if not can(role, "write"):
         raise ApiError("forbidden", 403)
     name = " ".join(str(body.get("name") or body.get("n") or "").split())[:60]
     if not name:
@@ -2282,8 +2283,8 @@ def system_get(q, role):
     long_c = db.execute("SELECT COUNT(*) FROM comments WHERE ts>=? AND LENGTH(body)>1500", (since,)).fetchone()[0]
     out = {"days": days, "nodes": nodes_list()["i"], "quota": quota_view(), "series": series, "spend": usage_history(days), "long_comments": long_c, "quality": quality_list(),
            "runs": {"total": len(runs), "by": sorted(by.values(), key=lambda e: -e["n"]), "with_cost": with_cost},
-           "accept": {"done_with_criteria": ac["n"] or 0, "verified": int(ac["v"] or 0)}, "receipts": rec, "assure": assure_view()}
-    if _priv(role):
+           "accept": {"done_with_criteria": ac["n"] or 0, "verified": int(ac["v"] or 0)}, "receipts": rec, "act": activity_list({}, role)["i"], "assure": assure_view()}
+    if can(role, "audit"):
         c = audit_verify(role)
         out["chain"] = {"ok": c["ok"], "n": c["n"], **({"broken": c["broken"]} if not c["ok"] else {})}
     return out
@@ -2401,8 +2402,10 @@ def task_activity(tid):
 
 def supervisor_names():
     names = {x.strip() for x in get_setting("supervisors").split(",") if x.strip()}
-    names |= {n for n, r in TOKENS.values() if r == "supervisor"}
-    names |= {r["name"] for r in rows("SELECT name FROM tokens WHERE role='supervisor'")}
+    rs = [n for n in ROLE_PERMS if can(n, "escalations.receive")]
+    names |= {n for n, r in TOKENS.values() if r in rs}
+    if rs:
+        names |= {r["name"] for r in rows("SELECT name FROM tokens WHERE role IN (%s)" % ",".join("?" * len(rs)), rs)}
     return names
 
 
@@ -2714,7 +2717,7 @@ def _wake_send(a, unread, ready):
 
 
 def wake_now(actor, role, body):
-    if not _priv(role):
+    if not can(role, "wake"):
         raise ApiError("forbidden", 403)
     name = " ".join(str(body.get("n") or body.get("name") or "").split())
     r = rows("SELECT * FROM agents WHERE name=?", (name,))
@@ -3186,7 +3189,7 @@ def run_end(actor, role, rid, body):
         if not r:
             raise ApiError("nf", 404)
         r = r[0]
-        if r["agent"].lower() != (me or "").lower() and not _priv(role):
+        if r["agent"].lower() != (me or "").lower() and not can(role, "override"):
             raise ApiError("forbidden", 403)
         if r["status"] != "running":
             return run_out(r)
@@ -3208,6 +3211,77 @@ def run_end(actor, role, rid, body):
     if r["task_id"] and (st != "ok" or body.get("comment")):
         comment_add(actor, r["task_id"], {"c": "Run %s (%s, %ds)%s" % (st, r["runtime"] or "job", _secs(r), (": " + outcome[:300]) if outcome else "")}, notify_assignee=False)
     return run_out(rows("SELECT * FROM runs WHERE id=?", (rid,))[0])
+
+
+_TEST_AGENT = re.compile(r"selftest|smoke|e2e", re.I)
+
+
+def agent_items(ag, n, priv, scope):
+    """Newest-first items one agent did: runs, field changes and comments, each tied to a task. Audit-only fields (via, before/after, run log) only for supervisor/admin."""
+    ok = lambda b: scope is None or (b is not None and int(b) in scope)
+    out = []
+    for r in rows("SELECT r.*, t.title tt FROM runs r LEFT JOIN tasks t ON t.id=r.task_id WHERE r.agent=? COLLATE NOCASE ORDER BY r.id DESC LIMIT ?", (ag, n * 3)):
+        if r["task_id"] and ok(r["board_id"]):
+            it = {"tk": r["task_id"], "t": r["tt"] or "", "ty": "run", "st": r["status"], "m": (r["outcome"] or r["job"] or "")[:160], "ts": r["ended"] or r["started"]}
+            if priv and r["log_url"]:
+                it["log"] = r["log_url"]
+            out.append(it)
+    for e in rows("SELECT e.ts, e.type, e.payload, t.title tt, t.board_id tb FROM events e JOIN tasks t ON t.id=CAST(json_extract(e.payload,'$.id') AS INTEGER) "
+                  "WHERE e.actor=? COLLATE NOCASE AND e.type LIKE 'task.%' AND e.type!='task.commented' ORDER BY e.id DESC LIMIT ?", (ag, n * 4)):
+        if not ok(e["tb"]):
+            continue
+        try:
+            pl = json.loads(e["payload"])
+        except ValueError:
+            continue
+        d = pl.get("d") or {}
+        if e["type"] == "task.created":
+            ty, m = "created", "created"
+        else:
+            parts = ["%s -> %s" % (_ACT_LABEL[k], v if v not in ("", None, []) else "cleared") for k, v in d.items() if k in _ACT_LABEL]
+            if not parts:
+                continue
+            ty, m = ("status" if "st" in d else "edit"), ", ".join(parts)
+        it = {"tk": pl["id"], "t": e["tt"], "ty": ty, "m": m[:160], "ts": e["ts"]}
+        if priv and pl.get("via"):
+            it["via"] = pl["via"]
+        out.append(it)
+    for c in rows("SELECT c.body, c.ts, c.task_id, t.title tt, t.board_id tb FROM comments c JOIN tasks t ON t.id=c.task_id WHERE c.actor=? COLLATE NOCASE ORDER BY c.id DESC LIMIT ?", (ag, n * 2)):
+        if ok(c["tb"]):
+            out.append({"tk": c["task_id"], "t": c["tt"], "ty": "comment", "m": " ".join(c["body"].split())[:160], "ts": c["ts"]})
+    out.sort(key=lambda x: x["ts"], reverse=True)
+    return out[:n]
+
+
+def activity_list(q, role):
+    """GET /activity?by=agent[&n=10]: per agent last task, action and time (+ last seen); with by= that agent's last n items."""
+    priv, scope, now = can(role, "activity.all"), allowed_boards(), time.time()
+    one = _qv(q, "by", "ag", "as")
+    n = max(1, min(qint(q, "n", 10) or 10, 50))
+    seen = {r["name"]: r["last_seen"] for r in rows("SELECT name, last_seen FROM agents")}
+    if one:
+        names = [next((k for k in seen if k.lower() == one.lower()), one)]
+    else:
+        names = list(seen)
+        known = {k.lower() for k in names}
+        names += [r["actor"] for r in rows("SELECT DISTINCT actor FROM events WHERE actor!='' AND actor NOT IN ('system','wake','nudge-cron','recurring','git','cost') ORDER BY id DESC LIMIT 60") if r["actor"].lower() not in known][:20]
+    res = []
+    for a in names:
+        its = agent_items(a, n if one else 1, priv, scope)
+        o = {"ag": a}
+        if seen.get(a):
+            o["seen"] = seen[a]
+            o["age"] = int(max(0, now - _ts(seen[a])))
+        if its:
+            o["last"] = its[0]
+        if one:
+            o["i"] = its
+        if _TEST_AGENT.search(a):
+            o["tst"] = 1
+        res.append(o)
+    stamp = lambda o: (o.get("last") or {}).get("ts") or o.get("seen") or ""
+    res.sort(key=lambda o: (1 if "last" in o else 0, stamp(o)), reverse=True)
+    return {"n": len(res), "i": res if one else res[:30]}
 
 
 def runs_list(q):
@@ -3260,7 +3334,7 @@ def approval_request(actor, tid, body):
 
 # ---------------------------------------------------------------- audit log: who changed what (admins and supervisors)
 def audit_get(q, role):
-    if not _priv(role):
+    if not can(role, "audit"):
         raise ApiError("forbidden", 403)
     wh, ar = ["id>?"], [qint(q, "since", 0) or 0]
     if _qv(q, "actor", "by"):
@@ -3310,7 +3384,7 @@ def say(actor, role, body):
     sent = []
     with lock:
         if "*" in to:
-            if not _priv(role):
+            if not can(role, "messages.broadcast"):
                 raise ApiError("forbidden", 403)
             to = [r["name"] for r in rows("SELECT name FROM agents ORDER BY name LIMIT 50")]
         bid = None
@@ -3338,7 +3412,7 @@ def messages_get(actor, role, q):
     me, other = _qv(q, "as", "agent"), _qv(q, "with")
     lim = max(1, min(qint(q, "limit", 30) or 30, 200))
     wh, ar = ["id>?"], [qint(q, "since", 0) or 0]
-    if not _priv(role):
+    if not can(role, "messages.all"):
         me = actor if actor and actor.lower() not in GENERIC_ACTORS else me
         if not me:
             raise ApiError("missing", 400, "as")
@@ -3561,7 +3635,7 @@ def _ident(actor, body):
     """Who is acting. A named, non-privileged token is always itself (cannot impersonate); shared/generic or admin/supervisor tokens may say `as`."""
     named = bool(actor) and actor.lower() not in GENERIC_ACTORS
     asn = " ".join(str(body.get("as") or body.get("agent") or "").split())[:60]
-    if named and not (asn and _priv(getattr(_ctx, "role", "agent"))):
+    if named and not (asn and can(getattr(_ctx, "role", "agent"), "act_as")):
         return actor
     return asn or (actor if named else "")
 
@@ -3573,8 +3647,159 @@ def _me(actor, body):
     return n
 
 
-def _priv(role):
-    return role in ("admin", "supervisor")
+# ---------------------------------------------------------------- roles: a role is a named set of permissions (table `roles`); every access check asks can(role, perm)
+PERMS = {
+    "read": "Read boards, tasks and everything else (GET)",
+    "write": "Create and change tasks, comments, sprints and other content (any non-GET call)",
+    "boards.delete": "Delete boards",
+    "sprints.delete": "Delete sprints",
+    "admin.settings": "Admin tab: settings, backups, usage, webhooks (/admin, /settings)",
+    "tokens": "Create, revoke, limit and change the role of access tokens",
+    "roles": "Create, edit and delete roles",
+    "import": "Import boards and tasks",
+    "export": "Export boards and tasks (JSON, CSV)",
+    "chats": "Manage chat notification channels",
+    "assure.report": "Report as the outside witness (Assure)",
+    "audit": "Read the audit log, its chain check, the event feed and system view",
+    "snapshot": "Write and read the board snapshot",
+    "escalations.receive": "Receive escalations (esc.* inbox items: declined, blocked, stale, red sprint)",
+    "approvals": "Decide proposals and lessons",
+    "wake": "Wake agents now",
+    "verify.all": "See every task waiting for a check, not only your own",
+    "messages.broadcast": "Send a message to everyone",
+    "messages.all": "Read every message, not only your own",
+    "activity.all": "See last activity of every agent on every board",
+    "override": "Act on other agents' work: release their claims and locks, answer their asks, decide their reviews, move held tasks, record evidence, lower rigor",
+    "force": "Force a task move, a WIP limit, a sprint close or a deploy past a gate",
+    "assign.any": "Assign tasks to anyone on boards where agents may only assign to themselves",
+    "act_as": "Act as another agent by passing `as`",
+    "agents.manage": "Edit any agent's profile, skills, webhook and quotas",
+    "policy": "Choose how strict a board is",
+    "nodes.admit": "Admit or refuse machines (nodes)",
+    "envs.freeze": "Freeze and unfreeze environments",
+    "mcp.coord": "Coordination tools in the MCP connector by default",
+}
+# what each built-in role could do before roles were data: exactly this
+BUILTIN_PERMS = {
+    "viewer": {"read"},
+    "agent": {"read", "write"},
+    "supervisor": {"read", "write", "sprints.delete", "audit", "snapshot", "escalations.receive", "approvals", "wake", "verify.all", "messages.broadcast", "messages.all",
+                   "activity.all", "override", "force", "assign.any", "act_as", "agents.manage", "policy", "nodes.admit", "envs.freeze", "mcp.coord"},
+}
+BUILTIN_PERMS["admin"] = set(PERMS) - {"escalations.receive"}
+ADMIN_REQUIRED = frozenset(BUILTIN_PERMS["admin"])     # the admin role can never lose these (the receive-only escalation flag is optional)
+ROLE_PERMS = {}
+ROLE_RE = re.compile(r"^[a-z][a-z0-9_-]{1,29}$")
+
+
+def roles_load():
+    ROLE_PERMS.clear()
+    for r in db.execute("SELECT name, perms FROM roles").fetchall():
+        ps = {x for x in (r["perms"] or "").split(",") if x in PERMS}
+        ROLE_PERMS[r["name"]] = (ps | ADMIN_REQUIRED) if r["name"] == "admin" else ps
+
+
+def roles_init():
+    for n in ROLES:
+        db.execute("INSERT OR IGNORE INTO roles(name, perms, builtin) VALUES(?,?,1)", (n, ",".join(sorted(BUILTIN_PERMS[n]))))
+    roles_load()
+
+
+def can(role, perm):
+    return perm in ROLE_PERMS.get(role, ())
+
+
+def need(role, perm):
+    if not can(role, perm):
+        raise ApiError("forbidden", 403)
+
+
+def role_exists(role):
+    return role in ROLE_PERMS
+
+
+def role_use(name):
+    return db.execute("SELECT COUNT(*) FROM tokens WHERE role=?", (name,)).fetchone()[0] + sum(1 for _n, _r in TOKENS.values() if _r == name)
+
+
+def roles_list():
+    out = []
+    for r in rows("SELECT name, builtin FROM roles ORDER BY builtin DESC, name"):
+        ps = sorted(ROLE_PERMS.get(r["name"], ()))
+        out.append({"n": r["name"], "p": ps, "b": r["builtin"], "use": role_use(r["name"])})
+    return {"perms": [{"k": k, "d": d} for k, d in PERMS.items()], "req": sorted(ADMIN_REQUIRED), "n": len(out), "i": out}
+
+
+def _role_perms(v):
+    if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+        raise ApiError("bad", 400, "p")
+    ps = {x.strip() for x in v if x.strip()}
+    if ps - set(PERMS):
+        raise ApiError("bad", 400, "p", "unknown permission: " + ", ".join(sorted(ps - set(PERMS))))
+    if "read" not in ps:
+        raise ApiError("bad", 400, "p", "every role needs read")
+    return ps
+
+
+def role_save(body, name=None):
+    """Create (POST) or change (PATCH /roles/{name}) a role. Admin cannot lose its admin permissions. Audited."""
+    actor = getattr(_ctx, "actor", "") or "admin"
+    with lock:
+        if name is None:
+            name = str(body.get("n") or body.get("name") or "").strip().lower()
+            if not ROLE_RE.match(name):
+                raise ApiError("bad", 400, "n")
+            if name in ROLE_PERMS:
+                raise ApiError("exists", 409, "n")
+            ps = _role_perms(body.get("p", body.get("perms", [])) if ("p" in body or "perms" in body) else ["read"])
+            db.execute("INSERT INTO roles(name, perms, builtin) VALUES(?,?,0)", (name, ",".join(sorted(ps))))
+            roles_load()
+            emit(actor, "role.created", None, None, {"n": name, "p": ",".join(sorted(ps))})
+            return {"n": name, "p": sorted(ps)}
+        if name not in ROLE_PERMS:
+            raise ApiError("nf", 404)
+        ps = _role_perms(body.get("p", body.get("perms")))
+        if name == "admin" and ADMIN_REQUIRED - ps:
+            raise ApiError("bad", 400, "p", "admin cannot lose: " + ", ".join(sorted(ADMIN_REQUIRED - ps)))
+        old = ROLE_PERMS[name]
+        db.execute("UPDATE roles SET perms=? WHERE name=?", (",".join(sorted(ps)), name))
+        roles_load()
+        if old != ps:
+            emit(actor, "role.updated", None, None, {"n": name, "add": ",".join(sorted(ps - old)), "rm": ",".join(sorted(old - ps))})
+    return {"n": name, "p": sorted(ps)}
+
+
+def role_delete(name):
+    actor = getattr(_ctx, "actor", "") or "admin"
+    with lock:
+        r = db.execute("SELECT builtin FROM roles WHERE name=?", (name,)).fetchone()
+        if not r:
+            raise ApiError("nf", 404)
+        if r["builtin"] or name == "admin":
+            raise ApiError("builtin", 409, "n")
+        if role_use(name):
+            raise ApiError("in_use", 409, "n")
+        db.execute("DELETE FROM roles WHERE name=?", (name,))
+        roles_load()
+        emit(actor, "role.deleted", None, None, {"n": name})
+    return {"n": name, "x": 1}
+
+
+def route_perm(method, path):
+    """The permission an admin-area route needs, or None."""
+    for pre, perm in (("/api/admin", "admin.settings"), ("/api/settings", "admin.settings"), ("/api/tokens", "tokens"), ("/api/roles", "roles"),
+                      ("/api/import", "import"), ("/api/chats", "chats"), ("/api/export", "export")):
+        if path.startswith(pre):
+            return perm
+    if method == "DELETE":
+        if path.startswith("/api/boards/"):
+            return "boards.delete"
+        if path.startswith("/api/sprints/"):
+            return "sprints.delete"
+    return None
+
+
+roles_init()
 
 
 def allowed_boards():
@@ -3692,7 +3917,7 @@ def release_task(actor, role, tid, body):
             raise ApiError("nf", 404)
         t = r[0]
         me = _ident(actor, body)
-        if t["claimed_by"] and t["claimed_by"].lower() != me.lower() and not _priv(role):
+        if t["claimed_by"] and t["claimed_by"].lower() != me.lower() and not can(role, "override"):
             raise ApiError("forbidden", 403)
         db.execute("UPDATE tasks SET claimed_by='', claim_until='', version=COALESCE(version,1)+1, updated=CURRENT_TIMESTAMP WHERE id=?", (tid,))
         emit(actor, "task.updated", tid, t["board_id"], {"cb": ""})
@@ -3754,7 +3979,7 @@ def lock_release(actor, role, name, body):
         r = db.execute("SELECT * FROM locks WHERE name=?", (name,)).fetchone()
         if not r:
             return {"name": name, "released": 0}
-        if r["owner"].lower() != me.lower() and not _priv(role):
+        if r["owner"].lower() != me.lower() and not can(role, "override"):
             raise ApiError("forbidden", 403)
         db.execute("DELETE FROM locks WHERE name=?", (name,))
     return {"name": name, "released": 1}
@@ -3803,7 +4028,7 @@ def ask_answer(actor, role, aid, body):
         r = r[0]
         if r["status"] != "open":
             raise ApiError("bad", 400, "st")
-        if r["to_agent"].lower() != me.lower() and not _priv(role):
+        if r["to_agent"].lower() != me.lower() and not can(role, "override"):
             raise ApiError("forbidden", 403)
         db.execute("UPDATE asks SET answer=?, status='answered', answered=? WHERE id=?", (a, now_s(), aid))
         notify(r["from_agent"], "ask.answered", me, r["task_id"], r["board_id"], "%s answered your question #%d: %s" % (me, aid, a[:200]), {"ask": aid})
@@ -3816,7 +4041,7 @@ def ask_cancel(actor, role, aid, body):
         r = rows("SELECT * FROM asks WHERE id=?", (aid,))
         if not r:
             raise ApiError("nf", 404)
-        if r[0]["from_agent"].lower() != me.lower() and not _priv(role):
+        if r[0]["from_agent"].lower() != me.lower() and not can(role, "override"):
             raise ApiError("forbidden", 403)
         db.execute("UPDATE asks SET status='cancelled' WHERE id=? AND status='open'", (aid,))
     return {"id": aid, "st": "cancelled"}
@@ -3883,7 +4108,7 @@ def review_decide(actor, role, rid, body):
         r = r[0]
         if r["status"] != "pending":
             raise ApiError("bad", 400, "st")
-        if r["reviewer"].lower() != me.lower() and not _priv(role):
+        if r["reviewer"].lower() != me.lower() and not can(role, "override"):
             raise ApiError("forbidden", 403)
         st = "approved" if dec == "approve" else "changes"
         db.execute("UPDATE reviews SET status=?, decision_note=?, decided=? WHERE id=?", (st, note, now_s(), rid))
@@ -3974,9 +4199,9 @@ def verify_queue(q, actor, role):
         if not _board_ok(t["board_id"]):
             continue
         who = suggest_verifier(t)
-        if me and not _priv(role) and (who or "").lower() != me.lower():
+        if me and not can(role, "verify.all") and (who or "").lower() != me.lower():
             continue
-        if me and _priv(role) and _qv(q, "mine") and (who or "").lower() != me.lower():
+        if me and can(role, "verify.all") and _qv(q, "mine") and (who or "").lower() != me.lower():
             continue
         out.append({"id": t["id"], "t": t["title"][:80], "st": t["status"], "as": t["assignee"] or None, "vf": who, "ac": t["accept"].splitlines()[:6]})
     return {"n": len(out), "i": out[:20]}
@@ -4141,7 +4366,7 @@ def proposals_list(q):
 
 def proposal_decide(actor, role, pid, body):
     """A supervisor or admin accepts (the proposal becomes a task, optionally assigned) or rejects it with a reason."""
-    if not _priv(role):
+    if not can(role, "approvals"):
         raise ApiError("forbidden", 403)
     dec = str(body.get("decision") or "").lower()
     note = sg(" ".join(str(body.get("note") or "").split())[:300])
@@ -4209,7 +4434,7 @@ def lessons_list(q):
 
 
 def lesson_decide(actor, role, lid, body):
-    if not _priv(role):
+    if not can(role, "approvals"):
         raise ApiError("forbidden", 403)
     dec = str(body.get("decision") or "").lower()
     note = sg(" ".join(str(body.get("note") or "").split())[:300])
@@ -4244,7 +4469,7 @@ def task_wait(actor, role, tid, body):
         raise ApiError("nf", 404)
     t = t[0]
     me = " ".join(str(body.get("as") or actor or "").split())
-    if not _priv(role) and me.lower() not in {(t["assignee"] or "").lower(), (t["claimed_by"] or "").lower()} - {""}:
+    if not can(role, "override") and me.lower() not in {(t["assignee"] or "").lower(), (t["claimed_by"] or "").lower()} - {""}:
         raise ApiError("forbidden", 403)
     if body.get("clear") or not body.get("kind"):
         with lock:
@@ -4308,7 +4533,7 @@ def wait_tick(actor="wake"):
 
 # ---- machines: admission and retirement, health thresholds
 def node_admit(actor, role, name, action):
-    if not _priv(role):
+    if not can(role, "nodes.admit"):
         raise ApiError("forbidden", 403)
     r = rows("SELECT * FROM nodes WHERE name=?", (name,))
     if not r:
@@ -4420,7 +4645,7 @@ def intake_run(p):
     except ValueError:
         senders = {}
     who = senders.get(sender)
-    if not isinstance(who, dict) or not who.get("as") or who.get("role") not in ("viewer", "agent", "supervisor", "admin"):
+    if not isinstance(who, dict) or not who.get("as") or not role_exists(who.get("role")):
         raise ApiError("sender", 403)
     if not mid or not text:
         raise ApiError("missing", 400, "message_id" if not mid else "text")
@@ -4447,7 +4672,7 @@ def intake_run(p):
             raise ApiError("nf", 404)
         t = t[0]
         out = {"intent": "status", "tk": tid, "reply": "#%d %s [%s]%s%s" % (tid, t["title"][:80], t["status"], (" held by " + t["assignee"]) if t["assignee"] else " unassigned", (" - " + t["play"][:120]) if t["play"] else "")}
-    elif role == "viewer":
+    elif not can(role, "write"):
         raise ApiError("forbidden", 403)
     elif cmd == "new":
         if not rest:
@@ -4470,7 +4695,7 @@ def intake_run(p):
         r = task_finish(actor, role, tid, {"summary": body or "Marked done from chat", "as": actor})
         out = {"intent": "done", "tk": tid, "reply": "#%d is now %s" % (tid, r["st"])}
     elif cmd == "assign":
-        if not _priv(role):
+        if not can(role, "assign.any"):
             raise ApiError("forbidden", 403)
         tid, who2 = tid_of(rest)
         if not who2:
@@ -4512,7 +4737,7 @@ def _witness(actor):
 
 def assure_report(actor, role, body):
     """The outside witness says how far it has got. Only the named witness (or an admin) may; the token itself stays a viewer."""
-    if role != "admin" and not _witness(actor):
+    if not can(role, "assure.report") and not _witness(actor):
         raise ApiError("forbidden", 403)
     keep = {k: body[k] for k in ("events", "head", "findings", "checkpoints", "signed", "last_checkpoint", "ok", "version") if k in body}
     if not isinstance(keep.get("events", 0), int) or not isinstance(keep.get("findings", 0), int):
@@ -4560,7 +4785,7 @@ def assure_tick(actor):
 
 def events_feed(q, role, actor=""):
     """Raw audit events with their chain hashes, for an independent witness: since=<id> (exclusive), limit (default 500, max 1000), or ids=1,2,3."""
-    if not _priv(role) and (actor or "").lower() not in {x.strip().lower() for x in get_setting("witness_names").split(",") if x.strip()}:
+    if not can(role, "audit") and (actor or "").lower() not in {x.strip().lower() for x in get_setting("witness_names").split(",") if x.strip()}:
         raise ApiError("forbidden", 403)
     ids = [int(x) for x in re.findall(r"\d+", _qv(q, "ids") or "")][:500]
     if ids:
@@ -4638,7 +4863,7 @@ def env_deploy(actor, role, body):
     sha = str(body.get("sha") or "").strip()[:200]
     with lock:
         r = db.execute("SELECT * FROM envs WHERE name=?", (name,)).fetchone()
-        if r and r["frozen_until"] > now_s() and not (body.get("force") and _priv(role)):
+        if r and r["frozen_until"] > now_s() and not (body.get("force") and can(role, "force")):
             raise ApiError("frozen", 423, r["frozen_until"])
         lk = db.execute("SELECT * FROM locks WHERE name=? AND expires>=?", ("env:" + name, now_s())).fetchone()
         if lk and lk["owner"].lower() != me.lower():
@@ -4896,7 +5121,7 @@ def check_wip(bid, status, tid=None, force=False):
     n = db.execute("SELECT COUNT(*) FROM tasks WHERE board_id=? AND status=? AND id!=?", (bid, status, tid or 0)).fetchone()[0]
     if n < lim:
         return None
-    if cfg.get("wip_mode") == "block" and not (force and _priv(getattr(_ctx, "role", "agent"))):
+    if cfg.get("wip_mode") == "block" and not (force and can(getattr(_ctx, "role", "agent"), "force")):
         raise ApiError("wip", 409, status)
     return "WIP limit for %s reached (%d of %d)" % (status, n + 1, lim)
 
@@ -5115,7 +5340,7 @@ def move_task(actor, tid, body):
     else:
         sprint = None
     kids = body.get("children", True) is not False
-    force = bool(body.get("force")) and _priv(getattr(_ctx, "role", "agent"))
+    force = bool(body.get("force")) and can(getattr(_ctx, "role", "agent"), "force")
     warns = []
     with lock:
         ids = [tid]
@@ -5918,6 +6143,10 @@ def token_create(body):
     has_b = "boards" in body or "bs" in body
     ids = _board_ids(body.get("boards", body.get("bs"))) if has_b else []
     if body.get("id"):
+        if body.get("role") is not None:
+            res = token_set_role(int(body["id"]), body["role"])
+            if not has_b:
+                return res
         with lock:
             r = db.execute("SELECT role FROM tokens WHERE id=?", (int(body["id"]),)).fetchone()
             if not r:
@@ -5930,7 +6159,7 @@ def token_create(body):
     role = body.get("role") or "agent"
     if not name:
         raise ApiError("missing", 400, "n")
-    if role not in ROLES:
+    if not role_exists(role):
         raise ApiError("bad", 400, "role")
     if ids and role == "admin":
         raise ApiError("bad", 400, "boards")
@@ -5938,6 +6167,29 @@ def token_create(body):
     with lock:
         db.execute("INSERT INTO tokens(name,hash,role,boards) VALUES(?,?,?,?)", (name, hashlib.sha256(tk.encode()).hexdigest(), role, ",".join(str(i) for i in ids)))
     return {"n": name, "role": role, "token": tk, **({"bs": ids} if ids else {}), "note": "shown once - store it now"}
+
+
+def token_set_role(tid, role):
+    """Change an existing token's role. Admin only (the route checks). The last admin (database + env tokens) cannot be demoted; an admin is never limited to boards. Audited."""
+    role = str(role or "").strip().lower()
+    if not role_exists(role):
+        raise ApiError("bad", 400, "role")
+    with lock:
+        r = db.execute("SELECT id, name, role FROM tokens WHERE id=?", (tid,)).fetchone()
+        if not r:
+            raise ApiError("nf", 404)
+        if r["role"] == role:
+            return {"id": tid, "n": r["name"], "role": role, "same": 1}
+        if can(r["role"], "tokens") and can(r["role"], "roles") and not (can(role, "tokens") and can(role, "roles")):
+            others = sum(db.execute("SELECT COUNT(*) FROM tokens WHERE role=? AND id!=?", (n, tid)).fetchone()[0] for n in ROLE_PERMS if can(n, "tokens") and can(n, "roles")) + sum(1 for _n, _r in TOKENS.values() if can(_r, "tokens") and can(_r, "roles"))
+            if others < 1:
+                raise ApiError("last_admin", 409, "role")
+        if role == "admin":
+            db.execute("UPDATE tokens SET role=?, boards='' WHERE id=?", (role, tid))
+        else:
+            db.execute("UPDATE tokens SET role=? WHERE id=?", (role, tid))
+        emit(getattr(_ctx, "actor", "") or "admin", "token.role", tid, None, {"n": r["name"], "from": r["role"], "to": role})
+    return {"id": tid, "n": r["name"], "role": role, "was": r["role"]}
 
 
 def tokens_list():
@@ -6329,8 +6581,8 @@ class H(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(b)
 
-    def err(self, code, status, field=None):
-        self.send_json(status, {"e": code, **({"f": field} if field else {})})
+    def err(self, code, status, field=None, msg=""):
+        self.send_json(status, {"e": code, **({"f": field} if field else {}), **({"m": msg} if msg else {})})
 
     def actor(self, query):
         self.role = "admin"
@@ -6476,7 +6728,7 @@ class H(BaseHTTPRequestHandler):
         tok = getattr(self, "tok", "") or "-"
         M._ctx.url, M._ctx.token, M._ctx.key = "http://127.0.0.1:%d" % self.server.server_address[1], tok, hashlib.sha256(tok.encode()).hexdigest()[:16]
         try:
-            outs = [M.handle(x, _qv(q, "tools") or ("core,coord" if _priv(self.role) else "core")) for x in msgs]
+            outs = [M.handle(x, _qv(q, "tools") or ("core,coord" if can(self.role, "mcp.coord") else "core")) for x in msgs]
         finally:
             M._ctx.url = M._ctx.token = M._ctx.key = None
         outs = [o for o in outs if o is not None]
@@ -6504,7 +6756,7 @@ class H(BaseHTTPRequestHandler):
             _ctx.sec, _ctx.via = 0, "chat"
             return self.send_json(200, intake_run(p))
         except ApiError as e:
-            return self.err(e.code, e.status, e.field)
+            return self.err(e.code, e.status, e.field, getattr(e, "msg", ""))
 
     def git_hook(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -6523,7 +6775,7 @@ class H(BaseHTTPRequestHandler):
             _ctx.role = "agent"
             return self.send_json(200, git_event(self.headers, p))
         except ApiError as e:
-            return self.err(e.code, e.status, e.field)
+            return self.err(e.code, e.status, e.field, getattr(e, "msg", ""))
 
     def read_body(self, limit=None):
         n = int(self.headers.get("Content-Length") or 0)
@@ -6596,11 +6848,11 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, {"ok": True, **res, "h": NUDGE_HOURS})
             if path == "/api/assure/report" and method == "POST":
                 return self.send_json(200, assure_report(actor, self.role, self.read_body()))
-            if self.role == "viewer" and method != "GET":
+            if not can(self.role, "write" if method != "GET" else "read"):
                 return self.err("forbidden", 403)
             self.scope_check(method, path, q)
-            if self.role != "admin" and (path.startswith(("/api/admin", "/api/tokens", "/api/settings", "/api/import", "/api/chats", "/api/export")) or
-                                         (method == "DELETE" and (re.match(r"/api/boards/", path) or (re.match(r"/api/sprints/", path) and self.role != "supervisor")))):
+            _rp = route_perm(method, path)
+            if _rp and not can(self.role, _rp):
                 return self.err("forbidden", 403)
             if path == "/api/tokens":
                 if method == "GET":
@@ -6609,6 +6861,19 @@ class H(BaseHTTPRequestHandler):
                     return self.send_json(201, token_create(self.read_body()))
                 if method == "DELETE":
                     return self.send_json(200, token_delete(qint(q, "id", 0)))
+            if path == "/api/roles":
+                if method == "GET":
+                    return self.send_json(200, roles_list())
+                if method == "POST":
+                    return self.send_json(201, role_save(self.read_body()))
+            mrl = re.match(r"/api/roles/([a-z][a-z0-9_-]*)$", path)
+            if mrl and method in ("PATCH", "PUT"):
+                return self.send_json(200, role_save(self.read_body(), mrl.group(1)))
+            if mrl and method == "DELETE":
+                return self.send_json(200, role_delete(mrl.group(1)))
+            mtk = re.match(r"/api/tokens/(\d+)$", path)
+            if mtk and method == "PATCH":
+                return self.send_json(200, token_set_role(int(mtk.group(1)), self.read_body().get("role")))
             if path == "/api/settings":
                 return self.send_json(200, settings_set(self.read_body()) if method == "POST" else settings_get())
             if path == "/api/admin/backup" and method == "POST":
@@ -6645,7 +6910,7 @@ class H(BaseHTTPRequestHandler):
             if ms and method == "POST":
                 body = self.read_body()
                 with lock:
-                    res = sprint_start(actor, int(ms.group(1))) if ms.group(2) == "start" else close_phase_aware(actor, int(ms.group(1)), body.get("to"), bool(body.get("force")) and _priv(self.role))
+                    res = sprint_start(actor, int(ms.group(1))) if ms.group(2) == "start" else close_phase_aware(actor, int(ms.group(1)), body.get("to"), bool(body.get("force")) and can(self.role, "force"))
                 return self.send_json(200, res)
             if path == "/api/specs":
                 if method == "GET":
@@ -6740,7 +7005,7 @@ class H(BaseHTTPRequestHandler):
                     return self.send_json(200, env_deploy(actor, self.role, self.read_body()))
             mev = re.fullmatch(r"/api/envs/([A-Za-z0-9._-]+)/(freeze|unfreeze)", path)
             if mev and method == "POST":
-                if self.role not in ("admin", "supervisor"):
+                if not can(self.role, "envs.freeze"):
                     return self.err("forbidden", 403)
                 return self.send_json(200, env_freeze(actor, mev.group(1), self.read_body(), mev.group(2) == "freeze"))
             if path == "/api/watch":
@@ -6805,6 +7070,8 @@ class H(BaseHTTPRequestHandler):
                 if not r_:
                     raise ApiError("nf", 404)
                 return self.send_json(200, run_out(r_[0]))
+            if path == "/api/activity" and method == "GET":
+                return self.send_json(200, activity_list(q, self.role))
             if path == "/api/audit" and method == "GET":
                 return self.send_json(200, audit_get(q, self.role))
             if path == "/api/tasks/move" and method == "POST":
@@ -6906,7 +7173,7 @@ class H(BaseHTTPRequestHandler):
             mnd = re.fullmatch(r"/api/nodes/([^/]+)/(admit|retire)", path)
             if mnd and method == "POST":
                 return self.send_json(200, node_admit(actor, self.role, unquote(mnd.group(1)), mnd.group(2)))
-            if path == "/api/snapshot" and method in ("GET", "POST") and _priv(self.role):
+            if path == "/api/snapshot" and method in ("GET", "POST") and can(self.role, "snapshot"):
                 return self.send_json(200, snapshot_write() if method == "POST" else {"generated_at": json.load(open(os.path.join(snapshot_dir(), "board.json")))["generated_at"] if os.path.exists(os.path.join(snapshot_dir(), "board.json")) else None, "dir": snapshot_dir()})
             if path == "/api/events/feed" and method == "GET":
                 return self.send_json(200, events_feed(q, self.role, actor))
@@ -7000,7 +7267,7 @@ class H(BaseHTTPRequestHandler):
                 except ValueError:
                     _c = {}
                 _stored = board_policy(rid)
-                if _c.get("policy") is None or not _priv(self.role):
+                if _c.get("policy") is None or not can(self.role, "policy"):
                     _c.pop("policy", None)
                     if _stored:
                         _c["policy"] = _stored
@@ -7010,14 +7277,14 @@ class H(BaseHTTPRequestHandler):
                 if method != "DELETE" and isinstance(body, dict):
                     check_move(self.role, rid, body)
                     _nr = body.get("rigor", body.get("rg"))
-                    if _nr is not None and not _priv(self.role):
+                    if _nr is not None and not can(self.role, "override"):
                         _cur = rows("SELECT rigor FROM tasks WHERE id=?", (rid,))
                         if _cur and RIGOR_RANK.get(str(_nr).strip().lower(), 0) < RIGOR_RANK.get(_cur[0]["rigor"] or "", 0):
                             raise ApiError("forbidden", 403, "rg")
             res = crud(actor, method, m.group(1), rid, body, q, full)
             self.send_json(201 if method == "POST" else 200, res, etag)
         except ApiError as e:
-            self.err(e.code, e.status, e.field)
+            self.err(e.code, e.status, e.field, getattr(e, "msg", ""))
         except sqlite3.IntegrityError:
             self.err("bad", 400, "ref")
         except (BrokenPipeError, ConnectionResetError):

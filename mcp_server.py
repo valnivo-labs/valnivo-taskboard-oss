@@ -104,6 +104,19 @@ def _views(a):
     return {"e": "bad", "f": "action"}
 
 
+def _roles(a):
+    act = a.pop("action", "list")
+    if act == "list":
+        return api("GET", "/roles")
+    if act == "create" and a.get("n"):
+        return api("POST", "/roles", a)
+    if act == "set" and a.get("n"):
+        return api("PATCH", "/roles/%s" % a["n"], {"p": a.get("p")})
+    if act == "delete" and a.get("n"):
+        return api("DELETE", "/roles/%s" % a["n"])
+    return {"e": "bad", "f": "action"}
+
+
 def _tokens(a):
     act = a.pop("action", "list")
     if act == "list":
@@ -114,6 +127,8 @@ def _tokens(a):
         return api("DELETE", "/tokens?id=%s" % a["id"])
     if act == "scope" and "id" in a:
         return api("POST", "/tokens", a)
+    if act == "role" and "id" in a and a.get("role"):
+        return api("PATCH", "/tokens/%s" % a["id"], {"role": a["role"]})
     return {"e": "bad", "f": "action"}
 
 
@@ -299,7 +314,9 @@ TOOLS = {
               S(action=s, id=i, n=s, kind=s, url=s, token=s, target=s, events={"type": "array", "items": s}, minpr=i, b=i, on={"type": "boolean"}), lambda a: _chats(dict(a))),
     "git_secret": ("Admin: create a new secret for the git webhook (POST /api/hooks/git from GitHub, GitLab or Gitea). Returns the secret once to paste into the forge.",
                    S(), lambda a: api("POST", "/admin/git-secret", {})),
-    "tokens": ("Admin: access tokens. action list | create (n=name, role agent|supervisor|viewer|admin; the token is returned once) | revoke (id) | scope (id, boards=[ids]: limit an existing token to those boards, [] = all). create also takes boards=[ids].",
+    "roles": ("Admin: roles = named sets of permissions. action list (roles + all permission names) | create (n, p=[permissions]) | set (n, p=[permissions]: replace; admin can never lose its admin permissions) | delete (n; not built-in, not in use). Then tokens role sets a token's role.",
+              S(action=s, n=s, p={"type": "array", "items": s}), lambda a: _roles(dict(a))),
+    "tokens": ("Admin: access tokens. action list | create (n=name, role: any role name, see roles; the token is returned once) | revoke (id) | scope (id, boards=[ids]: limit an existing token to those boards, [] = all) | role (id, role: change an existing token's role; the last admin cannot be demoted, admin clears board limits). create also takes boards=[ids].",
                S(action=s, n=s, role=s, id=i, boards={"type": "array", "items": i}), lambda a: _tokens(dict(a))),
     "say": ("Send a direct message to an agent or a human by name: to (a name, a list of names, or '*' for everyone - supervisors and admins only), c (text), optional task (id it is about) and reply (message id). The recipient sees it in briefing with do='say to=<you>'.",
             S(["to", "c"], to={"type": ["string", "array"]}, c=s, task=i, reply=i, kind={"type": "string", "enum": ["ask", "fyi", "ack"]}, **{"as": s}), lambda a: api("POST", "/messages", idn(a))),
@@ -367,6 +384,8 @@ TOOLS = {
     "audit_verify": ("Supervisor/admin: check the audit chain. ok=false names the first broken event; unchained = older events that predate the chain.", S(), lambda a: api("GET", "/audit/verify")),
     "audit": ("Supervisor/admin: who changed what. Newest first: ts, by, ty (event type), e (entity id), bn (board), m (what changed). Filters actor, type (prefix, e.g. task. or run.), task, b, since (event id), limit.",
               S(actor=s, type=s, task=i, b=i, since=i, limit=i), lambda a: api("GET", "/audit" + qs(a, ["actor", "type", "task", "b", "since", "limit"]))),
+    "activity": ("Who did what last: per agent the last task (tk, t), action (ty), one-line m, ts and seen. by=Name adds that agent's last n items (default 10).",
+                 S(by=s, n=i), lambda a: api("GET", "/activity" + qs(a, ["by", "n"]))),
     "batch": ("Run up to 20 calls in one round trip: ops=[{m:'GET'|'POST'|'PATCH'|'DELETE', p:'/tasks/7', b:{...}}]. Stops at the first error unless cont=true. Returns [{s:status, r:result}].",
               S(["ops"], ops={"type": "array", "items": {"type": "object", "properties": {"m": s, "p": s, "b": {"type": "object"}}}}, cont={"type": "boolean"}), lambda a: api("POST", "/batch", a)),
     "guide": ("A short playbook for your role (~100-250 tokens): agent, coder, reviewer, supervisor or planner.", S(role=s), lambda a: api("GET", "/guide" + qs(a, ["role"]))),
@@ -383,7 +402,7 @@ TOOLS = {
 CORE = ["briefing", "next", "finish", "inbox", "claim", "set_task", "add_task", "tasks", "task", "comment", "say", "handoff", "heartbeat", "answer", "decide_review", "lock", "unlock"]
 COORD = ["messages", "claim_next", "release", "locks", "ask", "asks", "cancel_ask", "request_review", "reviews", "watch", "unwatch", "watches", "attach", "attachments", "del_attachment",
          "cost", "links", "route", "envs", "deploy_env", "freeze_env", "unfreeze_env", "decline_task", "reopen_task", "add_commit", "task_activity", "comments", "verify", "timeline", "decision", "verify_queue", "faq", "policy", "evidence", "propose", "proposals", "lesson", "wait"]
-ADMIN = ["tokens", "settings", "backups", "export_data", "export_csv", "import_csv", "import_data", "del_board", "del_sprint", "chats", "git_secret", "wake_agent", "usage"]
+ADMIN = ["tokens", "roles", "settings", "backups", "export_data", "export_csv", "import_csv", "import_data", "del_board", "del_sprint", "chats", "git_secret", "wake_agent", "usage"]
 GROUPS = {"core": CORE, "coord": COORD, "admin": ADMIN, "plan": [n for n in TOOLS if n not in CORE + COORD + ADMIN]}
 PROFILE = os.environ.get("TASKBOARD_TOOLS", "core")      # core (default) | core,coord | core,coord,plan | core,admin | all | tool names
 

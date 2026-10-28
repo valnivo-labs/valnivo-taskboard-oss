@@ -291,6 +291,11 @@ function limitsHtml(q) {
   return rows_ + subs || '<p class="muted">No limits set and nothing reported. Daily limits are in Admin → Budgets; machines can report subscription usage.</p>';
 }
 let sysDays = +(localStorage.tb_sysdays || 7);
+const actPlain = x => `#${x.tk} ${x.t || ""} · ${x.ty === "run" ? "run " + x.st : x.ty}${x.m ? ": " + x.m : ""}`;
+const actTxt = x => `<a data-tk="${x.tk}" style="cursor:pointer;text-decoration:underline">#${x.tk} ${esc((x.t || "").slice(0, 60))}</a> · ${x.ty === "run" ? "run " + esc(x.st) : esc(x.ty)}${x.m ? ": " + esc(x.m.slice(0, 90)) : ""}`;
+const actShort = ts => { const t = Date.parse(ts.replace(" ", "T") + "Z"); return ageTxt(Math.max(0, Math.round((Date.now() - (isNaN(t) ? Date.now() : t)) / 1000))); };
+const actAge = ts => actShort(ts) + " ago";
+const actRow = a => `<div class="kv actrow" data-actby="${esc(a.ag)}"><span class="actl"><b>${esc(a.ag)}</b>${a.tst ? ' <small class="muted">test</small>' : ""}<small class="actt"${a.last ? ` title="${esc(actPlain(a.last))}"` : ""}>${a.last ? actTxt(a.last) : '<span class="muted">no runs or changes</span>'}</small></span><span class="actr"><b>${a.last ? actShort(a.last.ts) : ""}</b><small class="muted">${a.seen ? "seen " + ageTxt(a.age) : "never seen"}</small></span></div><div class="actmore" hidden></div>`;
 async function renderSystem() {
   const el = $("v-system"); let r;
   try { r = await api("GET", "/system?days=" + sysDays); } catch (_) { return; }
@@ -319,10 +324,13 @@ async function renderSystem() {
         ${r.chain ? `<div class="kv"><span>History chain</span><b style="color:var(--${r.chain.ok ? "ok" : "bad"})">${r.chain.ok ? "✓ intact · " + r.chain.n + " events" : "✗ broken at #" + r.chain.broken}</b></div>` : ""}
         <p class="muted hint">Reported cost is what agents said they spent, not a provider bill. A finished task is only "verified" when someone other than the worker checked it.</p></section>
       <section class="panel"><h2>Tokens spent talking to the board <span class="muted">${r.days === 1 ? "today" : "last " + r.days + " days"}</span></h2>${r.spend && r.spend.agents.length ? r.spend.agents.map(a => `<div class="sprow2"><span><b>${esc(a.n)}</b><br><small>${a.routes.map(x => esc(x.r) + " " + x.t).join(" · ")}</small></span><span class="num">${a.calls} calls</span><span class="num">${a.t >= 1000 ? (a.t / 1000).toFixed(1) + "k" : a.t} tokens</span></div>`).join("") : '<p class="muted">Nothing counted yet.</p>'}<p class="muted hint">Counted from what agents send and receive (bytes ÷ 4). The biggest routes are where a shorter answer or a "since" read saves the most.</p></section>
-      <section class="panel"><h2>Last activity by who</h2>${r.receipts.length ? r.receipts.map(x => `<div class="kv"><span>${esc(x.by)}</span><b>${ageTxt(x.age)} ago</b></div>`).join("") : '<p class="muted">Nothing yet.</p>'}</section>
+      <section class="panel"><h2>Last activity by who</h2>${(r.act || []).length ? r.act.map(actRow).join("") : '<p class="muted">Nothing yet.</p>'}<p class="muted hint">Click a name for the last 10 items. Agents named selftest/smoke/e2e are marked "test". "seen" is the last heartbeat.</p></section>
     </div></div>`;
 }
-$("v-system").addEventListener("click", e => { const b = e.target.closest("[data-days]"); if (b) { sysDays = +b.dataset.days; localStorage.tb_sysdays = sysDays; renderSystem(); } });
+$("v-system").addEventListener("click", async e => {
+  const tk = e.target.closest("a[data-tk]"); if (tk) return openTask(+tk.dataset.tk);
+  const ar = !e.target.closest("a[data-tk]") && e.target.closest("[data-actby]");
+  if (ar) { const box = ar.nextElementSibling; if (!box.hidden) { box.hidden = true; return; } const r = await api("GET", "/activity?by=" + encodeURIComponent(ar.dataset.actby) + "&n=10"); const it = (r.i[0] || {}).i || []; box.innerHTML = it.length ? it.map(x => `<div class="kv actrow sub"><span class="actl"><small class="actt" title="${esc(actPlain(x))}">${actTxt(x)}</small></span><span class="actr"><b>${actShort(x.ts)}</b></span></div>`).join("") : '<p class="muted">No runs or changes yet.</p>'; box.hidden = false; return; } const b = e.target.closest("[data-days]"); if (b) { sysDays = +b.dataset.days; localStorage.tb_sysdays = sysDays; renderSystem(); } });
 
 const pipeOf = t => { try { return t.pipeline ? JSON.parse(t.pipeline) : []; } catch (_) { return []; } };
 const pipeText = t => pipeOf(t).map(s => `${s.name} | ${s.holder} | ${s.gate}`).join("\n");
@@ -639,15 +647,18 @@ async function rawPost(path, text) {
 }
 async function renderAdmin() {
   const el = $("v-admin");
-  let tk, se, bk, tp, us, ch;
-  try { [tk, se, bk, tp, us, ch] = await Promise.all([api("GET", "/tokens"), api("GET", "/settings"), api("GET", "/admin/backups"), api("GET", "/templates"), api("GET", "/admin/usage"), api("GET", "/chats")]); CHATS = ch.i; }
+  let tk, se, bk, tp, us, ch, rl;
+  try { [tk, se, bk, tp, us, ch, rl] = await Promise.all([api("GET", "/tokens"), api("GET", "/settings"), api("GET", "/admin/backups"), api("GET", "/templates"), api("GET", "/admin/usage"), api("GET", "/chats"), api("GET", "/roles")]); CHATS = ch.i; ROLES = rl; }
   catch (_) { el.innerHTML = '<div class="pad"><div class="empty"><b>Admin only</b><br>Your token does not have the admin role.</div></div>'; return; }
   if (view !== "admin") return;
   const last = bk.last;
-  el.innerHTML = `<div class="pad"><div class="adm"><nav class="admnav" aria-label="Admin sections">${[["access", "Access", tk.i.length], ["notifications", "Notifications"], ["chat", "Chat channels", ch.i.length], ["git", "Git and pull requests"], ["budgets", "Budgets and wake-ups"], ["rules", "Board rules"], ["backups", "Backups"], ["templates", "Templates"], ["data", "Import and export"], ["usage", "API usage"], ["audit", "Audit log"]].map(([k, l, n]) => `<button type="button" data-admsec="${k}" class="${admSec === k ? "on" : ""}" ${admSec === k ? 'aria-current="page"' : ""}>${l}${n ? `<span class="chip">${n}</span>` : ""}</button>`).join("")}</nav><div class="admbody" data-cur="${admSec}">
-    <div class="panel" data-sec="access"><h2>Access — one token per agent</h2><p class="muted hint">Roles: <b>admin</b> everything · <b>supervisor</b> agent + deletes sprints, gets escalations · <b>agent</b> read/write, no deletes of boards/sprints, no admin · <b>viewer</b> read-only. A token's name is the actor in the audit trail and the default inbox.</p>
-      <table class="tb"><tr><th>Name</th><th>Role</th><th>Boards</th><th>Last used</th><th></th></tr>${tk.i.map(t => `<tr><td>${esc(t.n)}</td><td><span class="stb">${esc(t.role)}</span></td><td class="muted">${t.bs ? esc(t.bs.map(i => (boards.find(b => b.id === i) || {}).name || "#" + i).join(", ")) : "all"}</td><td>${t.env ? '<span class="muted">env</span>' : esc(t.u ? ago(t.u) + " ago" : "never")}</td><td class="num">${t.env ? "" : `<span class="rowacts"><button type="button" class="mini" data-tokscope="${t.id}" data-bs="${(t.bs || []).join(",")}" ${t.role === "admin" ? "disabled" : ""}>Boards…</button><button type="button" class="mini" data-deltoken="${t.id}">Revoke</button></span>`}</td></tr>`).join("")}</table>
+  el.innerHTML = `<div class="pad"><div class="adm"><nav class="admnav" aria-label="Admin sections">${[["access", "Access", tk.i.length], ["roles", "Roles", rl.i.length], ["notifications", "Notifications"], ["chat", "Chat channels", ch.i.length], ["git", "Git and pull requests"], ["budgets", "Budgets and wake-ups"], ["rules", "Board rules"], ["backups", "Backups"], ["templates", "Templates"], ["data", "Import and export"], ["usage", "API usage"], ["audit", "Audit log"]].map(([k, l, n]) => `<button type="button" data-admsec="${k}" class="${admSec === k ? "on" : ""}" ${admSec === k ? 'aria-current="page"' : ""}>${l}${n ? `<span class="chip">${n}</span>` : ""}</button>`).join("")}</nav><div class="admbody" data-cur="${admSec}">
+    <div class="panel" data-sec="access"><h2>Access — one token per agent</h2><p class="muted hint">Roles (what each may do is set under <b>Roles</b>): <b>admin</b> everything · <b>supervisor</b> agent + deletes sprints, gets escalations · <b>agent</b> read/write, no deletes of boards/sprints, no admin · <b>viewer</b> read-only. A token's name is the actor in the audit trail and the default inbox.</p>
+      <table class="tb"><tr><th>Name</th><th>Role</th><th>Boards</th><th>Last used</th><th></th></tr>${tk.i.map(t => `<tr><td>${esc(t.n)}</td><td><span class="stb">${esc(t.role)}</span></td><td class="muted">${t.bs ? esc(t.bs.map(i => (boards.find(b => b.id === i) || {}).name || "#" + i).join(", ")) : "all"}</td><td>${t.env ? '<span class="muted">env</span>' : esc(t.u ? ago(t.u) + " ago" : "never")}</td><td class="num">${t.env ? "" : `<span class="rowacts"><button type="button" class="mini" data-tokrole="${t.id}" data-role="${esc(t.role)}" data-name="${esc(t.n)}">Role…</button><button type="button" class="mini" data-tokscope="${t.id}" data-bs="${(t.bs || []).join(",")}" ${t.role === "admin" ? "disabled" : ""}>Boards…</button><button type="button" class="mini" data-deltoken="${t.id}">Revoke</button></span>`}</td></tr>`).join("")}</table>
       <p><button type="button" class="mini primary" id="newtoken">+ Create agent token</button></p></div>
+    <div class="panel" data-sec="roles"><h2>Roles — what each role may do</h2><p class="muted hint">A role is a set of permissions. The four built-in roles keep the behaviour they always had; edit them or add your own, then give a token the role under Access. Admin always keeps its admin permissions; a role in use, and the built-in ones, cannot be deleted. Every change is in the audit log.</p>
+      <table class="tb"><tr><th>Role</th><th>Permissions</th><th>Tokens</th><th></th></tr>${rl.i.map(r => `<tr><td><span class="stb">${esc(r.n)}</span>${r.b ? ' <span class="muted">built-in</span>' : ""}</td><td class="muted">${r.p.length} of ${rl.perms.length}: ${esc(r.p.join(", "))}</td><td class="num">${r.use}</td><td class="num"><span class="rowacts"><button type="button" class="mini" data-roleedit="${esc(r.n)}">Edit</button><button type="button" class="mini" data-roledel="${esc(r.n)}" ${r.b || r.use ? "disabled" : ""}>Delete</button></span></td></tr>`).join("")}</table>
+      <p><button type="button" class="mini primary" id="newrole">+ New role</button></p></div>
     <div class="panel" data-sec="notifications"><h2>Notifications &amp; supervisor</h2><form id="setf" class="stack">
       <label>Supervisor agent(s) — get escalations (comma separated names)<input name="supervisors" value="${esc(se.supervisors)}" placeholder="e.g. Supervisor"></label>
       <label>Daily digest webhook (Slack/Teams/Discord incoming URL)<input name="digest_url" value="${esc(se.digest_url)}" placeholder="https://hooks.slack.com/…"></label>
@@ -694,6 +705,7 @@ async function renderAdmin() {
       ${tp.i.length ? `<table class="tb"><tr><th>Template</th><th>Rule</th><th>Next run</th><th>Assignee</th><th></th></tr>${tp.i.map(t => `<tr><td>${esc(t.n)}${t.on ? "" : ' <span class="muted">(paused)</span>'}</td><td>${esc(t.rc || "manual")}</td><td>${esc(t.nx || "—")}</td><td>${esc(t.as || "—")}</td><td class="num"><button type="button" class="mini" data-usetpl="${t.id}">Use</button> <button type="button" class="mini" data-edittpl="${t.id}">Edit</button> <button type="button" class="mini" data-deltpl="${t.id}">Delete</button></td></tr>`).join("")}</table>` : '<p class="muted">No templates yet.</p>'}
       <div class="rowbtn"><button type="button" class="mini primary" id="newtpl">+ New template</button><button type="button" class="mini" id="runtpl">Run due recurring now</button></div></div></div></div></div>`;
   el._tpl = tp.i;
+  el.querySelectorAll(".admbody>[data-sec]").forEach(p => p.classList.toggle("on", p.dataset.sec === admSec));
   if (admSec === "audit") loadAudit();
 }
 
@@ -719,7 +731,7 @@ $("v-admin").addEventListener("click", async e => {
   const el = $("v-admin"), id = k => e.target.id === k;
   if (await adminExtras(e)) return;
   const dt = e.target.closest("[data-deltoken]"); if (dt) { if (confirm("Revoke this token? Anything using it stops working.")) { await api("DELETE", "/tokens?id=" + dt.dataset.deltoken); renderAdmin(); } return; }
-  if (id("newtoken")) return dlg(`<h3>Create agent token</h3><label>Agent name (exactly as used in Assignee)<input name="n" required></label><label>Role<select name="role">${opt(["agent", "supervisor", "viewer", "admin"], "agent")}</select></label>${boardPick([])}`,
+  if (id("newtoken")) return dlg(`<h3>Create agent token</h3><label>Agent name (exactly as used in Assignee)<input name="n" required></label><label>Role<select name="role">${opt(roleNames(), "agent")}</select></label>${boardPick([])}`,
     async d => { const bs = boards.filter(b => d["tb_" + b.id]).map(b => b.id); if (bs.length && d.role === "admin") { toast("Admin tokens cannot be limited to boards"); throw {e: "bad"}; } const r = await api("POST", "/tokens", {n: d.n, role: d.role, boards: bs}); closeDlg(true); setTimeout(() => dlg(`<h3>Token for ${esc(r.n)}</h3><p class="muted hint">Shown once. Store it in the agent's secret store now.</p><label>Token<input readonly value="${esc(r.token)}" id="tkv"></label><label>Connector address <span class="muted">(for agents that only take a URL; contains the token, keep it secret)</span><input readonly value="${esc(location.origin + BASE + "/api/mcp?key=" + r.token)}"></label>`, async () => { await navigator.clipboard.writeText(r.token).catch(() => {}); toast("Copied"); renderAdmin(); }, "", "Copy & close"), 50); throw {e: "shown"}; }, "", "Create");
   if (id("bknow")) { try { const r = await api("POST", "/admin/backup"); toast(r.ok ? "Backup created and verified" : "Backup created but verification FAILED"); renderAdmin(); } catch (_) {} return; }
   if (id("digestnow")) { const r = await api("POST", "/admin/digest"); return toast(r.sent ? "Digest sent" : "Not sent: " + (r.why || "nothing to do")); }
@@ -1490,6 +1502,13 @@ const CHAT_EV = [["blocked", "A task is blocked"], ["done", "A task is done"], [
   ["escalation", "Escalations to the supervisor"], ["sprint", "Sprint started, closed or at risk"], ["budget", "Budget warnings"], ["git", "Pull requests merged, CI failures"]];
 let CHATS = [];
 let agFilter = "all", admSec = (() => { try { return localStorage.tb_adm || "access"; } catch (_) { return "access"; } })();
+let ROLES = {i: [], perms: [], req: []};
+const roleNames = () => ROLES.i.map(r => r.n);
+function roleDlg(name) {
+  const cur = ROLES.i.find(r => r.n === name), isNew = !cur, req = name === "admin" ? ROLES.req : ["read"];
+  dlg(`<h3>${isNew ? "New role" : "Role " + esc(name)}</h3>${isNew ? '<label>Name <span class="muted">(lowercase letters, digits, - _)</span><input name="n" required pattern="[a-z][a-z0-9_-]{1,29}"></label>' : ""}<fieldset class="fs"><legend>Permissions${name === "admin" ? ' <span class="muted">(admin keeps the ticked, locked ones)</span>' : ""}</legend><div class="permgrid">${ROLES.perms.map(p => `<label class="chk" title="${esc(p.d)}"><input type="checkbox" name="p_${esc(p.k)}" ${(cur ? cur.p : ["read"]).includes(p.k) || req.includes(p.k) ? "checked" : ""} ${req.includes(p.k) ? "disabled" : ""}> <b>${esc(p.k)}</b> <span class="muted">${esc(p.d)}</span></label>`).join("")}</div></fieldset>`,
+    async d => { const p = ROLES.perms.map(x => x.k).filter(k => d["p_" + k] || req.includes(k)); if (isNew) await api("POST", "/roles", {n: d.n, p}); else await api("PATCH", "/roles/" + name, {p}); toast("Role saved"); renderAdmin(); }, "", "Save");
+}
 const boardPick = sel => `<fieldset class="fs"><legend>Limit to boards <span class="muted">(none ticked = every board)</span></legend><div class="evgrid">${boards.map(b => `<label class="chk"><input type="checkbox" name="tb_${b.id}" ${sel.includes(b.id) ? "checked" : ""}> ${esc(b.name)}</label>`).join("")}</div></fieldset>`;
 function msgDlg(to) {
   dlg(`<h3>Message${to ? " to " + esc(to) : ""}</h3><div class="row2"><label>To (agent or person, * = everyone)<input name="to" required value="${esc(to)}"></label><label>From<input name="as" required value="${esc(localStorage.tb_from || "Operator")}"></label></div>
@@ -1555,12 +1574,22 @@ async function adminExtras(e) {
   const sn = t.closest("[data-admsec]");
   if (sn) {
     admSec = sn.dataset.admsec; try { localStorage.tb_adm = admSec; } catch (_) {}
-    const body = $("v-admin").querySelector(".admbody"); if (body) body.dataset.cur = admSec;
+    const body = $("v-admin").querySelector(".admbody"); if (body) { body.dataset.cur = admSec; body.querySelectorAll(":scope>[data-sec]").forEach(p => p.classList.toggle("on", p.dataset.sec === admSec)); }
     if (admSec === "audit") loadAudit();
     $("v-admin").querySelectorAll("[data-admsec]").forEach(b => { b.classList.toggle("on", b === sn); b.toggleAttribute("aria-current", b === sn); });
     return true;
   }
   if (t.id === "newchat") { chatDlg(); return true; }
+  const re_ = t.closest("[data-roleedit]");
+  if (re_) { roleDlg(re_.dataset.roleedit); return true; }
+  const rd_ = t.closest("[data-roledel]");
+  if (rd_) { if (confirm("Delete the role " + rd_.dataset.roledel + "?")) { await api("DELETE", "/roles/" + rd_.dataset.roledel); toast("Role deleted"); renderAdmin(); } return true; }
+  if (t.id === "newrole") { roleDlg(""); return true; }
+  const tr = t.closest("[data-tokrole]");
+  if (tr) {
+    dlg(`<h3>Role for ${esc(tr.dataset.name)}</h3><label>Role<select name="role">${opt(roleNames(), tr.dataset.role)}</select></label><p class="muted hint">Takes effect on the token's next request. Admin tokens cannot be limited to boards (choosing admin clears the limit). The last admin cannot be demoted.</p>`, async d => { await api("PATCH", "/tokens/" + tr.dataset.tokrole, {role: d.role}); toast("Role changed"); renderAdmin(); }, "", "Save");
+    return true;
+  }
   const ts = t.closest("[data-tokscope]");
   if (ts) {
     const cur = ts.dataset.bs ? ts.dataset.bs.split(",").map(Number) : [];

@@ -273,11 +273,14 @@ def test_admin_is_split_into_sections(page):
     assert page.locator("[data-sec=access]").is_visible() and not page.locator("[data-sec=chat]").is_visible()
     page.click("[data-admsec=chat]")
     assert page.locator("[data-sec=chat]").is_visible() and not page.locator("[data-sec=access]").is_visible()
-    for sec in ("access", "notifications", "chat", "git", "budgets", "rules", "backups", "templates", "data", "usage"):
+    secs = page.evaluate("[...document.querySelectorAll('#v-admin .admnav [data-admsec]')].map(b => b.dataset.admsec)")
+    assert "roles" in secs and set(secs) == set(page.evaluate("[...document.querySelectorAll('#v-admin .admbody>[data-sec]')].map(p => p.dataset.sec)")), secs
+    for sec in secs:                                                                 # every nav entry must reveal a non-empty panel
         page.click("[data-admsec=%s]" % sec)
         assert page.locator("[data-sec=%s]" % sec).is_visible(), sec
         shown = page.evaluate("[...document.querySelectorAll('#v-admin [data-sec]')].filter(p => p.offsetParent).map(p => p.dataset.sec)")
         assert shown == [sec], shown                                                 # exactly one section at a time
+        assert page.locator("[data-sec=%s]" % sec).bounding_box()["width"] > 200, sec
         over = page.evaluate("[...document.querySelectorAll('#v-admin .panel')].filter(p => p.offsetParent && p.scrollWidth > p.clientWidth + 1).length")
         assert over == 0, (sec, over)                                                # nothing spills out of its panel
 

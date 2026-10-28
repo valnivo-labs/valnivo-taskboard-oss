@@ -159,6 +159,34 @@ st, tkn = J("POST", "/tokens", {"n": "Zed", "role": "agent"}); assert st == 201 
 st, zt = J("POST", "/tasks", {"b": BID, "t": "for zed", "ch": "X", "as": "Zed"})
 st, ib = J("GET", "/inbox", tok=tkn["token"]); assert ib["n"] == 1 and ib["i"][0]["ty"] == "task.assigned", ib   # inbox defaults to token name
 assert all("token" not in x for x in J("GET", "/tokens")[1]["i"])
+# ---- token role editor (PATCH /tokens/{id}, POST /tokens {id, role}); audited, last admin protected
+_zid = [x["id"] for x in J("GET", "/tokens")[1]["i"] if x.get("n") == "Zed"][0]
+assert J("PATCH", f"/tokens/{_zid}", {"role": "supervisor"}, tok="wtok")[0] == 403 and J("PATCH", f"/tokens/{_zid}", {"role": "supervisor"}, tok="stok")[0] == 403   # non-admin refused
+assert J("PATCH", f"/tokens/{_zid}", {"role": "root"})[1]["e"] == "bad" and J("PATCH", "/tokens/99999", {"role": "agent"})[0] == 404
+st, r = J("PATCH", f"/tokens/{_zid}", {"role": "supervisor"}); assert st == 200 and r["role"] == "supervisor" and r["was"] == "agent", r
+assert [x["role"] for x in J("GET", "/tokens")[1]["i"] if x.get("id") == _zid] == ["supervisor"]
+assert J("GET", "/audit", tok="tok")[0] == 200 and J("GET", "/attention", tok=tkn["token"])[0] == 200                  # the new role is live on the token's next call
+st, r = J("POST", "/tokens", {"id": _zid, "role": "agent"}); assert st == 201 and r["role"] == "agent"                    # POST spelling
+_au = J("GET", "/audit?type=token.role&limit=10")[1]["i"]
+assert len(_au) == 2 and _au[0]["by"] in ("a", "admin") and "agent" in _au[0]["m"] and "supervisor" in _au[1]["m"] and _au[0]["e"] == _zid, _au
+st, r = J("PATCH", f"/tokens/{_zid}", {"role": "admin"}); assert st == 200
+st, r = J("GET", "/tokens"); assert not any(x.get("id") == _zid and x.get("bs") for x in r["i"])
+# admin role clears board limits
+_wid = J("POST", "/tokens", {"n": "Walled2", "role": "agent", "boards": [BID]})[1]; _wrow = [x for x in J("GET", "/tokens")[1]["i"] if x.get("n") == "Walled2"][0]; assert _wrow["bs"] == [BID]
+assert J("PATCH", f"/tokens/{_wrow['id']}", {"role": "admin"})[0] == 200 and not [x for x in J("GET", "/tokens")[1]["i"] if x.get("n") == "Walled2"][0].get("bs")
+# last admin: with no env admins left, the only database admin cannot be demoted; with another admin it can
+_env = dict(server.TOKENS); _zt = J("POST", "/tokens", {"n": "Solo", "role": "admin"})[1]["token"]
+J("PATCH", f"/tokens/{_wrow['id']}", {"role": "agent"}); J("PATCH", f"/tokens/{_zid}", {"role": "agent"})
+_solo = [x["id"] for x in J("GET", "/tokens")[1]["i"] if x.get("n") == "Solo"][0]
+for _k in [k for k, v in server.TOKENS.items() if v[1] == "admin"]:
+    del server.TOKENS[_k]
+st, r = J("PATCH", f"/tokens/{_solo}", {"role": "agent"}, tok=_zt); assert st == 409 and r["e"] == "last_admin", (st, r)
+assert J("GET", "/tokens", tok=_zt)[0] == 200                                                                          # still admin
+server.TOKENS.update(_env)
+assert J("PATCH", f"/tokens/{_solo}", {"role": "agent"})[0] == 200                                                     # env admins exist again: fine
+assert J("PATCH", f"/tokens/{_solo}", {"role": "agent"})[1].get("same") == 1
+J("DELETE", f"/tokens?id={_solo}"); J("DELETE", f"/tokens?id={_wrow['id']}")
+print("token role selftest OK")
 assert J("GET", "/boards", tok="bogus")[0] == 401
 
 # ---- dependencies
@@ -1612,3 +1640,98 @@ assert J("POST", "/tasks", {"b": RB, "t": "no", "ch": "X"}, tok=wv)[0] == 403
 J("POST", "/settings", {"witness_names": ""})
 assert J("POST", "/assure/report", {"events": 5}, tok=wv)[0] == 403
 print("v37 assure status OK")
+
+
+# ================= roles are data: Admin > Roles (card #146) =================
+_B = {  # what each built-in could do before roles were data
+    "viewer": {"read"},
+    "agent": {"read", "write"},
+    "supervisor": {"read", "write", "sprints.delete", "audit", "snapshot", "escalations.receive", "approvals", "wake", "verify.all", "messages.broadcast", "messages.all", "activity.all",
+                   "override", "force", "assign.any", "act_as", "agents.manage", "policy", "nodes.admit", "envs.freeze", "mcp.coord"}}
+_B["admin"] = set(server.PERMS) - {"escalations.receive"}
+_rl = J("GET", "/roles")[1]
+assert {r["n"]: set(r["p"]) for r in _rl["i"] if r["b"]} == _B and all(r["b"] for r in _rl["i"] if r["n"] in _B), _rl
+assert {p["k"] for p in _rl["perms"]} == set(server.PERMS) and len(server.PERMS) >= 25
+# parity: the four built-ins answer a matrix of routes exactly as the hardcoded roles did (expected = old behaviour; None = not 403)
+_M = [("GET", "/tokens", {"tok": 1}), ("GET", "/settings", {"tok": 1}), ("GET", "/export", {"tok": 1}), ("GET", "/chats", {"tok": 1}), ("GET", "/admin/backups", {"tok": 1}), ("POST", "/import", {"tok": 1}),
+      ("DELETE", "/boards/999999", {"tok": 1}), ("DELETE", "/sprints/999999", {"tok": 1, "stok": 1}), ("GET", "/audit", {"tok": 1, "stok": 1}), ("GET", "/audit/verify", {"tok": 1, "stok": 1}),
+      ("POST", "/agents/wake", {"tok": 1, "stok": 1}), ("POST", "/proposals/99999/decide", {"tok": 1, "stok": 1}), ("POST", "/envs/zz/freeze", {"tok": 1, "stok": 1}),
+      ("POST", "/nodes/zz/admit", {"tok": 1, "stok": 1}), ("GET", "/roles", {"tok": 1}),
+      ("POST", "/messages", {"tok": 1, "stok": 1}), ("POST", "/tasks", {"tok": 1, "stok": 1, "wtok": 1}), ("GET", "/boards", {"tok": 1, "stok": 1, "wtok": 1, "vtok": 1})]
+for _m, _p, _ok in _M:
+    for _t in ("tok", "stok", "wtok", "vtok"):
+        _body = {"b": BID, "t": "parity", "ch": "X"} if _p == "/tasks" else {"to": ["*"], "c": "x"} if _p == "/messages" else {} if _m in ("POST", "PATCH") else None
+        _st = J(_m, _p, _body, tok=_t)[0]
+        assert (_st != 403) == (_t in _ok), (_m, _p, _t, _st)
+# custom roles: create / edit / validation / audit
+assert J("POST", "/roles", {"n": "Bad Name", "p": ["read"]}, tok="stok")[0] == 403 and J("GET", "/roles", tok="wtok")[0] == 403
+assert J("POST", "/roles", {"n": "Bad Name", "p": ["read"]})[0] == 400 and J("POST", "/roles", {"n": "ghost", "p": ["read", "nope"]})[0] == 400 and J("POST", "/roles", {"n": "ghost", "p": ["write"]})[0] == 400
+assert J("POST", "/roles", {"n": "admin", "p": ["read"]})[0] == 409
+st, r = J("POST", "/roles", {"n": "auditor", "p": ["read", "audit"]}); assert st == 201 and r["p"] == ["audit", "read"], r
+assert J("POST", "/roles", {"n": "auditor", "p": ["read"]})[0] == 409
+_at = J("POST", "/tokens", {"n": "Auditor1", "role": "auditor"}); assert _at[0] == 201, _at; _att = _at[1]["token"]
+assert J("POST", "/tokens", {"n": "Nobody", "role": "nonexistent"})[0] == 400
+assert J("GET", "/audit", tok=_att)[0] == 200 and J("POST", "/tasks", {"b": BID, "t": "no", "ch": "X"}, tok=_att)[0] == 403 and J("GET", "/tokens", tok=_att)[0] == 403
+# every permission is enforced: a role holding only read+X passes X's probe and a role holding everything except X fails it
+_P = {"audit": ("GET", "/audit", None), "tokens": ("GET", "/tokens", None), "roles": ("GET", "/roles", None), "admin.settings": ("GET", "/settings", None), "export": ("GET", "/export", None),
+      "import": ("POST", "/import", {}), "chats": ("GET", "/chats", None), "boards.delete": ("DELETE", "/boards/999999", None), "sprints.delete": ("DELETE", "/sprints/999999", None),
+      "wake": ("POST", "/agents/wake", {}), "approvals": ("POST", "/proposals/99999/decide", {}), "messages.broadcast": ("POST", "/messages", {"to": ["*"], "c": "x"}),
+      "envs.freeze": ("POST", "/envs/zz/freeze", {}), "nodes.admit": ("POST", "/nodes/zz/admit", {}), "write": ("POST", "/tasks", {"b": BID, "t": "perm", "ch": "X"})}
+_all = set(server.PERMS)
+for _k, (_m, _p, _b) in _P.items():
+    J("POST", "/roles", {"n": "only-x", "p": sorted({"read", "write", _k})}) if not server.role_exists("only-x") else J("PATCH", "/roles/only-x", {"p": sorted({"read", "write", _k})})
+    J("POST", "/roles", {"n": "all-but-x", "p": sorted(_all - {_k})}) if not server.role_exists("all-but-x") else J("PATCH", "/roles/all-but-x", {"p": sorted(_all - {_k})})
+    for _rn, _want in (("only-x", True), ("all-but-x", False)):
+        if _rn not in globals().setdefault("_pt", {}):
+            _pt[_rn] = J("POST", "/tokens", {"n": "P-" + _rn, "role": _rn})[1]["token"]
+        _s = J(_m, _p, _b, tok=_pt[_rn])[0]
+        assert (_s != 403) == _want, (_k, _rn, _s)
+# the rest of the permissions: table + the functions that read them
+assert server.can("agent", "assure.report") is False and server.can("admin", "assure.report") is True
+J("PATCH", "/roles/only-x", {"p": ["read", "escalations.receive"]}); J("PATCH", "/roles/all-but-x", {"p": ["read", "assure.report"]})
+assert "P-only-x" in server.supervisor_names() and "P-all-but-x" not in server.supervisor_names() and "Sup Bot" in server.supervisor_names() and "a" not in server.supervisor_names()
+server._ctx.role = "only-x"; assert server._ident("P-only-x", {"as": "Other"}) == "P-only-x"
+J("PATCH", "/roles/only-x", {"p": ["read", "act_as"]}); server._ctx.role = "only-x"; assert server._ident("P-only-x", {"as": "Other"}) == "Other"; server._ctx.role = "admin"
+for _k, _okf in (("policy", lambda r: server.board_policy_set("x", r, BID, {"policy": "standard"})), ("audit", lambda r: server.audit_get({}, r)), ("wake", lambda r: server.wake_now("x", r, {})),
+                 ("nodes.admit", lambda r: server.node_admit("x", r, "zz", "admit")), ("approvals", lambda r: server.proposal_decide("x", r, 99999, {})), ("override", lambda r: server.check_holder("x", r, 99999))):
+    J("PATCH", "/roles/only-x", {"p": ["read", _k]}); J("PATCH", "/roles/all-but-x", {"p": sorted(_all - {_k})})
+    try:
+        _okf("only-x"); _g = True
+    except server.ApiError as e:
+        _g = e.code != "forbidden"
+    except Exception:
+        _g = True
+    assert _g, _k
+    try:
+        _okf("all-but-x"); _d = False
+    except server.ApiError as e:
+        _d = e.code == "forbidden"
+    except Exception:
+        _d = False
+    assert _d or _k == "override", _k
+# mcp.coord decides the default tool set
+_tl = lambda t: len(json.loads(call("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, tok=t)[2])["result"]["tools"])
+J("PATCH", "/roles/only-x", {"p": ["read", "mcp.coord"]}); J("PATCH", "/roles/all-but-x", {"p": ["read"]})
+assert _tl(_pt["only-x"]) > _tl(_pt["all-but-x"]), (_tl(_pt["only-x"]), _tl(_pt["all-but-x"]))
+# built-in/admin protection, in-use protection, delete, audit
+assert J("PATCH", "/roles/admin", {"p": ["read", "write"]})[0] == 400 and J("PATCH", "/roles/admin", {"p": sorted(_B["admin"] | {"escalations.receive"})})[0] == 200
+assert J("PATCH", "/roles/admin", {"p": sorted(_B["admin"])})[0] == 200 and server.can("admin", "tokens")
+assert J("DELETE", "/roles/admin")[0] == 409 and J("DELETE", "/roles/agent")[0] == 409 and J("DELETE", "/roles/auditor")[1]["e"] == "in_use" and J("DELETE", "/roles/zzzz")[0] == 404
+assert J("DELETE", "/roles/auditor", tok="stok")[0] == 403
+J("PATCH", "/roles/viewer", {"p": ["read", "audit"]}); assert J("GET", "/audit", tok="vtok")[0] == 200; J("PATCH", "/roles/viewer", {"p": ["read"]}); assert J("GET", "/audit", tok="vtok")[0] == 403     # built-ins are editable, and edits are live
+_ids = {x["n"]: x["id"] for x in J("GET", "/tokens")[1]["i"] if x.get("id")}
+assert J("PATCH", f"/tokens/{_ids['Auditor1']}", {"role": "agent"})[0] == 200 and J("DELETE", "/roles/auditor")[0] == 200 and "auditor" not in {r["n"] for r in J("GET", "/roles")[1]["i"]}
+_ev = J("GET", "/audit?type=role.&limit=200")[1]["i"]; _ty = [e["ty"] for e in _ev]
+assert "role.created" in _ty and "role.updated" in _ty and "role.deleted" in _ty and all(e["by"] in ("a", "admin") for e in _ev), _ty
+assert any("audit" in e.get("m", "") for e in _ev)
+# a role may be given and taken away through the token editor; new roles with tokens-and-roles keep the last-admin rule
+J("POST", "/roles", {"n": "deputy", "p": sorted(_all)}); _dt = J("POST", "/tokens", {"n": "Deputy", "role": "deputy"})[1]["token"]
+assert J("GET", "/roles", tok=_dt)[0] == 200
+_dep = [x["id"] for x in J("GET", "/tokens")[1]["i"] if x.get("n") == "Deputy"][0]
+_env2 = dict(server.TOKENS)
+for _k in [k for k, v in server.TOKENS.items() if v[1] == "admin"]:
+    del server.TOKENS[_k]
+assert J("PATCH", f"/tokens/{_dep}", {"role": "agent"}, tok=_dt)[1]["e"] == "last_admin"
+server.TOKENS.update(_env2)
+assert J("PATCH", f"/tokens/{_dep}", {"role": "agent"})[0] == 200 and J("DELETE", "/roles/deputy")[0] == 200
+print("v47 roles selftest OK")
