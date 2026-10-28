@@ -1377,7 +1377,7 @@ function taskDlg(id, status, title, boardId, pri, pre) {
         else if (t_.id === "wgo") { await api("POST", `/tasks/${id}/wait`, {kind: $("wk").value, owner: $("wo").value.trim(), reason: $("wr").value.trim()}); toast("Waiting recorded"); $("dlg").close(); dirty = false; loadBoard(); }
         else if (t_.id === "wclear") { await api("POST", `/tasks/${id}/wait`, {clear: true}); toast("No longer waiting"); $("dlg").close(); dirty = false; loadBoard(); }
         else if (t_.id === "vfok" || t_.id === "vfno") { const n = $("vfn").value.trim(); if (t_.id === "vfno" && !n) { toast("Say what is missing"); return; } await api("POST", `/tasks/${id}/verify`, {ok: t_.id === "vfok", note: n}); toast(t_.id === "vfok" ? "Verified" : "Sent back"); $("dlg").close(); dirty = false; loadBoard(); }
-        else if (t_.id === "rvreq") { const to = $("rvto").value.trim(); if (!to) return; await api("POST", `/tasks/${id}/review`, {reviewer: to, note: $("rvn").value.trim()}); loadReviews(); }
+        else if (t_.id === "rvreq") { const to = $("rvto").value.trim(); if (!to) return; await api("POST", `/tasks/${id}/request_review`, {reviewer: to, summary: $("rvn").value.trim()}); loadReviews(); }
         else if (t_.dataset && t_.dataset.rvdec) { const note = document.querySelector(`.rvnote[data-rv="${t_.dataset.rv}"]`).value.trim(); await api("POST", `/reviews/${t_.dataset.rv}/decide`, {decision: t_.dataset.rvdec, note}); loadReviews(); }
       } catch (_) { /* api() toasted */ }
     });

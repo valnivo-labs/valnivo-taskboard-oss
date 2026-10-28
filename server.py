@@ -6611,6 +6611,44 @@ GUIDES = {
 }
 
 
+def task_request_review(actor, role, tid, body):
+    """Ask for a review without finishing: same guards and attachments as finish(review=...), but `summary` is optional."""
+    rv = str(body.get("reviewer") or body.get("review") or body.get("to") or "").strip()
+    if not rv:
+        raise ApiError("missing", 400, "reviewer")
+    b = {k: v for k, v in body.items() if k not in ("to", "st", "next")}
+    b["review"] = rv
+    b["summary"] = str(body.get("summary") or body.get("note") or "").strip() or "Review requested"
+    return task_finish(actor, role, tid, b)
+
+
+DIGEST_ROLES = {"worker": "worker", "agent": "worker", "coder": "worker", "producer": "producer", "planner": "producer", "checker": "checker", "reviewer": "checker", "supervisor": "supervisor", "lead": "supervisor"}
+
+
+def team_digest(q):
+    """GET /api/team?digest=1[&role=worker|producer|checker|supervisor][&fmt=text]: the core rules plus the part for one role, from docs/TEAM-DIGEST.md."""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs", "TEAM-DIGEST.md"), encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        raise ApiError("nf", 404, "TEAM-DIGEST.md")
+    parts, cur = {}, None
+    for ln in text.split("\n"):
+        if ln.startswith("## "):
+            cur = ln[3:].strip().lower()
+            parts[cur] = []
+        elif cur:
+            parts[cur].append(ln)
+    parts = {k: "\n".join(v).strip() for k, v in parts.items()}
+    want = (_qv(q, "role") or "").lower()
+    role = DIGEST_ROLES.get(want) if want else None
+    if want and not role:
+        raise ApiError("bad", 400, "role")
+    keys = ["core"] + ([role] if role else [k for k in parts if k != "core"])
+    md = "\n\n".join("## %s\n%s" % (k, parts.get(k, "")) for k in keys if k in parts)
+    return {"role": role or "", "roles": sorted(k for k in parts if k != "core"), "g": md, "bytes": len(md.encode())}
+
+
 def guide_get(q):
     role = (_qv(q, "role") or "agent").lower()
     if role not in GUIDES:
@@ -7939,6 +7977,9 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, res)
             if path == "/api/next" and method == "POST":
                 return self.send_json(200, next_task(actor, self.read_body()))
+            mrr = re.fullmatch(r"/api/tasks/(\d+)/request_review", path)
+            if mrr and method == "POST":
+                return self.send_json(200, task_request_review(actor, self.role, int(mrr.group(1)), self.read_body()))
             mmv = re.fullmatch(r"/api/tasks/(\d+)/move", path)
             if mmv and method == "POST":
                 return self.send_json(200, move_task(actor, int(mmv.group(1)), self.read_body()))
@@ -7947,6 +7988,9 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, task_finish(actor, self.role, int(mfn.group(1)), self.read_body()))
             if path == "/api/batch" and method == "POST":
                 return self.send_json(200, self.run_batch(self.read_body()))
+            if path == "/api/team" and method == "GET":
+                g = team_digest(q)
+                return self.send_raw(200, g["g"], "text/plain; charset=utf-8") if _qv(q, "fmt") == "text" else self.send_json(200, g)
             if path == "/api/guide" and method == "GET":
                 g = guide_get(q)
                 return self.send_raw(200, g["g"], "text/plain; charset=utf-8") if _qv(q, "fmt") == "text" else self.send_json(200, g)

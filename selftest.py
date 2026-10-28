@@ -2134,3 +2134,19 @@ assert any(r["k"] == "blocked" and r["ids"] == [_h2] for r in J("GET", f"/sprint
 assert any(i["id"] == _h2 for i in server.digest_build()["s"]["blocked"]["i"])
 assert any(i["k"] == "blocked-p12" and _h2 in i["ids"] for i in server.attention([_hb]))
 print("v53 hold label selftest OK")
+
+# ---- v54: request_review (REST + MCP) and the role digest served from docs/TEAM-DIGEST.md
+_rr = J("POST", "/tasks", {"b": BID, "t": "request review probe", "as": "Worker", "st": "in_progress", "d": "probe for request_review, done when asserted"}, tok="stok")[1]["id"]
+assert J("POST", f"/tasks/{_rr}/request_review", {"as": "Worker"}, tok="stok")[1]["e"] == "missing"
+_r = J("POST", f"/tasks/{_rr}/request_review", {"reviewer": "Sup Bot", "as": "Worker", "pr": "https://example.org/pr/1", "sha": "abc1234"}, tok="stok"); assert _r[0] == 200 and "review" in _r[1]["did"], _r
+_t = J("GET", f"/tasks/{_rr}")[1]; assert _t["st"] == "review" and _t["sha"] == "abc1234", _t                 # summary optional; pr/sha recorded
+assert server.db.execute("SELECT COUNT(*) FROM reviews WHERE task_id=? AND status='pending' AND reviewer='Sup Bot'", (_rr,)).fetchone()[0] == 1
+assert J("POST", f"/tasks/{_rr}/request_review", {"reviewer": "Sup Bot"}, tok="vtok")[0] == 403
+_g = J("GET", "/team?digest=1&role=worker", tok="wtok")[1]
+assert _g["role"] == "worker" and "## core" in _g["g"] and "## worker" in _g["g"] and "## checker" not in _g["g"] and _g["bytes"] < 3500, _g
+assert "## checker" in J("GET", "/team?digest=1&role=reviewer")[1]["g"] and J("GET", "/team?digest=1&role=wizard")[1]["e"] == "bad"
+_all = J("GET", "/team?digest=1")[1]; assert _all["roles"] == ["checker", "producer", "supervisor", "worker"] and "## supervisor" in _all["g"]
+assert call("GET", "/team?digest=1&role=supervisor&fmt=text", tok="stok")[2].startswith("## core") and call("GET", "/team?digest=1", tok="nope")[0] == 401
+_mr = mcp_as("stok", "all", "request_review", {"id": _rr, "reviewer": "Reviewer Z", "as": "Worker", "summary": "again"}); assert "review" in _mr.get("did", []), _mr
+assert "## worker" in mcp_as("wtok", "all", "team", {"role": "worker"})["g"]
+print("v54 request_review and team digest OK")
