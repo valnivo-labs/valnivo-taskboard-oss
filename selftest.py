@@ -2040,7 +2040,7 @@ print("v51.4 finish token reporting OK")
 
 # ---- v52: scheduled stuck-work digest: thresholds, per-slot dedupe, restart persistence, empty = nothing, role scoping
 import datetime as _dd, zoneinfo as _zi
-_lux = _zi.ZoneInfo("Europe/Luxembourg")
+_lux = _zi.ZoneInfo("Europe/Paris")
 _at = lambda d, h, m=0: _dd.datetime(2026, 10, d, h, m, tzinfo=_lux)          # 28 Oct 2026 is a Wednesday, 31 a Saturday
 _ago = lambda h: _tw.strftime("%Y-%m-%d %H:%M:%S", _tw.gmtime(_tw.time() - h * 3600))
 J("POST", "/agents", {"n": "DgA", "capacity": 40}); J("POST", "/agents", {"n": "selftest-dg", "capacity": 40})
@@ -2069,7 +2069,7 @@ assert J("GET", "/digest/stuck", tok="stok")[0] == 200 and J("GET", "/digest/stu
 # settings validation and schedule
 assert J("POST", "/settings", {"digest_cfg": '{"times": ["9am"]}'})[1]["e"] == "bad" and J("POST", "/settings", {"digest_cfg": '{"nope": 1}'})[1]["e"] == "bad" and J("POST", "/settings", {"digest_cfg": '{"tz": "Mars/Base"}'})[1]["e"] == "bad"
 assert server.digest_tick(now=_at(28, 9, 2))["sent"] == 0 and server.get_setting("digest_slot") == ""                         # off until digest_cfg names slots
-assert J("POST", "/settings", {"digest_cfg": '{"times": ["09:00", "14:00"], "tz": "Europe/Luxembourg"}'})[0] == 200
+assert J("POST", "/settings", {"digest_cfg": '{"times": ["09:00", "14:00"], "tz": "Europe/Paris"}'})[0] == 200
 assert server.digest_slot(_at(28, 8, 59)) == "" and server.digest_slot(_at(28, 9)) == "2026-10-28 09:00" and server.digest_slot(_at(28, 15)) == "2026-10-28 14:00" and server.digest_slot(_at(31, 10)) == ""   # Mon-Fri only
 # send: one item per supervisor, deduped per slot, persisted slot survives restart
 _dc = lambda: _db.execute("SELECT COUNT(*) FROM notifications WHERE agent='Sup Bot' AND type='digest.stuck'").fetchone()[0]
@@ -2106,3 +2106,31 @@ finally:
     server.workload_calc = _wl0
 print("v52 stuck-work digest selftest OK")
 J("POST", "/settings", {"digest_cfg": ""})
+
+
+# ---- v53 (#154): blocked+hold is a deliberate hold: not a blocker in workload / digest / sprint risk; plain blocked still is; hold exposed
+J("POST", "/agents", {"n": "HoldAg"})
+_hb = J("POST", "/boards", {"n": "Hold board"})[1]["id"]
+_hs_ = J("POST", "/sprints", {"b": _hb, "n": "Hold sprint", "from": _ago(60 * 24 * 2)[:10], "to": time.strftime("%Y-%m-%d", time.gmtime(time.time() + 5 * 86400))}, tok="stok")[1]["id"]
+def _hmk(t, lb):
+    r = J("POST", "/tasks", {"b": _hb, "t": t, "as": "HoldAg", "st": "blocked", "lb": lb, "s": _hs_, "pr": 2, "d": "hold probe, done when asserted", "bl": "Why: parked\nMissing: go-ahead\nWho: Owner\nSteps: wait"}, tok="stok")
+    assert r[0] in (200, 201), r
+    return r[1]["id"]
+_h1 = _hmk("held card", "hold")
+server._wl_cache[1] = None
+_w = server.workload_calc(only="HoldAg", fresh=True)["HoldAg"]
+assert _w["bl"] == 0 and _w["by"]["blocked"] == 0 and _w["hold"] == 1 and _w["ids"]["hold"] == [_h1] and _w["ids"]["blocked"] == [], _w
+_sh = J("GET", f"/sprints/{_hs_}/stats")[1]
+assert not any(r["k"] == "blocked" for r in _sh["risks"]) and _sh["hold"] == [_h1], _sh["risks"]
+server.db.execute("UPDATE tasks SET updated=? WHERE id=?", (_ago(60 * 24 * 4), _h1))
+_dg = server.digest_build(); assert not any(i["id"] == _h1 for i in _dg["s"].get("blocked", {}).get("i", [])) and _dg["hold"] >= 1, _dg
+assert not any(i["k"] == "blocked-p12" and _h1 in i["ids"] for i in server.attention([_hb]))
+_h2 = _hmk("plain blocked", "")
+server.db.execute("UPDATE tasks SET updated=? WHERE id=?", (_ago(60 * 24 * 4), _h2))
+server._wl_cache[1] = None
+_w = server.workload_calc(only="HoldAg", fresh=True)["HoldAg"]
+assert _w["bl"] == 1 and _w["hold"] == 1 and _w["ids"]["blocked"] == [_h2], _w
+assert any(r["k"] == "blocked" and r["ids"] == [_h2] for r in J("GET", f"/sprints/{_hs_}/stats")[1]["risks"])
+assert any(i["id"] == _h2 for i in server.digest_build()["s"]["blocked"]["i"])
+assert any(i["k"] == "blocked-p12" and _h2 in i["ids"] for i in server.attention([_hb]))
+print("v53 hold label selftest OK")

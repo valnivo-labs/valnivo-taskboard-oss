@@ -275,6 +275,11 @@ def _lbl_set(labels):
     return {x.strip().lower() for x in str(labels or "").split(",") if x.strip()}
 
 
+def is_hold(t):
+    """#154: a blocked card labelled `hold` is a deliberate hold: visible on the board, never counted or alerted as a blocker."""
+    return t["status"] == "blocked" and "hold" in _lbl_set(t["labels"])
+
+
 def _lbl_csv(ls):
     return ",".join(sorted(ls))[:200]
 
@@ -2605,7 +2610,7 @@ def _escalate_task(actor, old, new):
     tid, bid, title, asg = new["id"], new["board_id"], new["title"][:70], new["assignee"]
     if is_owner_assignee(asg) and (old is None or not is_owner_assignee(old["assignee"])):
         escalate("human-card", actor, tid, bid, "#%d '%s' now waits on a human (%s)" % (tid, title, asg), skip=(asg,))
-    if new["status"] == "blocked" and (old is None or old["status"] != "blocked") and new["priority"] <= 2:
+    if new["status"] == "blocked" and (old is None or old["status"] != "blocked") and new["priority"] <= 2 and not is_hold(new):
         escalate("blocked", actor, tid, bid, "#%d '%s' (p%s) is blocked: %s" % (tid, title, new["priority"], new["blocker"] or "no note"), skip=(asg,))
 
 
@@ -2620,7 +2625,7 @@ def attention(bid=None):
     def add(k, sev, msg, ts):
         if ts:
             items.append({"k": k, "sev": sev, "m": msg % len(ts), "ids": [t["id"] for t in ts][:30]})
-    add("blocked-p12", "high", "%d high-priority task(s) blocked", [t for t in op if t["status"] == "blocked" and t["priority"] <= 2])
+    add("blocked-p12", "high", "%d high-priority task(s) blocked", [t for t in op if t["status"] == "blocked" and t["priority"] <= 2 and not is_hold(t)])
     add("human-wait", "med", "%d task(s) waiting on a human", [t for t in op if is_owner_assignee(t["assignee"])])
     add("stale", "med", "%d important/owner task(s) stale", [t for t in op if t["nudge"] and (t["priority"] <= 2 or is_owner_assignee(t["assignee"]))])
     xs = []
@@ -3598,13 +3603,17 @@ def workload_calc(only=None, fresh=False):
     if only and not any(n.lower() == only.lower() for n in names):
         names.append(next((k for k in reg if k.lower() == only.lower()), only))   # unlisted/test agent: still computed alongside the rest
     fr, fa = _in("board_id", sorted(scope) if scope is not None else None)
-    out = {n: {"ag": n, "by": {"todo": 0, "in_progress": 0, "review": 0, "blocked": 0}, "bids": {"todo": [], "blocked": [], "stale": [], "od": []}, "lbl": {}} for n in names}
+    out = {n: {"ag": n, "by": {"todo": 0, "in_progress": 0, "review": 0, "blocked": 0}, "bids": {"todo": [], "blocked": [], "stale": [], "od": [], "hold": []}, "lbl": {}} for n in names}
     low = {n.lower(): n for n in names}
     for t in rows("SELECT id, status, assignee, due, updated, labels FROM tasks WHERE status IN ('todo','in_progress','review','blocked') AND assignee!=''" + fr + " ORDER BY id", fa):
         n = low.get(t["assignee"].lower())
         if not n:
             continue
         m = out[n]
+        if is_hold(t):
+            m["bids"]["hold"].append(t["id"])      # #154: deliberate hold, not a blocker
+            m["lbl"][t["id"]] = t["labels"] or ""
+            continue
         m["by"][t["status"]] += 1
         if t["status"] in ("todo", "blocked"):
             m["bids"][t["status"]].append(t["id"])
@@ -3634,7 +3643,8 @@ def workload_calc(only=None, fresh=False):
     for n, m in out.items():
         a = reg.get(n)
         m["cap"] = int((a["capacity"] if a else 0) or cfg["cap"])
-        m["open"] = sum(m["by"].values())
+        m["hold"] = len(m["bids"]["hold"])
+        m["open"] = sum(m["by"].values()) + m["hold"]
         m["ld"] = round(m["open"] / m["cap"], 2)
         for k in ("rvn", "rvw", "un", "una", "rf"):
             m.setdefault(k, 0)
@@ -3652,7 +3662,7 @@ def workload_calc(only=None, fresh=False):
         m.pop("_ov", None)
         m.pop("lbl", None)
         b = m.pop("bids")
-        m["ids"] = {"todo": b["todo"][:5], "blocked": b["blocked"][:5], "stale": b["stale"][:5], "overdue": b["od"][:5]}
+        m["ids"] = {"todo": b["todo"][:5], "blocked": b["blocked"][:5], "stale": b["stale"][:5], "overdue": b["od"][:5], "hold": b["hold"][:5]}
     _wl_cache[0], _wl_cache[1] = time.time(), (skey, out)
     return {k: v for k, v in out.items() if k.lower() == only.lower()} if only else out
 
@@ -3824,9 +3834,12 @@ def digest_build(scope=None):
     pend = {}
     for r in rows("SELECT r.task_id, r.reviewer, r.created FROM reviews r JOIN tasks t ON t.id=r.task_id WHERE r.status='pending'" + fr.replace("board_id", "t.board_id") + " ORDER BY r.created", fa):
         pend.setdefault(r["task_id"], []).append(r)
-    esc_n = 0
-    for t in rows("SELECT id, board_id, status, assignee, updated, approved_at, deploy_owner, blocked_by, blocker FROM tasks WHERE status IN ('review','approved','deploying','blocked','in_progress')" + fr + " ORDER BY updated", fa):
+    esc_n = hold_n = 0
+    for t in rows("SELECT id, board_id, status, assignee, updated, approved_at, deploy_owner, blocked_by, blocker, labels FROM tasks WHERE status IN ('review','approved','deploying','blocked','in_progress')" + fr + " ORDER BY updated", fa):
         if _TEST_AGENT.search(t["assignee"] or ""):
+            continue
+        if is_hold(t):
+            hold_n += 1
             continue
         st = t["status"]
         lim = cfg[st + "_h"]
@@ -3864,7 +3877,7 @@ def digest_build(scope=None):
     bz = sorted(n for n, m in wl.items() if m["lv"] == "busy")
     n = sum(len(v) for v in items.values()) + len(rv) + len(ov) + len(bz)
     s = {k: {"n": len(v), "i": v[:mx]} for k, v in items.items() if v}
-    return {"n": n, "esc": esc_n, "s": s, "rv": rv[:mx], "ov": ov[:mx], "b": bz[:mx],
+    return {"n": n, "esc": esc_n, "hold": hold_n, "s": s, "rv": rv[:mx], "ov": ov[:mx], "b": bz[:mx],
             "cfg": {k: cfg[k] for k in ("times", "days", "tz", "review_h", "approved_h", "deploying_h", "blocked_h", "in_progress_h", "esc_x")}}
 
 
@@ -6806,7 +6819,8 @@ def sprint_stats(sid):
         late = [t["id"] for t in open_ if prio(t) and t["status"] in ("backlog", "todo")]
         if late and time_pct >= 0.5:
             risk("late-start", "high", "%d high-priority task(s) not started with %d%% of the sprint gone" % (len(late), round(time_pct * 100)), late)
-    blk = [t for t in open_ if t["status"] == "blocked"]
+    blk = [t for t in open_ if t["status"] == "blocked" and not is_hold(t)]
+    hold = [t["id"] for t in open_ if is_hold(t)]
     if blk:
         risk("blocked", "high" if any(prio(t) for t in blk) else "med", "%d blocked task(s)" % len(blk), [t["id"] for t in blk])
     owner = [t["id"] for t in open_ if is_owner_assignee(t["assignee"])]
@@ -6848,7 +6862,7 @@ def sprint_stats(sid):
             "days": {"total": span, "elapsed": elapsed, "left": left},
             "w": {"scope": scope, "done": done, "open": len(open_), "open_w": open_w, "pts": use_pts, "declined": declined, "by": by},
             "pct": {"time": time_pct, "done": done_pct}, "pace": pace, "proj": proj, "added": added,
-            "load": {a: len(l) for a, l in sorted(load.items())}, "health": health, "risks": risks, "burn": burn}
+            "load": {a: len(l) for a, l in sorted(load.items())}, "health": health, "risks": risks, "hold": hold, "burn": burn}
 
 
 def _in(col, bid):
@@ -7113,7 +7127,7 @@ def digest_text():
         lines.append("%s %s: %d/%d done, %d day(s) left, %d open" % ({"green": "OK", "amber": "WATCH", "red": "RISK"}[st["health"]], st["n"], w["done"], w["scope"], st["days"]["left"], w["open"]))
         for k in st["risks"][:3]:
             lines.append("   - [%s] %s" % (k["sev"], k["m"]))
-    bl = rows("SELECT COUNT(*) n FROM tasks WHERE status='blocked'")[0]["n"]
+    bl = rows("SELECT COUNT(*) n FROM tasks WHERE status='blocked' AND (',' || REPLACE(LOWER(labels),' ','') || ',') NOT LIKE '%,hold,%'")[0]["n"]
     nu = rows("SELECT COUNT(*) n FROM tasks WHERE nudge!='' AND status NOT IN ('done','declined')")[0]["n"]
     lines.append("Blocked: %d, stale: %d" % (bl, nu))
     return "\n".join(lines)
@@ -7304,7 +7318,7 @@ def dashboard(q):
             o["sp"] = sprint_row(sp[0], False)
             stt = sprint_stats(sp[0]["id"])
             o["sp"].update({"hl": stt["health"], "tp": stt["pct"]["time"], "rk": len(stt["risks"]), "proj": stt["proj"]})
-        bl = [r["id"] for r in rows("SELECT id FROM tasks WHERE board_id=? AND status='blocked'", (b["id"],))]
+        bl = [r["id"] for r in rows("SELECT id, labels, status FROM tasks WHERE board_id=? AND status='blocked'", (b["id"],)) if not is_hold(r)]
         nu = [r["id"] for r in rows("SELECT id FROM tasks WHERE board_id=? AND nudge!='' AND status NOT IN ('done','declined')", (b["id"],))]
         if bl:
             o["bl"] = bl
