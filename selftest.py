@@ -1864,3 +1864,104 @@ assert server.rows("SELECT status FROM reviews WHERE id=?", (_g,))[0]["status"] 
 J("PATCH", f"/tasks/{_p}", {"do": "codex-vm"}, tok="stok")
 assert J("POST", f"/reviews/{_g}/decide", {"decision": "approve", "as": "Boss"}, tok="stok")[0] == 200 and server.rows("SELECT status FROM tasks WHERE id=?", (_p,))[0]["status"] == "approved"
 print("v49b lifecycle create/handoff/review-approve OK")
+
+# ---- v50: workload test (levels, thresholds, role scoping, dedupe, noise exclusion)
+import time as _tw
+_db = server.db
+_old = _tw.strftime("%Y-%m-%d %H:%M:%S", _tw.gmtime(_tw.time() - 8 * 3600))
+for _n, _c, _s in (("WlA", 4, "py,qa,docs"), ("WlB", 10, "py"), ("WlC", 10, ""), ("WlD", 10, ""), ("WlE", 10, ""), ("WlF", 10, ""), ("WlG", 20, ""), ("WlH", 10, ""), ("selftest-wl", 2, "")):
+    assert J("POST", "/agents", {"n": _n, "capacity": _c, "skills": _s})[0] in (200, 201), _n
+def _wt(who, n, st="todo", **kw):
+    ids = []
+    for i in range(n):
+        r = J("POST", "/tasks", {"b": BID, "t": "wl %s %d" % (who, i), "as": who, "st": st, **kw}); assert r[0] in (200, 201), r
+        ids.append(r[1]["id"])
+    return ids
+_a = _wt("WlA", 5, lb="py")                                        # 5 open of cap 4: overloaded by ratio alone
+_wt("WlB", 3)                                                      # 3/10: ok
+_d = _wt("WlD", 2); _db.execute("UPDATE tasks SET due='2020-01-01' WHERE id=?", (_d[0],))      # one overdue: busy
+_g = _wt("WlG", 4, st="blocked", bl="x"); _db.execute("UPDATE tasks SET due='2020-01-01' WHERE id IN (%s)" % ",".join(str(i) for i in _g[:3]))     # 4 blocked + 3 overdue: two over-limit signals at 4/20
+_wt("selftest-wl", 3)
+_db.execute("UPDATE notifications SET read=1 WHERE agent LIKE 'Wl%' OR agent LIKE 'selftest-wl'")
+_db.execute("INSERT INTO notifications(agent,type,actor,summary,read,ts) VALUES('WlE','msg.direct','Owner','please look',0,?)", (_old,))                    # actionable, 8 h old: busy
+for _i in range(30):
+    _db.execute("INSERT INTO notifications(agent,type,actor,summary,read,ts) VALUES('WlF',?,'Owner','fyi',0,?)", (("msg.fyi", "task.updated", "esc.stale")[_i % 3], _old))   # noise only: stays idle
+for _i in range(2):
+    _db.execute("INSERT INTO runs(agent,status,started) VALUES('WlH','failed',CURRENT_TIMESTAMP)")
+_wk = lambda tok="tok", q="": {a["ag"]: a for a in J("GET", "/workload?fresh=1" + q, tok=tok)[1]["i"]}
+W = _wk()
+assert W["WlA"]["lv"] == "overloaded" and W["WlA"]["open"] == 5 and W["WlA"]["cap"] == 4 and W["WlA"]["by"]["todo"] == 5, W["WlA"]
+assert W["WlB"]["lv"] == "ok" and W["WlB"]["action"] == "", W["WlB"]
+assert W["WlC"]["lv"] == "idle" and "free slot" in W["WlC"]["action"], W["WlC"]
+assert W["WlD"]["lv"] == "busy" and W["WlD"]["od"] == 1 and W["WlD"]["ids"]["overdue"] == [_d[0]], W["WlD"]
+assert W["WlE"]["lv"] == "busy" and W["WlE"]["un"] == 1 and W["WlE"]["una"] >= 8 * 3600 - 5, W["WlE"]
+assert W["WlF"]["lv"] == "idle" and W["WlF"]["un"] == 0, W["WlF"]                       # FYI / coalesced / automated noise is not actionable
+assert W["WlG"]["lv"] == "overloaded" and W["WlG"]["ld"] < 1 and W["WlG"]["bl"] == 4 and W["WlG"]["od"] == 3 and len(W["WlG"]["why"]) >= 2, W["WlG"]
+assert W["WlH"]["lv"] == "busy" and W["WlH"]["rf"] == 2, W["WlH"]
+assert "selftest-wl" not in W and "selftest-wl" in _wk(q="&agent=selftest-wl")           # test agents are hidden unless asked for by name
+assert W["WlA"]["why"][0].startswith("5 open of cap 4") and "reassign 2 oldest todo" in W["WlA"]["action"] and "to WlB" in W["WlA"]["action"], W["WlA"]["action"]   # least loaded with matching skill (py)
+assert "unblock #" in W["WlG"]["action"] and "reschedule or reassign overdue" in W["WlG"]["action"], W["WlG"]["action"]
+assert [a["lv"] for a in J("GET", "/workload?fresh=1")[1]["i"]][:2] == ["overloaded", "overloaded"]       # worst first
+# thresholds are configurable and validated
+assert J("POST", "/settings", {"workload_cfg": '{"blocked": [3]}'})[1]["e"] == "bad" and J("POST", "/settings", {"workload_cfg": '{"nope": 1}'})[1]["e"] == "bad" and J("POST", "/settings", {"workload_cfg": "nonsense"})[1]["e"] == "bad"
+assert J("POST", "/settings", {"workload_cfg": '{"blocked": [1, 9], "ratio": [0.3, 0.8]}'})[0] == 200
+W2 = _wk()
+assert W2["WlG"]["lv"] == "busy" and W2["WlB"]["lv"] == "busy" and W2["WlA"]["lv"] == "overloaded", (W2["WlG"], W2["WlB"])        # blocked only over at 9; 3/10 now above the 0.3 busy ratio
+assert J("GET", "/workload")[1]["cfg"]["ratio"] == [0.3, 0.8]
+J("POST", "/settings", {"workload_cfg": ""}); assert _wk()["WlB"]["lv"] == "ok"
+# role scoping: supervisor and admin see everyone, others only themselves, never someone else
+assert {"WlA", "WlG"} <= set(_wk(tok="stok")) and len(_wk(tok="stok")) == len(W)
+_w = J("GET", "/workload", tok="wtok"); assert _w[0] == 200 and [a["ag"] for a in _w[1]["i"]] == ["Worker"], _w
+assert J("GET", "/workload?agent=WlA", tok="wtok")[0] == 403 and J("GET", "/workload?agent=Worker", tok="wtok")[0] == 200
+assert [a["ag"] for a in J("GET", "/workload", tok="vtok")[1]["i"]] == ["v"] and J("GET", "/workload?agent=WlA", tok="vtok")[0] == 403
+assert [a["ag"] for a in J("GET", "/workload?agent=wla")[1]["i"]] == ["WlA"]
+# briefing: compact line for supervisors/admins only, names only, busy/overloaded only
+server._wl_cache[1] = None
+_bw = J("GET", "/briefing?as=Sup%20Bot", tok="stok")[1].get("wl") or {}
+assert "WlA" in _bw["o"] and "WlG" in _bw["o"] and "WlD" in _bw["b"] and "WlB" not in _bw["o"] + _bw["b"] and "WlC" not in _bw["o"] + _bw["b"], _bw
+assert "wl" not in J("GET", "/briefing?as=Worker", tok="wtok")[1]
+# overload notification: on transition to overloaded, deduped for 24 h per agent, quiet (no push, no wake-up)
+_cnt = lambda ag: _db.execute("SELECT COUNT(*) FROM notifications WHERE agent=? AND type='workload.overload' AND summary LIKE ?", ("Sup Bot", "%" + ag + " is overloaded%")).fetchone()[0]
+_sent = server.workload_tick(); assert "WlA" in _sent and "WlG" in _sent and "WlB" not in _sent and "selftest-wl" not in _sent, _sent
+assert _cnt("WlA") == 1 and server.workload_tick() == [] and _cnt("WlA") == 1                                          # no change, no repeat
+_n = _db.execute("SELECT hook, woken, actor FROM notifications WHERE type='workload.overload' ORDER BY id DESC LIMIT 1").fetchone(); assert _n["hook"] == "quiet" and _n["woken"] == 1 and _n["actor"] == "system", dict(_n)
+J("POST", "/agents", {"n": "WlA", "capacity": 40}); assert server.workload_tick() == [] and _wk()["WlA"]["lv"] == "ok"      # recovered: no notification
+J("POST", "/agents", {"n": "WlA", "capacity": 4}); assert server.workload_tick() == [] and _cnt("WlA") == 1               # flaps back within 24 h: deduped
+J("POST", "/agents", {"n": "WlA", "capacity": 40}); server.workload_tick()
+_db.execute("INSERT OR REPLACE INTO settings(k,v) VALUES('wln:wla',?)", (_tw.strftime("%Y-%m-%d %H:%M:%S", _tw.gmtime(_tw.time() - 25 * 3600)),))
+J("POST", "/agents", {"n": "WlA", "capacity": 4}); assert server.workload_tick() == ["WlA"] and _cnt("WlA") == 2          # a day later it may notify again
+# throughput and time in status come from the status history
+_c = _wt("WlC", 1); J("PATCH", f"/tasks/{_c[0]}", {"st": "in_progress"}); J("PATCH", f"/tasks/{_c[0]}", {"st": "done"})
+_wc = _wk()["WlC"]; assert _wc["done7"] == 1 and "in_progress" in _wc["avg"] and _wc["open"] == 0, _wc
+# a review waiting ON an agent is counted, with its wait
+_r = J("POST", f"/tasks/{_a[0]}/review", {"reviewer": "WlB", "note": "pls"}, tok="tok")[1]
+_db.execute("UPDATE reviews SET created=? WHERE id=?", (_old, _r["id"]))
+_wb = _wk()["WlB"]; assert _wb["rvn"] == 1 and _wb["rvw"] >= 8 * 3600 - 5, _wb
+print("v50 workload selftest OK")
+# bug guard: the UI api() helper sends full=1, so the drill-down must read the long shape {items:[{id,title,status}]}
+_js2 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "app.js")).read()
+_dd = _js2[_js2.index("tr[data-wl]"):][:900]
+assert "t.items" in _dd and "x.title" in _dd and "x.status" in _dd and "t.i " not in _dd and "x.st " not in _dd, _dd
+_lt = J("GET", "/tasks?as=WlB&open=1&limit=50&full=1")[1]; assert "items" in _lt and all("title" in x and "status" in x for x in _lt["items"]), _lt
+print("v50 workload drill-down guard OK")
+# workload cache is per board scope; ?agent= computes every agent so the action still names a candidate
+_sc = J("POST", "/boards", {"n": "WlScope"})[1]["id"]; J("POST", "/sprints", {"b": _sc, "st": "active"})
+J("POST", "/tasks", {"b": _sc, "t": "wl scoped", "as": "WlA", "st": "todo"})
+_stk = J("POST", "/tokens", {"n": "WlSupScoped", "role": "supervisor", "boards": [_sc]})[1]["token"]
+_full = _wk(tok="stok")["WlA"]["open"]; _lim = lambda: {a["ag"]: a for a in J("GET", "/workload", tok=_stk)[1]["i"]}
+_unl = lambda: {a["ag"]: a for a in J("GET", "/workload", tok="stok")[1]["i"]}
+for _order in ("scoped-first", "full-first"):
+    server._wl_cache[1] = None
+    if _order == "scoped-first":
+        assert _lim()["WlA"]["open"] == 1, _lim()["WlA"]
+        assert _unl()["WlA"]["open"] == _full, (_unl()["WlA"], _full)                                  # no leak of the scoped view
+    else:
+        assert _unl()["WlA"]["open"] == _full, _unl()["WlA"]
+        assert _lim()["WlA"]["open"] == 1, _lim()["WlA"]                                               # unscoped cache is not reused for a scoped token
+    assert "WlA" in (J("GET", "/briefing?as=Sup%20Bot", tok="stok")[1].get("wl") or {}).get("o", []), _order
+    assert "WlA" not in (J("GET", "/briefing?as=WlSupScoped", tok=_stk)[1].get("wl") or {}).get("o", []), _order   # 1 open of cap 4 in its scope: not overloaded
+_fa = _wk(tok="stok")["WlA"]["action"]
+for _q in ("WlA", "wla", "WLA"):
+    _one = J("GET", "/workload?agent=" + _q, tok="stok")[1]["i"]
+    assert [a["ag"] for a in _one] == ["WlA"] and _one[0]["action"] == _fa and "to WlB" in _one[0]["action"] and "add a helper" not in _one[0]["action"], (_q, _one[0]["action"], _fa)
+print("workload scope cache + ?agent= action selftest OK")

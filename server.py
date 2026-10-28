@@ -1132,7 +1132,7 @@ def notify(agent, typ, actor, task_id, board_id, summary, delta=None):
                      (agent, task_id, board_id, typ, actor, summary[:300], json.dumps(delta, separators=(",", ":")) if delta else ""))
     with inbox_cv:
         inbox_cv.notify_all()
-    if typ in QUIET_TYPES:           # for the next briefing, never a push, a wake-up or a job
+    if typ in QUIET_TYPES or typ == "workload.overload":           # for the next briefing, never a push, a wake-up or a job
         db.execute("UPDATE notifications SET hook='quiet', woken=1 WHERE id=?", (cur.lastrowid,))
         return
     _push_hook(agent, cur.lastrowid)
@@ -3458,6 +3458,273 @@ def activity_list(q, role):
     stamp = lambda o: (o.get("last") or {}).get("ts") or o.get("seen") or ""
     res.sort(key=lambda o: (1 if "last" in o else 0, stamp(o)), reverse=True)
     return {"n": len(res), "i": res if one else res[:30]}
+
+
+# ---------------------------------------------------------------- workload test: who is overwhelmed (pure computation over board data, no model calls)
+# Thresholds are [busy, over] pairs; override any of them with the board setting `workload_cfg` (JSON object, e.g. {"cap":6,"blocked":[1,3]}).
+WL_DEFAULTS = {
+    "cap": 8,                  # open-task cap for agents without their own `capacity`
+    "ratio": [0.7, 1.0],       # open tasks / cap
+    "review_n": [3, 5],        # reviews waiting ON the agent as reviewer
+    "review_wait_h": [24, 72],  # longest such wait, hours
+    "blocked": [2, 4],         # own blocked tasks
+    "stale": [2, 4],           # own todo/in_progress/review tasks without any update for stale_h
+    "stale_h": 72,
+    "overdue": [1, 3],         # own open tasks past their due date
+    "inbox_n": [10, 25],       # unread ACTIONABLE inbox items
+    "inbox_age_h": [6, 24],    # age of the oldest unread actionable item, hours
+    "run_failed": [2, 5],      # failed/timed-out runs in 7 days
+}
+WL_NOISE = QUIET_TYPES | COALESCE_TYPES | HOOK_ALERT_TYPES | frozenset({"review.sla", "esc.stale", "esc.sprint-red"}) | {"workload.overload"}      # FYI chatter: never counts as actionable inbox
+WL_LEVELS = ("idle", "ok", "busy", "overloaded")
+_wl_cache = [0.0, None]
+
+
+def wl_cfg():
+    cfg = json.loads(json.dumps(WL_DEFAULTS))
+    try:
+        o = json.loads(get_setting("workload_cfg") or "{}")
+    except ValueError:
+        o = {}
+    for k, v in (o.items() if isinstance(o, dict) else ()):
+        d = cfg.get(k)
+        if isinstance(d, list) and isinstance(v, list) and len(v) == 2 and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v):
+            cfg[k] = [v[0], v[1]]
+        elif isinstance(d, (int, float)) and isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+            cfg[k] = v
+    return cfg
+
+
+def wl_check_cfg(v):
+    try:
+        o = json.loads(v)
+        assert isinstance(o, dict) and all(k in WL_DEFAULTS for k in o)
+        for k, x in o.items():
+            if isinstance(WL_DEFAULTS[k], list):
+                assert isinstance(x, list) and len(x) == 2 and all(isinstance(y, (int, float)) and not isinstance(y, bool) and y >= 0 for y in x) and x[0] <= x[1]
+            else:
+                assert isinstance(x, (int, float)) and not isinstance(x, bool) and x > 0
+    except Exception:
+        raise ApiError("bad", 400, "workload_cfg")
+
+
+def _wl_times(now):
+    """Status timeline of the last 14 days from the event log: per assignee done count (7 d) and hours spent in in_progress / review."""
+    tl = {}
+    for e in rows("SELECT ts, payload FROM events WHERE type LIKE 'task.%' AND ts>=? AND json_extract(payload,'$.d.st') IS NOT NULL ORDER BY id LIMIT 20000", (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 14 * 86400)),)):
+        try:
+            pl = json.loads(e["payload"])
+            tl.setdefault(int(pl["id"]), []).append((_ts(e["ts"]), pl["d"]["st"]))
+        except (ValueError, KeyError, TypeError):
+            continue
+    owner = {}
+    ids = list(tl)
+    for i in range(0, len(ids), 500):
+        c = ids[i:i + 500]
+        for r in rows("SELECT id, assignee FROM tasks WHERE id IN (%s)" % ",".join("?" * len(c)), c):
+            owner[r["id"]] = (r["assignee"] or "").lower()
+    done, dur = {}, {}
+    cut = now - 7 * 86400
+    for tid, seq in tl.items():
+        a = owner.get(tid, "")
+        if not a:
+            continue
+        for k, (t0, st) in enumerate(seq):
+            if st == "done" and t0 >= cut and (k == 0 or seq[k - 1][1] != "done"):
+                done[a] = done.get(a, 0) + 1
+            if st in ("in_progress", "review") and k + 1 < len(seq) and seq[k + 1][0] >= cut:
+                dur.setdefault(a, {"in_progress": [], "review": []})[st].append(seq[k + 1][0] - t0)
+    return done, dur
+
+
+def _wl_level(m, cfg):
+    """(level, why[], number of over-threshold signals) from one agent's metrics; thresholds are [busy, over]."""
+    hits = []
+
+    def chk(key, val, label):
+        b, o = cfg[key]
+        if val >= o:
+            hits.append((2, label))
+        elif val >= b:
+            hits.append((1, label))
+    chk("ratio", m["ld"], "%d open of cap %d" % (m["open"], m["cap"]))
+    chk("review_n", m["rvn"], "%d review(s) waiting on them" % m["rvn"])
+    chk("review_wait_h", m["rvw"] / 3600, "oldest review wait %.0fh" % (m["rvw"] / 3600))
+    chk("blocked", m["bl"], "%d blocked" % m["bl"])
+    chk("stale", m["stale"], "%d stale (no update %dh)" % (m["stale"], cfg["stale_h"]))
+    chk("overdue", m["od"], "%d overdue" % m["od"])
+    chk("inbox_n", m["un"], "%d unread actionable" % m["un"])
+    chk("inbox_age_h", m["una"] / 3600, "oldest actionable unread %.0fh" % (m["una"] / 3600))
+    chk("run_failed", m["rf"], "%d failed run(s) in 7d" % m["rf"])
+    over = [h for h in hits if h[0] == 2]
+    if m["ld"] >= cfg["ratio"][1] or len(over) >= 2:
+        lv = "overloaded"
+    elif hits:
+        lv = "busy"
+    elif m["open"] == 0 and m["un"] == 0:
+        lv = "idle"
+    else:
+        lv = "ok"
+    return lv, [h[1] for h in sorted(hits, key=lambda x: -x[0])], len(over)
+
+
+def workload_calc(only=None, fresh=False):
+    """{agent: metrics}. cap, open, ld (open/cap), by {todo,in_progress,review,blocked}, rvn/rvw (reviews waiting ON them: count, longest wait s), bl, stale, od,
+    un/una (unread actionable: count, oldest age s), done7, avg {in_progress,review} hours, rf (failed runs 7d), seen/age, lv (level), why, action."""
+    scope = allowed_boards()
+    skey = None if scope is None else frozenset(scope)
+    hit = _wl_cache[1]
+    if not fresh and hit is not None and hit[0] == skey and time.time() - _wl_cache[0] < 20:
+        return {k: v for k, v in hit[1].items() if k.lower() == only.lower()} if only else hit[1]
+    cfg, now = wl_cfg(), time.time()
+    today = time.strftime("%Y-%m-%d", time.gmtime(now))
+    stale_cut = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - cfg["stale_h"] * 3600))
+    wk = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 7 * 86400))
+    reg = {r["name"]: r for r in rows("SELECT * FROM agents")}
+    names = [n for n in reg if not _TEST_AGENT.search(n)]
+    if only and not any(n.lower() == only.lower() for n in names):
+        names.append(next((k for k in reg if k.lower() == only.lower()), only))   # unlisted/test agent: still computed alongside the rest
+    fr, fa = _in("board_id", sorted(scope) if scope is not None else None)
+    out = {n: {"ag": n, "by": {"todo": 0, "in_progress": 0, "review": 0, "blocked": 0}, "bids": {"todo": [], "blocked": [], "stale": [], "od": []}, "lbl": {}} for n in names}
+    low = {n.lower(): n for n in names}
+    for t in rows("SELECT id, status, assignee, due, updated, labels FROM tasks WHERE status IN ('todo','in_progress','review','blocked') AND assignee!=''" + fr + " ORDER BY id", fa):
+        n = low.get(t["assignee"].lower())
+        if not n:
+            continue
+        m = out[n]
+        m["by"][t["status"]] += 1
+        if t["status"] in ("todo", "blocked"):
+            m["bids"][t["status"]].append(t["id"])
+        if t["status"] != "blocked" and (t["updated"] or "") < stale_cut:
+            m["bids"]["stale"].append(t["id"])
+        if t["due"] and t["due"] < today:
+            m["bids"]["od"].append(t["id"])
+        m["lbl"][t["id"]] = t["labels"] or ""
+    for r in rows("SELECT r.reviewer, r.created FROM reviews r JOIN tasks t ON t.id=r.task_id WHERE r.status='pending'" + fr.replace("board_id", "t.board_id"), fa):
+        n = low.get(r["reviewer"].lower())
+        if n:
+            out[n]["rvn"] = out[n].get("rvn", 0) + 1
+            out[n]["rvw"] = max(out[n].get("rvw", 0), int(max(0, now - _ts(r["created"]))))
+    for r in rows("SELECT agent, type, ts, read FROM notifications WHERE read=0 OR ts>=?", (wk,)):
+        n = low.get(r["agent"].lower())
+        if not n:
+            continue
+        m = out[n]
+        if not r["read"] and r["type"] not in WL_NOISE:
+            m["un"] = m.get("un", 0) + 1
+            m["una"] = max(m.get("una", 0), int(max(0, now - _ts(r["ts"]))))
+    for r in rows("SELECT agent, COUNT(*) c FROM runs WHERE status IN ('failed','timeout') AND started>=? GROUP BY agent COLLATE NOCASE", (wk,)):
+        n = low.get(r["agent"].lower())
+        if n:
+            out[n]["rf"] = r["c"]
+    done, dur = _wl_times(now)
+    for n, m in out.items():
+        a = reg.get(n)
+        m["cap"] = int((a["capacity"] if a else 0) or cfg["cap"])
+        m["open"] = sum(m["by"].values())
+        m["ld"] = round(m["open"] / m["cap"], 2)
+        for k in ("rvn", "rvw", "un", "una", "rf"):
+            m.setdefault(k, 0)
+        m["bl"], m["stale"], m["od"] = m["by"]["blocked"], len(m["bids"]["stale"]), len(m["bids"]["od"])
+        m["done7"] = done.get(n.lower(), 0)
+        m["avg"] = {k: round(sum(v) / len(v) / 3600, 1) for k, v in dur.get(n.lower(), {}).items() if v}
+        m["seen"] = (a["last_seen"] if a else "") or ""
+        m["sk"] = (a["skills"] if a else "") or ""
+        if m["seen"]:
+            m["age"] = int(max(0, now - _ts(m["seen"])))
+        m["lv"], m["why"], m["_ov"] = _wl_level(m, cfg)
+    for n, m in out.items():
+        m["action"] = _wl_action(n, m, out, cfg)
+    for m in out.values():
+        m.pop("_ov", None)
+        m.pop("lbl", None)
+        b = m.pop("bids")
+        m["ids"] = {"todo": b["todo"][:5], "blocked": b["blocked"][:5], "stale": b["stale"][:5], "overdue": b["od"][:5]}
+    _wl_cache[0], _wl_cache[1] = time.time(), (skey, out)
+    return {k: v for k, v in out.items() if k.lower() == only.lower()} if only else out
+
+
+def _wl_skills(s):
+    return {x.strip().lower() for x in (s or "").split(",") if x.strip()}
+
+
+def _wl_action(n, m, all_, cfg):
+    """Concrete next steps for a busy/overloaded agent; an idle one says it can take work."""
+    if m["lv"] == "idle":
+        return "can take work: %d free slot(s)" % m["cap"]
+    if m["lv"] == "ok":
+        return ""
+    acts, todo, r0, r1 = [], m["bids"]["todo"], cfg["ratio"][0], cfg["ratio"][1]
+    if m["ld"] >= r0 and todo:
+        k = max(1, min(len(todo), m["open"] - m["cap"] + 1 if m["ld"] >= r1 else m["open"] - int(m["cap"] * r0)))
+        want = set()
+        for tid in todo[:k]:
+            want |= _wl_skills(m["lbl"].get(tid))
+        cand = sorted((-len(_wl_skills(o["sk"]) & want), o["ld"], o["ag"]) for o in all_.values() if o["ag"] != n and o["lv"] in ("idle", "ok") and o["ld"] < r0)
+        if cand:
+            acts.append("reassign %d oldest todo (#%s) to %s" % (k, ",".join(str(i) for i in todo[:k]), cand[0][2]))
+        else:
+            acts.append("add a helper producer: nobody else has headroom (%d todo to hand over)" % len(todo))
+    elif m["ld"] >= r1:
+        acts.append("raise cap above %d if they keep up (%d done in 7d)" % (m["cap"], m["done7"]) if m["done7"] >= m["open"] else "nothing in todo to hand over: lower cap or finish in-progress work first")
+    if m["rvn"] and (m["rvn"] >= cfg["review_n"][0] or m["rvw"] >= cfg["review_wait_h"][0] * 3600):
+        acts.append("decide %d review(s) waiting on them (oldest %.0fh) or switch reviewer" % (m["rvn"], m["rvw"] / 3600))
+    if m["bl"] >= cfg["blocked"][0]:
+        acts.append("unblock #%s" % ",".join(str(i) for i in m["bids"]["blocked"][:3]))
+    if m["od"] >= cfg["overdue"][0]:
+        acts.append("reschedule or reassign overdue #%s" % ",".join(str(i) for i in m["bids"]["od"][:3]))
+    if m["stale"] >= cfg["stale"][0]:
+        acts.append("ping or close stale #%s" % ",".join(str(i) for i in m["bids"]["stale"][:3]))
+    if m["rf"] >= cfg["run_failed"][0]:
+        acts.append("check runner/auth: %d failed run(s) in 7d" % m["rf"])
+    if m["un"] and (m["un"] >= cfg["inbox_n"][0] or m["una"] >= cfg["inbox_age_h"][0] * 3600):
+        acts.append("clear the inbox (%d actionable, oldest %.0fh)" % (m["un"], m["una"] / 3600))
+    if m["lv"] == "overloaded" and m["_ov"] >= 2 and len(_wl_skills(m["sk"])) >= 3:
+        acts.append("split the role: move %s to a helper" % ",".join(sorted(_wl_skills(m["sk"]))[:2]))
+    return "; ".join(acts[:3])
+
+
+def workload_get(q, role, actor):
+    """GET /workload[?agent=Name&fresh=1]: supervisors/admins see every agent, everyone else only themselves."""
+    one = _qv(q, "agent", "by", "ag", "as")
+    if not can(role, "activity.all"):
+        if (one and one.lower() != (actor or "").lower()) or not actor or actor.lower() in GENERIC_ACTORS:
+            raise ApiError("forbidden", 403)
+        one = actor
+    res = workload_calc(one, fresh=str(_qv(q, "fresh") or "").lower() in ("1", "yes", "true"))
+    items = sorted(res.values(), key=lambda m: (-WL_LEVELS.index(m["lv"]), -m["ld"], m["ag"]))
+    return {"n": len(items), "i": items, "cfg": wl_cfg()}
+
+
+def workload_brief():
+    """Compact briefing line for supervisors/admins: busy / overloaded agents only, names only."""
+    res = workload_calc()
+    o = sorted(n for n, m in res.items() if m["lv"] == "overloaded")
+    b = sorted(n for n, m in res.items() if m["lv"] == "busy")
+    return {k: v for k, v in (("o", o), ("b", b)) if v}
+
+
+def workload_tick(actor="system"):
+    """Nudge-loop step: tell the supervisors when an agent turns overloaded (once per agent and 24 h; quiet inbox item, no push, no wake-up)."""
+    res = workload_calc(fresh=True)
+    sent = []
+    with lock:
+        for n, m in res.items():
+            prev = get_setting("wl:" + n.lower())
+            if prev == m["lv"]:
+                continue
+            set_setting("wl:" + n.lower(), m["lv"])
+            if m["lv"] != "overloaded":
+                continue
+            last = get_setting("wln:" + n.lower())
+            if last and last > time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 86400)):
+                continue
+            set_setting("wln:" + n.lower(), now_s())
+            for s in supervisor_names():
+                if s.lower() != n.lower():
+                    notify(s, "workload.overload", actor, None, None, "[workload] %s is overloaded: %s%s" % (n, "; ".join(m["why"][:3]), (" -> " + m["action"]) if m["action"] else ""), {"ag": n, "ld": m["ld"]})
+            sent.append(n)
+    return sent
 
 
 def runs_list(q):
@@ -6406,7 +6673,7 @@ def token_delete(tid):
     return {"id": tid, "x": 1}
 
 
-SETTING_KEYS = ("work_start", "work_end", "work_tz", "digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd", "agent_limits", "run_lost_min", "holder_only", "strict_moves", "auto_verify", "policy_default", "secret_guard", "lesson_cooldown_h", "wait_escalate_min", "witness_names", "node_admission", "watermarks_on", "watermarks", "ops_board", "snapshot_on", "intake_secret", "intake_senders", "intake_board", "media_hosts")
+SETTING_KEYS = ("workload_cfg", "work_start", "work_end", "work_tz", "digest_url", "digest_hour", "alert_url", "backup_keep", "supervisors", "git_secret", "git_autodone", "base_url", "wake_after_min", "prices", "budget_usd", "agent_limits", "run_lost_min", "holder_only", "strict_moves", "auto_verify", "policy_default", "secret_guard", "lesson_cooldown_h", "wait_escalate_min", "witness_names", "node_admission", "watermarks_on", "watermarks", "ops_board", "snapshot_on", "intake_secret", "intake_senders", "intake_board", "media_hosts")
 
 
 def get_setting(k, default=""):
@@ -6439,6 +6706,9 @@ def settings_set(body):
                         assert isinstance(json.loads(v), dict)
                     except Exception:
                         raise ApiError("bad", 400, k)
+                if k == "workload_cfg" and v:
+                    wl_check_cfg(v)
+                    _wl_cache[1] = None
                 if k == "secret_guard" and v not in ("", "redact", "block", "off"):
                     raise ApiError("bad", 400, k)
                 if k == "policy_default" and v not in ("", "loose", "standard", "strict"):
@@ -7286,6 +7556,8 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json(200, run_out(r_[0]))
             if path == "/api/activity" and method == "GET":
                 return self.send_json(200, activity_list(q, self.role))
+            if path == "/api/workload" and method == "GET":
+                return self.send_json(200, workload_get(q, self.role, actor))
             if path == "/api/audit" and method == "GET":
                 return self.send_json(200, audit_get(q, self.role))
             if path == "/api/tasks/move" and method == "POST":
@@ -7307,7 +7579,12 @@ class H(BaseHTTPRequestHandler):
             if path == "/api/overview" and method == "GET":
                 return self.send_json(200, scope_analytics(q))
             if path == "/api/briefing" and method == "GET":
-                return self.send_json(200, briefing(actor, q))
+                res = briefing(actor, q)
+                if can(self.role, "activity.all") and (qint(q, "since", None) is None or q.get("full", ["0"])[0] not in ("0", "")):
+                    wl = workload_brief()
+                    if wl:
+                        res["wl"] = wl
+                return self.send_json(200, res)
             if path == "/api/next" and method == "POST":
                 return self.send_json(200, next_task(actor, self.read_body()))
             mmv = re.fullmatch(r"/api/tasks/(\d+)/move", path)
@@ -7626,7 +7903,7 @@ def _nudge_loop():
             nudge_tick(actor="nudge-cron")
         except Exception:
             pass
-        for fn in (maybe_digest, maybe_backup, recur_tick):
+        for fn in (maybe_digest, maybe_backup, recur_tick, workload_tick):
             try:
                 fn()
             except Exception:

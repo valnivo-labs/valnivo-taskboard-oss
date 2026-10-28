@@ -533,3 +533,5 @@ button.sprow progress{flex:none;height:8px;width:100%}
 .qrow{display:flex;gap:10px;align-items:center;padding:8px 0;border-top:1px solid var(--bd2)}.qrow:first-of-type{border-top:0}.qrow .qtx{flex:1;min-width:0}.qrow .qtx small{color:var(--mut);display:block}
 .qlist{display:grid;grid-template-columns:1fr auto;gap:4px 14px;font-size:13px}.qlist .z{color:var(--mut)}.qlist .nz{font-weight:600}
 .admbody>.panel.on{display:block}
+.wl{width:100%}.wl td,.wl th{vertical-align:top}.wlrow{cursor:pointer}.wlrow:hover{background:var(--subtle)}.wlbox td{padding:4px 0 8px 14px}.wlbox[hidden]{display:none}
+.badge.wl-overloaded{background:var(--bad-bg);color:var(--bad-h)}.badge.wl-busy{background:var(--warn-bg);color:var(--warn)}.badge.wl-ok{background:var(--ok-bg);color:var(--ok)}.badge.wl-idle{background:var(--subtle);color:var(--mut)}

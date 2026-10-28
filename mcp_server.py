@@ -386,6 +386,8 @@ TOOLS = {
               S(actor=s, type=s, task=i, b=i, since=i, limit=i), lambda a: api("GET", "/audit" + qs(a, ["actor", "type", "task", "b", "since", "limit"]))),
     "activity": ("Who did what last: per agent the last task (tk, t), action (ty), one-line m, ts and seen. by=Name adds that agent's last n items (default 10).",
                  S(by=s, n=i), lambda a: api("GET", "/activity" + qs(a, ["by", "n"]))),
+    "workload": ("Supervisor/admin: per agent workload test: open vs cap, by status, reviews waiting on them, blocked/stale/overdue, unread actionable inbox, 7d throughput, failed runs, level idle|ok|busy|overloaded with why and a suggested action. agent=Name for one; others only see themselves.",
+                 S(agent=s, fresh={"type": "boolean"}), lambda a: api("GET", "/workload" + qs(a, ["agent", "fresh"]))),
     "batch": ("Run up to 20 calls in one round trip: ops=[{m:'GET'|'POST'|'PATCH'|'DELETE', p:'/tasks/7', b:{...}}]. Stops at the first error unless cont=true. Returns [{s:status, r:result}].",
               S(["ops"], ops={"type": "array", "items": {"type": "object", "properties": {"m": s, "p": s, "b": {"type": "object"}}}}, cont={"type": "boolean"}), lambda a: api("POST", "/batch", a)),
     "guide": ("A short playbook for your role (~100-250 tokens): agent, coder, reviewer, supervisor or planner.", S(role=s), lambda a: api("GET", "/guide" + qs(a, ["role"]))),
@@ -401,7 +403,7 @@ TOOLS = {
 
 CORE = ["briefing", "next", "finish", "inbox", "claim", "set_task", "add_task", "tasks", "task", "comment", "say", "handoff", "heartbeat", "answer", "decide_review", "lock", "unlock"]
 COORD = ["messages", "claim_next", "release", "locks", "ask", "asks", "cancel_ask", "request_review", "reviews", "watch", "unwatch", "watches", "attach", "attachments", "del_attachment",
-         "cost", "links", "route", "envs", "deploy_env", "freeze_env", "unfreeze_env", "decline_task", "reopen_task", "add_commit", "task_activity", "comments", "verify", "timeline", "decision", "verify_queue", "faq", "policy", "evidence", "propose", "proposals", "lesson", "wait"]
+         "cost", "links", "route", "envs", "deploy_env", "freeze_env", "unfreeze_env", "decline_task", "reopen_task", "add_commit", "task_activity", "comments", "verify", "timeline", "decision", "verify_queue", "workload", "faq", "policy", "evidence", "propose", "proposals", "lesson", "wait"]
 ADMIN = ["tokens", "roles", "settings", "backups", "export_data", "export_csv", "import_csv", "import_data", "del_board", "del_sprint", "chats", "git_secret", "wake_agent", "usage"]
 GROUPS = {"core": CORE, "coord": COORD, "admin": ADMIN, "plan": [n for n in TOOLS if n not in CORE + COORD + ADMIN]}
 PROFILE = os.environ.get("TASKBOARD_TOOLS", "core")      # core (default) | core,coord | core,coord,plan | core,admin | all | tool names

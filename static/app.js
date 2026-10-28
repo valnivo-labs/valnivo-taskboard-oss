@@ -296,9 +296,15 @@ const actTxt = x => `<a data-tk="${x.tk}" style="cursor:pointer;text-decoration:
 const actShort = ts => { const t = Date.parse(ts.replace(" ", "T") + "Z"); return ageTxt(Math.max(0, Math.round((Date.now() - (isNaN(t) ? Date.now() : t)) / 1000))); };
 const actAge = ts => actShort(ts) + " ago";
 const actRow = a => `<div class="kv actrow" data-actby="${esc(a.ag)}"><span class="actl"><b>${esc(a.ag)}</b>${a.tst ? ' <small class="muted">test</small>' : ""}<small class="actt"${a.last ? ` title="${esc(actPlain(a.last))}"` : ""}>${a.last ? actTxt(a.last) : '<span class="muted">no runs or changes</span>'}</small></span><span class="actr"><b>${a.last ? actShort(a.last.ts) : ""}</b><small class="muted">${a.seen ? "seen " + ageTxt(a.age) : "never seen"}</small></span></div><div class="actmore" hidden></div>`;
+function workloadHtml(w) {
+  if (!w || !w.i) return '<p class="muted">Workload is not available for this role.</p>';
+  if (!w.i.length) return '<p class="muted">No agents registered yet.</p>';
+  const rowW = a => `<tr class="wlrow" data-wl="${esc(a.ag)}" title="Click to list their open tasks"><td class="wlag"><b>${esc(a.ag)}</b></td><td><span class="badge wl-${esc(a.lv)}">${esc(a.lv)}</span></td><td class="num">${a.open}/${a.cap}</td><td class="num">${a.by.in_progress}/${a.by.review}/${a.bl}/${a.by.todo}</td><td class="num">${a.rvn}${a.rvn ? " · " + ageTxt(a.rvw) : ""}</td><td class="num">${a.un}${a.un ? " · " + ageTxt(a.una) : ""}</td><td class="num">${a.done7}</td><td class="wlwhy">${esc((a.why || []).join("; "))}</td><td class="wlact">${esc(a.action || "")}</td></tr><tr class="wlbox" hidden><td colspan="9"></td></tr>`;
+  return `<div class="wlwrap"><table class="tb wl"><tr><th>Agent</th><th>Level</th><th class="num">Open/cap</th><th class="num" title="in progress / review / blocked / todo">WIP/rev/blk/todo</th><th class="num" title="reviews waiting on them, longest wait">Reviews</th><th class="num" title="unread actionable items, oldest">Inbox</th><th class="num" title="done in 7 days">Done 7d</th><th>Why</th><th>Suggested action</th></tr>${w.i.map(rowW).join("")}</table></div><p class="muted hint">overloaded = at/over cap or two signals past their limit; busy = one signal past its limit. Limits: setting <code>workload_cfg</code>. Test agents are left out. Click a row for the agent's open tasks.</p>`;
+}
 async function renderSystem() {
-  const el = $("v-system"); let r;
-  try { r = await api("GET", "/system?days=" + sysDays); } catch (_) { return; }
+  const el = $("v-system"); let r, wl = null;
+  try { [r, wl] = await Promise.all([api("GET", "/system?days=" + sysDays), api("GET", "/workload").catch(() => null)]); } catch (_) { return; }
   if (view !== "system") return;
   const mx = Math.max(1, ...r.series.map(x => Math.max(x.done, x.new)));
   const bars = r.series.map(x => `<div class="sbar" title="${x.d}: ${x.new} new, ${x.done} done"><i class="n" style="height:${Math.round(100 * x.new / mx)}%"></i><i class="d" style="height:${Math.round(100 * x.done / mx)}%"></i><small>${r.series.length <= 10 || x === r.series[0] || x === r.series[r.series.length - 1] ? x.d.slice(5) : ""}</small></div>`).join("");
@@ -306,6 +312,7 @@ async function renderSystem() {
   el.innerHTML = `<div class="pad sys">
     <div class="seg" role="group" aria-label="Period">${[1, 7, 30].map(d => `<button type="button" class="${d === sysDays ? "on" : ""}" data-days="${d}">${d === 1 ? "Today" : d + " days"}</button>`).join("")}</div>
     <section class="panel"><h2>Machines</h2>${machinesHtml(r.nodes)}</section>
+    <section class="panel" id="wlcard"><h2>Workload <span class="muted">who is overwhelmed</span></h2>${workloadHtml(wl)}</section>
     <div class="grid2">
       <section class="panel"><h2>Limits and quota</h2>${limitsHtml(r.quota)}</section>
       <section class="panel"><h2>Tasks per day <span class="muted"><i class="lg n"></i> new <i class="lg d"></i> done</span></h2><div class="sbars">${bars}</div></section>
@@ -329,6 +336,8 @@ async function renderSystem() {
 }
 $("v-system").addEventListener("click", async e => {
   const tk = e.target.closest("a[data-tk]"); if (tk) return openTask(+tk.dataset.tk);
+  const wr = !e.target.closest("a[data-tk]") && e.target.closest("tr[data-wl]");
+  if (wr) { const bx = wr.nextElementSibling; if (!bx.hidden) { bx.hidden = true; return; } const t = await api("GET", "/tasks?as=" + encodeURIComponent(wr.dataset.wl) + "&open=1&limit=50"); const it = t.items || []; bx.firstElementChild.innerHTML = it.length ? it.map(x => `<div class="kv"><span><a data-tk="${x.id}" style="cursor:pointer;text-decoration:underline">#${x.id} ${esc((x.title || "").slice(0, 80))}</a></span><b>${esc(x.status || "")}</b></div>`).join("") : '<span class="muted">No open tasks.</span>'; bx.hidden = false; return; }
   const ar = !e.target.closest("a[data-tk]") && e.target.closest("[data-actby]");
   if (ar) { const box = ar.nextElementSibling; if (!box.hidden) { box.hidden = true; return; } const r = await api("GET", "/activity?by=" + encodeURIComponent(ar.dataset.actby) + "&n=10"); const it = (r.i[0] || {}).i || []; box.innerHTML = it.length ? it.map(x => `<div class="kv actrow sub"><span class="actl"><small class="actt" title="${esc(actPlain(x))}">${actTxt(x)}</small></span><span class="actr"><b>${actShort(x.ts)}</b></span></div>`).join("") : '<p class="muted">No runs or changes yet.</p>'; box.hidden = false; return; } const b = e.target.closest("[data-days]"); if (b) { sysDays = +b.dataset.days; localStorage.tb_sysdays = sysDays; renderSystem(); } });
 
